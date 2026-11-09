@@ -54,23 +54,40 @@ interface ArchitectureSupport {
 const COMMIT_RE = /^[a-f0-9]{40}$/;
 const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
-function requirements(
-  architecture: string,
-  ggufArch: "QWEN35" | "QWEN35MOE",
-  runtimeArch: "QWEN35" | "QWEN35MOE",
-  runtimeName: "qwen35" | "qwen35moe",
-  converterClass: "Qwen3_5TextModel" | "Qwen3_5MoeTextModel",
-  runtimeClass: "llama_model_qwen35" | "llama_model_qwen35moe",
-  modelFile: "src/models/qwen35.cpp" | "src/models/qwen35moe.cpp"
-): ArchitectureSupport {
+/**
+ * One llama.cpp-backed model family. Adding a new official architecture (for example a future
+ * Qwen generation) is one entry in `FAMILIES` once the pinned llama.cpp checkout supports it: name
+ * the HF architecture classes, the GGUF/runtime arch tokens, the converter class/file, and the
+ * runtime model class/file. The source-token checks below then prove support fail-closed.
+ */
+export interface ArchitectureFamily {
+  /** Official Hugging Face `architectures` values served by this family. */
+  architectures: readonly string[];
+  /** `MODEL_ARCH.<ggufArch>` in gguf-py and `LLM_ARCH_<ggufArch>` in llama.cpp. */
+  ggufArch: string;
+  /** Lowercase arch name used by gguf-py, llama-arch.cpp, and speculative decoding. */
+  runtimeName: string;
+  /** Converter class in `converterFile`. */
+  converterClass: string;
+  /** Converter module path relative to the llama.cpp checkout. */
+  converterFile: string;
+  /** Runtime model class, e.g. `llama_model_qwen35`. */
+  runtimeClass: string;
+  /** Runtime model source path relative to the llama.cpp checkout. */
+  modelFile: string;
+}
+
+function requirements(architecture: string, family: ArchitectureFamily): ArchitectureSupport {
+  const { ggufArch, runtimeName, converterClass, converterFile, runtimeClass, modelFile } = family;
+  const converterModule = converterFile.replace(/^conversion\//, "").replace(/\.py$/, "");
   return {
     requirements: [
       {
         path: "conversion/__init__.py",
-        tokenGroups: [[`"${architecture}"`, `"qwen"`]],
+        tokenGroups: [[`"${architecture}"`, `"${converterModule}"`]],
       },
       {
-        path: "conversion/qwen.py",
+        path: converterFile,
         tokenGroups: [
           [architecture],
           [`class ${converterClass}`],
@@ -83,11 +100,11 @@ function requirements(
       },
       {
         path: "src/llama-arch.cpp",
-        tokenGroups: [[`LLM_ARCH_${runtimeArch}`, `"${runtimeName}"`]],
+        tokenGroups: [[`LLM_ARCH_${ggufArch}`, `"${runtimeName}"`]],
       },
       {
         path: "src/llama-model.cpp",
-        tokenGroups: [[`case LLM_ARCH_${runtimeArch}`, `new ${runtimeClass}`]],
+        tokenGroups: [[`case LLM_ARCH_${ggufArch}`, `new ${runtimeClass}`]],
       },
       {
         path: modelFile,
@@ -110,56 +127,41 @@ function requirements(
   };
 }
 
-const SUPPORT = new Map<string, ArchitectureSupport>([
-  [
-    "Qwen3_5ForConditionalGeneration",
-    requirements(
-      "Qwen3_5ForConditionalGeneration",
-      "QWEN35",
-      "QWEN35",
-      "qwen35",
-      "Qwen3_5TextModel",
-      "llama_model_qwen35",
-      "src/models/qwen35.cpp"
-    ),
-  ],
-  [
-    "Qwen3_5ForCausalLM",
-    requirements(
-      "Qwen3_5ForCausalLM",
-      "QWEN35",
-      "QWEN35",
-      "qwen35",
-      "Qwen3_5TextModel",
-      "llama_model_qwen35",
-      "src/models/qwen35.cpp"
-    ),
-  ],
-  [
-    "Qwen3_5MoeForConditionalGeneration",
-    requirements(
-      "Qwen3_5MoeForConditionalGeneration",
-      "QWEN35MOE",
-      "QWEN35MOE",
-      "qwen35moe",
-      "Qwen3_5MoeTextModel",
-      "llama_model_qwen35moe",
-      "src/models/qwen35moe.cpp"
-    ),
-  ],
-  [
-    "Qwen3_5MoeForCausalLM",
-    requirements(
-      "Qwen3_5MoeForCausalLM",
-      "QWEN35MOE",
-      "QWEN35MOE",
-      "qwen35moe",
-      "Qwen3_5MoeTextModel",
-      "llama_model_qwen35moe",
-      "src/models/qwen35moe.cpp"
-    ),
-  ],
-]);
+export const FAMILIES: readonly ArchitectureFamily[] = [
+  {
+    architectures: ["Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"],
+    ggufArch: "QWEN35",
+    runtimeName: "qwen35",
+    converterClass: "Qwen3_5TextModel",
+    converterFile: "conversion/qwen.py",
+    runtimeClass: "llama_model_qwen35",
+    modelFile: "src/models/qwen35.cpp",
+  },
+  {
+    architectures: ["Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"],
+    ggufArch: "QWEN35MOE",
+    runtimeName: "qwen35moe",
+    converterClass: "Qwen3_5MoeTextModel",
+    converterFile: "conversion/qwen.py",
+    runtimeClass: "llama_model_qwen35moe",
+    modelFile: "src/models/qwen35moe.cpp",
+  },
+  // Qwen 4: add its family here on release day from the official config.json `architectures`
+  // and the pinned llama.cpp source. Do not guess names before the release is public.
+];
+
+export function buildSupport(families: readonly ArchitectureFamily[]): Map<string, ArchitectureSupport> {
+  const support = new Map<string, ArchitectureSupport>();
+  for (const family of families) {
+    for (const architecture of family.architectures) {
+      if (support.has(architecture)) throw new Error(`duplicate architecture family: ${architecture}`);
+      support.set(architecture, requirements(architecture, family));
+    }
+  }
+  return support;
+}
+
+const SUPPORT = buildSupport(FAMILIES);
 
 export function runtimeCompatibilitySourcePaths(): string[] {
   const paths = new Set<string>();

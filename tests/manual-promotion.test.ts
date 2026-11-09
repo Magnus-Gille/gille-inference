@@ -155,6 +155,27 @@ describe("manual-promotion spec contract (#217)", () => {
       .toBe("/v1/chat/completions");
   });
 
+  it("keeps the pre-release Qwen 4 27B placeholder on the reviewed qwen38-27b serving shape", () => {
+    const fixture = readFileSync(new URL("../deploy/specs/qwen4-27b.yaml", import.meta.url), "utf8");
+    const spec = parseManualSpec(fixture);
+    expect(spec).toMatchObject({
+      key: "qwen4-27b",
+      api: "chat",
+      ctx: 65536,
+      ubatch: 512,
+      np: 1,
+      ctk: "q8_0",
+      ctv: "q8_0",
+      cacheRamMib: 2048,
+      imageMinTokens: 1024,
+      specType: "draft-mtp",
+      specDraftNMax: 2,
+    });
+    // Placeholder paths must never be mistaken for applied operator paths.
+    expect(renderManualEntry(spec)).toContain("/operator-resolve/");
+    expect(manualWarmupRequest(spec, spec.key).path).toBe("/v1/chat/completions");
+  });
+
   it("keeps the public Clef fixture on the typed System One serving path", () => {
     const fixture = readFileSync(new URL("../deploy/specs/clef-flash.yaml", import.meta.url), "utf8");
     const spec = parseManualSpec(fixture);
