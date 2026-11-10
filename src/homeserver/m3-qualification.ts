@@ -1156,7 +1156,7 @@ export function evaluateM3Qualification(input: M3QualificationInput): M3Qualific
   if (record.contract !== M3_QUALIFICATION_CONTRACT || record.version !== M3_QUALIFICATION_VERSION) globalReasons.push("invalid_input");
 
   const temporal = validateTemporalEvidence(record, globalReasons);
-  const { asOf, asOfMillis, window, startMillis, endMillis, snapshot, observedMillis } = temporal;
+  const { asOf, window, snapshot } = temporal;
 
   const thresholdValue = record.thresholds;
   let thresholds: QualificationThresholds | null = null;
@@ -1228,7 +1228,7 @@ export function evaluateM3FirstCanaryQualification(input: M3FirstCanaryInput): M
   if (!validateFirstCanaryDeferral(record.costDeferral)) globalReasons.push("invalid_cost_deferral");
 
   const temporal = validateTemporalEvidence(record, globalReasons);
-  const { asOf, asOfMillis, window, startMillis, endMillis, snapshot, observedMillis } = temporal;
+  const { asOf, window, snapshot } = temporal;
 
   const thresholdValue = record.thresholds;
   let thresholds: M3FirstCanaryThresholds | null = null;
