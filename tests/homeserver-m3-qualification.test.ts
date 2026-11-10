@@ -461,6 +461,58 @@ describe("evaluateM3Qualification", () => {
 });
 
 describe("evaluateM3FirstCanaryQualification", () => {
+  it("keeps shared temporal validation reasons aligned across contracts", () => {
+    const cases: Array<[string, (full: M3QualificationInput, canary: M3FirstCanaryInput) => void, string[]]> = [
+      ["immutable", (full, canary) => {
+        full.snapshot.immutable = false;
+        canary.snapshot.immutable = false;
+      }, ["invalid_snapshot"]],
+      ["future snapshot", (full, canary) => {
+        full.snapshot.observedAt = "2026-09-04T00:00:00.000Z";
+        canary.snapshot.observedAt = "2026-09-04T00:00:00.000Z";
+      }, ["snapshot_after_asof", "stale_snapshot"]],
+      ["stale evidence and review", (full, canary) => {
+        full.snapshot.observedAt = "2026-08-01T00:00:00.000Z";
+        canary.snapshot.observedAt = "2026-08-01T00:00:00.000Z";
+        full.thresholds!.maxEvidenceAgeMs = 1000;
+        canary.thresholds!.maxEvidenceAgeMs = 1000;
+        full.thresholds!.review.reviewedAt = "2026-09-02T00:00:00.000Z";
+        canary.thresholds!.review.reviewedAt = "2026-09-02T00:00:00.000Z";
+      }, ["review_after_window", "snapshot_before_window_end", "stale_snapshot", "stale_window"]],
+    ];
+
+    for (const [name, mutate, expectedReasons] of cases) {
+      const full = input();
+      const canary = firstCanaryInput();
+      mutate(full, canary);
+
+      const fullReasons = evaluateM3Qualification(full).reasons;
+      const canaryReasons = evaluateM3FirstCanaryQualification(canary).reasons;
+      expect(fullReasons, name).toEqual(expectedReasons);
+      expect(canaryReasons, name).toEqual(expectedReasons);
+    }
+  });
+
+  it("keeps candidate ordering and duplicate-key and identity holds aligned", () => {
+    const fullCandidates = [candidate(), candidate(), candidate()];
+    const canaryCandidates = [firstCanaryCandidate(), firstCanaryCandidate(), firstCanaryCandidate()];
+    for (const [index, id] of ["model-zulu", "model-alpha", "model-zulu"].entries()) {
+      fullCandidates[index]!.key.modelId = id;
+      canaryCandidates[index]!.key.modelId = id;
+    }
+    fullCandidates[1]!.identity.artifactSha256 = DIGEST_B;
+    canaryCandidates[1]!.identity.artifactSha256 = DIGEST_B;
+
+    const full = evaluateM3Qualification(input({ candidates: fullCandidates }));
+    const canary = evaluateM3FirstCanaryQualification(firstCanaryInput({ candidates: canaryCandidates }));
+
+    expect(full.candidates.map((item) => item.key.modelId)).toEqual(["model-alpha", "model-zulu", "model-zulu"]);
+    expect(canary.candidates.map((item) => item.key.modelId)).toEqual(["model-alpha", "model-zulu", "model-zulu"]);
+    expect(full.candidates.map((item) => item.reasons)).toEqual(canary.candidates.map((item) => item.reasons));
+    expect(full.candidates.map((item) => item.diagnostic)).toEqual(["PASS", "HOLD", "HOLD"]);
+    expect(canary.candidates.map((item) => item.diagnostic)).toEqual(["PASS", "HOLD", "HOLD"]);
+  });
+
   it("returns scoped ELIGIBLE while keeping full analysis HOLD and costs unassessed", () => {
     const result = evaluateM3FirstCanaryQualification(firstCanaryInput());
 
