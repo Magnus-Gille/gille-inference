@@ -2296,6 +2296,35 @@ describe("gateway spine — HTTP integration", () => {
     expect(bad.status).toBe(400);
   });
 
+  it("keeps the exposure admin JSON byte caps and parser errors route-specific", async () => {
+    const owner = mintKey({ alias: `exposure-json-bounds-${randomUUID()}`, tier: "owner", scope: "admin" }, DEFAULTS);
+    const targets = [
+      { path: "/admin/task-exposures/lookup", maxBytes: 32 * 1024 },
+      { path: "/admin/exposure-receipts", maxBytes: 16 * 1024 },
+      { path: "/admin/exposure-receipts/heartbeat", maxBytes: 4 * 1024 },
+    ];
+
+    for (const target of targets) {
+      const atLimit = await fetch(url(target.path), {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+        body: " ".repeat(target.maxBytes),
+      });
+      expect(atLimit.status, `${target.path} must accept exactly ${target.maxBytes} bytes`).toBe(400);
+      expect(await atLimit.json()).toMatchObject({
+        error: { code: "invalid_request_error", message: "Request body must be valid JSON." },
+      });
+
+      const overLimit = await fetch(url(target.path), {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+        body: " ".repeat(target.maxBytes + 1),
+      });
+      expect(overLimit.status, `${target.path} must reject ${target.maxBytes + 1} bytes`).toBe(413);
+      expect(await overLimit.json()).toMatchObject({ error: { code: "payload_too_large" } });
+    }
+  });
+
   it("duplicate alias mint → clean 409, no SQLite string in the body (Fix #10)", async () => {
     const make = () =>
       fetch(url("/admin/keys"), {
