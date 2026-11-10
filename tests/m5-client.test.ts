@@ -9,6 +9,7 @@ import {
   createKeychainCredentialStore,
   createM5Client,
   diagnoseProfile,
+  normalizeEvidenceRecovery,
   validateProfileConfig,
 } from "../client/m5-client.mjs";
 
@@ -234,6 +235,60 @@ describe("profile-based Keychain resolution", () => {
       readFileSync(new URL("../client/package.json", import.meta.url), "utf8"),
     ) as { version: string };
     expect(M5_CLIENT_VERSION).toBe(pkg.version);
+  });
+});
+
+describe("adoption evidence recovery normalization", () => {
+  it("projects only the closed recovery fields and rejects spool_failed ids", () => {
+    const normalized = normalizeEvidenceRecovery({
+      status: "spooled",
+      spool_id: "adoption-20260911T000000-deadbeef",
+      action: "retry_same_tool_call",
+      path: "/private/operator/adoption.jsonl",
+      extra: "untrusted carrier data",
+    });
+    expect(normalized).toEqual({
+      status: "spooled",
+      spool_id: "adoption-20260911T000000-deadbeef",
+      action: "retry_same_tool_call",
+    });
+
+    const projectedError = new M5ClientError("network_failure", "transport failed", {
+      evidenceRecovery: {
+        status: "spooled",
+        spool_id: "adoption-20260911T000000-deadbeef",
+        action: "retry_same_tool_call",
+        path: "/private/operator/adoption.jsonl",
+      },
+    });
+    expect(projectedError.evidenceRecovery).toEqual(normalized);
+    expect(JSON.stringify(projectedError)).not.toContain("/private/operator/adoption.jsonl");
+
+    const failed = new M5ClientError("network_failure", "transport failed", {
+      evidenceRecovery: {
+        status: "spool_failed",
+        spool_id: "/private/operator/adoption.jsonl",
+        action: "retry_same_tool_call",
+      },
+    });
+    expect(failed.evidenceRecovery).toBeUndefined();
+    expect(failed.toJSON().error).not.toHaveProperty("evidence_recovery");
+  });
+
+  it("re-normalizes mutated error carriers before JSON output", () => {
+    const error = new M5ClientError("network_failure", "transport failed", {
+      evidenceRecovery: {
+        status: "spool_failed",
+        action: "retry_same_tool_call",
+      },
+    });
+    error.evidenceRecovery.path = "/private/operator/adoption.jsonl";
+    error.evidenceRecovery.extra = "untrusted carrier data";
+    expect(error.toJSON().error.evidence_recovery).toEqual({
+      status: "spool_failed",
+      action: "retry_same_tool_call",
+    });
+    expect(JSON.stringify(error.toJSON())).not.toContain("/private/operator/adoption.jsonl");
   });
 });
 
