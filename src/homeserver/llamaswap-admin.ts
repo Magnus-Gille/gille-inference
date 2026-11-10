@@ -23,7 +23,7 @@ import {
   type LoadResult,
   type RunningSnapshotEntry,
   RunningSnapshotUnavailableError,
-} from "./lmstudio-admin.js";
+} from "./model-admin-contract.js";
 import {
   currentTraceHeaders,
   recordReadinessObservation,
@@ -34,7 +34,7 @@ import {
 } from "./tracing.js";
 
 export type { ModelInfo, LoadOptions, LoadResult, RunningSnapshotEntry };
-// Re-export validators so the facade shape matches typeof lmstudio-admin
+// Keep the adapter's public validation helpers available.
 export { assertModelKey, assertGpu };
 
 /** Derive the llama-swap origin from config. Strips trailing /v1 from lmStudioBaseUrl,

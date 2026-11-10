@@ -145,7 +145,6 @@ describe("runTokenize request boundaries", () => {
   });
 
   it.each([
-    ["lmstudio backend", cfg({ backend: "lmstudio" }), MODEL],
     ["System One model", cfg({ systemOneModels: ["decision-model"] }), "decision-model"],
     ["embedding model", cfg(), "embeddinggemma-2"],
   ])("rejects %s before quota or fetch", async (_label, config, model) => {

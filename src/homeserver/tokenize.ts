@@ -4,7 +4,7 @@ import type { McpPrincipal } from "./mcp.js";
 import { AdmissionController, AdmissionRejected } from "./admission.js";
 import { admitHostMemory, type HostMemoryAdmissionDeps } from "./host-memory-admission.js";
 import { getRunningSnapshot } from "./model-admin.js";
-import { assertModelKey } from "./lmstudio-admin.js";
+import { assertModelKey } from "./model-admin-contract.js";
 import { isSystemOneDecisionModel } from "./systemone-request.js";
 import { isEmbeddingModel } from "./embedding-request.js";
 import { checkQuota, recordUsage } from "./quota.js";

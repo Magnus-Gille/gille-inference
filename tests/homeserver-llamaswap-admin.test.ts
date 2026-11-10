@@ -7,7 +7,7 @@ import {
 
 /**
  * Tests for the llama-swap admin adapter (src/homeserver/llamaswap-admin.ts)
- * and the backend-selection facade (src/homeserver/model-admin.ts).
+ * and the stable model-admin entry point (src/homeserver/model-admin.ts).
  *
  * Spins a tiny http.Server mimicking the llama-swap REST API and points the
  * adapter at it via setConfig.
@@ -108,7 +108,6 @@ function startMock(): Promise<void> {
 let setConfig: typeof import("../src/homeserver/config.js").setConfig;
 let llamaswap: typeof import("../src/homeserver/llamaswap-admin.js");
 let modelAdmin: typeof import("../src/homeserver/model-admin.js");
-let lmstudioAdmin: typeof import("../src/homeserver/lmstudio-admin.js");
 
 beforeAll(async () => {
   await startMock();
@@ -116,7 +115,6 @@ beforeAll(async () => {
   setConfig = cfgMod.setConfig;
   llamaswap = await import("../src/homeserver/llamaswap-admin.js");
   modelAdmin = await import("../src/homeserver/model-admin.js");
-  lmstudioAdmin = await import("../src/homeserver/lmstudio-admin.js");
 
   // Point at the mock server with llamaswap backend
   setConfig({
@@ -306,15 +304,9 @@ describe("getRunningSnapshot", () => {
     ]);
   });
 
-  it("reports the deprecated LM Studio backend as unavailable", async () => {
-    setConfig({ backend: "lmstudio" });
-
-    await expect(modelAdmin.getRunningSnapshot()).rejects.toMatchObject({
-      name: "RunningSnapshotUnavailableError",
-    });
-    await expect(lmstudioAdmin.getRunningSnapshot()).rejects.toMatchObject({
-      name: "RunningSnapshotUnavailableError",
-    });
+  it("preserves the public running-snapshot error identity", async () => {
+    runningStatus = 503;
+    await expect(modelAdmin.getRunningSnapshot()).rejects.toBeInstanceOf(modelAdmin.RunningSnapshotUnavailableError);
   });
 });
 
@@ -341,10 +333,6 @@ describe("getRunningCmd", () => {
     runningModels = [{ model: "qwen2.5:7b", state: "ready", cmd: "llama-server -m /models/qwen2.5-7b.gguf -c 16384" }];
     setConfig({ backend: "llamaswap" });
     expect(await modelAdmin.getRunningCmd("qwen2.5:7b")).toBe("llama-server -m /models/qwen2.5-7b.gguf -c 16384");
-  });
-
-  it("the deprecated lmstudio backend honestly reports null (#5) — no /running equivalent exists", async () => {
-    expect(await lmstudioAdmin.getRunningCmd("anything")).toBeNull();
   });
 });
 
@@ -544,25 +532,15 @@ describe("downloadModel", () => {
   });
 });
 
-// ─── Facade switch (model-admin.ts) ───────────────────────────────────────────
+// ─── Stable entry point (model-admin.ts) ───────────────────────────────────────────
 
 describe("model-admin facade", () => {
-  it("routes to llamaswap when backend=llamaswap", async () => {
+  it("uses the llama-swap catalogue", async () => {
     setConfig({ backend: "llamaswap" });
     runningModels = [];
     const models = await modelAdmin.listModels();
     // llamaswap returns 3 models from the mock
     expect(models).toHaveLength(3);
     expect(models[0]!.key).toBe("llama3.2:3b");
-  });
-
-  it("routes to lmstudio when backend=lmstudio (does not call llamaswap mock)", async () => {
-    // Point lmStudioRestUrl at an unroutable address so lmstudio always fails
-    // regardless of whether a real LM Studio happens to be running on this machine.
-    setConfig({ backend: "lmstudio", lmStudioRestUrl: "http://127.0.0.1:1/api/v1" });
-    // LM Studio listModels hits lmStudioRestUrl — connection refused → throws.
-    await expect(modelAdmin.listModels()).rejects.toThrow();
-    // Restore
-    setConfig({ backend: "llamaswap" });
   });
 });

@@ -63,16 +63,14 @@ function restoreEnvironment(): void {
 
 function startUpstream(): Promise<void> {
   upstream = createServer((req: IncomingMessage, res: ServerResponse) => {
-    if (req.url === "/api/v1/models") {
+    if (req.url === "/v1/models") {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        models: [{
-          type: "llm",
-          key: "m1",
-          display_name: "m1",
-          loaded_instances: [],
-        }],
-      }));
+      res.end(JSON.stringify({ data: [{ id: "m1", object: "model" }] }));
+      return;
+    }
+    if (req.url === "/running") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ running: [] }));
       return;
     }
     if (req.method === "POST" && req.url === "/api/chat") {
@@ -154,7 +152,7 @@ beforeAll(async () => {
 
   // Set env BEFORE importing the gateway (config is read at startGateway() time)
   process.env["LMSTUDIO_BASE_URL"] = `http://127.0.0.1:${upstreamPort}/v1`;
-  process.env["HOMESERVER_BACKEND"] = "lmstudio";
+  process.env["HOMESERVER_BACKEND"] = "llamaswap";
   process.env["HOMESERVER_HOST"] = "127.0.0.1";
   process.env["HOMESERVER_PORT"] = "0";
   process.env["HOMESERVER_MAX_INFLIGHT"] = "2";

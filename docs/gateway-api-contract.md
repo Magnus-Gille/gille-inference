@@ -2,7 +2,7 @@
 
 **Status:** stable reference for the BosGame M5 home-server gateway.
 **Audience:** Hugin's macro-router (the M5 runtime/executor), Heimdall's inference-observability collector, and any LAN client.
-**Source of truth:** `src/homeserver/gateway.ts` (routing), `src/homeserver/learning-task-contract.ts` (LearningTaskContract preflight/stamp/echo), `src/homeserver/review-bounded.ts` (review-lane capability preflight, #74), `src/homeserver/ledger.ts` (`/ledger`), `src/homeserver/model-admin.ts` (`/models`, `/admin/*` backend facade — routes to `llamaswap-admin.ts`, the default, or the deprecated `lmstudio-admin.ts` per `HOMESERVER_BACKEND`, #146), `src/homeserver/errors.ts` (envelopes). This doc is derived from those files — if they change, update this doc in the same PR.
+**Source of truth:** `src/homeserver/gateway.ts` (routing), `src/homeserver/learning-task-contract.ts` (LearningTaskContract preflight/stamp/echo), `src/homeserver/review-bounded.ts` (review-lane capability preflight, #74), `src/homeserver/ledger.ts` (`/ledger`), `src/homeserver/model-admin.ts` (`/models`, `/admin/*` entry point — uses `llamaswap-admin.ts`; the deprecated LM Studio adapter has been removed), `src/homeserver/errors.ts` (envelopes). This doc is derived from those files — if they change, update this doc in the same PR.
 
 Per **ADR-004** (`docs/adr-004-m5-routing-ownership.md`): Hugin owns *macro*-routing (which node), the home-server gateway owns *micro*-routing + external admission, `ledger.ts` is the single capability KB (read via `/ledger`), and nightly local sub-tasks route through `/delegate`.
 

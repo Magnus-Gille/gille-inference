@@ -17,7 +17,7 @@
  */
 
 import { readFile as fsReadFile } from "node:fs/promises";
-import type { RunningSnapshotEntry } from "./lmstudio-admin.js";
+import type { RunningSnapshotEntry } from "./model-admin-contract.js";
 import { meminfoBytes } from "./strix-host-profile.js";
 import { recordHostMemoryAdmission } from "./metrics.js";
 
