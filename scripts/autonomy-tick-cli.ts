@@ -3,8 +3,8 @@
  * autonomy-tick-cli.ts — the IO composition root for the autonomy controller (issue #49). One
  * idempotent cron entrypoint: RECONCILE any crashed prior tick's adoption intent → WATCH (#47) →
  * ACKNOWLEDGE/DEMOTE → REVIEW (#7, live-table baseline read AFTER watch + live #48 gate) →
- * PREDICATES → DECIDE BY TIER → ADOPT at most ONE axis → TIER LADDER → NOTIFY. All decision logic
- * lives in src/homeserver/autonomy-controller.ts (pure/DI); this script only wires it to the
+ * PREDICATES → STANDING PROPOSAL → NOTIFY. Shared review and recovery logic
+ * lives in autonomy-controller.ts, with pure planning in autonomy-planner.ts; this script wires the
  * ledger, the served-model catalogue, the filesystem, and the live gateway's reload endpoint — the
  * exact same IO surface scripts/routing-lifecycle-cli.ts already composes for the human-driven
  * `review`/`adopt`/`watch` commands (`buildAdoptDeps` is imported from there rather than re-wired
@@ -14,9 +14,8 @@
  * <path>` override — an unattended cron tick always computes the LIVE #6/#48 gate from current
  * evidence (`computeLiveCalibrationGate`, default mode "both": human receipts merged additively
  * with #48's verifier-anchored feed, exactly like the human `review` command's own default). This
- * script also supplies `recomputeCalibrationGate` — a FRESH ledger read + gate computation invoked
- * again by the controller immediately before any organic-dependent adopt attempt (Sol-xhigh review
- * finding 6), never the single review-time snapshot reused stale.
+ * script uses the shadow-only entrypoint: fresh autonomous adoption and promotion phases are
+ * absent. Recovery of prior adoption intents retains explicit filesystem/reload IO.
  *
  * USAGE
  *   tsx scripts/autonomy-tick-cli.ts [--dry-run] [--table docs/m5-routing.json] [--data-dir ./data]
@@ -38,8 +37,7 @@
  * ENV: EVAL_DB_PATH (ledger DB, default ./data/eval.db);
  *      GATEWAY_URL / ROUTING_LIFECYCLE_ADMIN_KEY / HOMESERVER_OWNER_KEY — see
  *        routing-lifecycle-cli.ts's own header (issue #38), reused verbatim via `buildAdoptDeps`;
- *      AUTONOMY_KILL_SWITCH=on — evaluate + record everything, adopt/promote nothing (demotion
- *        still applies). Absent/anything else = acting ENABLED;
+ *      AUTONOMY_KILL_SWITCH cannot enable this permanently shadow-only entrypoint;
  *      AUTONOMY_NOTIFY_CMD — when set, invoked with a short content-blind JSON summary on stdin
  *        after any adopt/revert/tier-change (issue #49 item 8). Never an HTTP call — the box wires
  *        Ratatoskr or anything else behind this command itself.
@@ -61,9 +59,9 @@ import { DEFAULT_WATCHDOG_POLICY } from "../src/homeserver/adoption-watchdog.js"
 import { buildAdoptDeps } from "./routing-lifecycle-cli.js";
 import { microRoutingAdmission } from "../src/homeserver/autonomy-constitution.js";
 import {
-  runAutonomyTick,
+  runShadowAutonomyTick,
   DEFAULT_AUTONOMY_POLICY,
-  type AutonomyTickDeps,
+  type ShadowAutonomyTickDeps,
   type AutonomyTickReport,
 } from "../src/homeserver/autonomy-controller.js";
 
@@ -98,10 +96,6 @@ function readFlag(args: string[], name: string): string | undefined {
   const v = args[i + 1];
   if (v === undefined || v.startsWith("--")) return undefined;
   return v;
-}
-
-function killSwitchOn(): boolean {
-  return (process.env["AUTONOMY_KILL_SWITCH"] ?? "").trim().toLowerCase() === "on";
 }
 
 async function loadServableModelIds(): Promise<string[] | null> {
@@ -184,17 +178,9 @@ async function main(): Promise<void> {
   const epochHash = policyEpochHash(config.policy);
   const adoptDeps = buildAdoptDeps(args, config, tablePath);
 
-  // Finding 6: recompute the LIVE gate again, FRESH, at the exact moment of an organic-dependent
-  // adopt attempt — a fresh ledger read each call, never the `calibrationGate` snapshot above.
-  const recomputeCalibrationGate = () => {
-    const freshRows = listCalibrationSampleRows({ includeShadow: true });
-    return computeLiveCalibrationGate({ rows: freshRows, receipts: [], generatedAt: new Date().toISOString() });
-  };
-
-  const deps: AutonomyTickDeps = {
+  const deps: ShadowAutonomyTickDeps = {
     dataDir,
     nowIso: () => new Date().toISOString(),
-    killSwitchOn: () => true,
     decisionRef,
     policy: DEFAULT_AUTONOMY_POLICY,
     watchdogPolicy: DEFAULT_WATCHDOG_POLICY,
@@ -210,11 +196,10 @@ async function main(): Promise<void> {
     },
     queryGuardMetrics: (taskTypes, sinceIso, untilIso) => guardMetricsWindow({ taskTypes, sinceIso, untilIso }),
     adoptDeps,
-    recomputeCalibrationGate,
     notify: (json) => notifyIfConfigured(json),
   };
 
-  const report = await runAutonomyTick(deps, { dryRun });
+  const report = await runShadowAutonomyTick(deps, { dryRun });
 
   const outPath = readFlag(args, "--out");
   const json = JSON.stringify(report, null, 2) + "\n";
