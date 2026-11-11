@@ -717,6 +717,48 @@ describe("m5 stdio MCP conformance", () => {
     });
   });
 
+  it("rejects spool_failed carriers that include a spool id", async () => {
+    const error = new M5ClientError("network_failure", "transport failed", {
+      retryable: true,
+    });
+    // Simulate a malformed carrier arriving after the client error was constructed.
+    // The bridge must apply the same strict contract as the client serializer.
+    error.evidenceRecovery = {
+      status: "spool_failed",
+      spool_id: "/private/operator/adoption.jsonl",
+      action: "retry_same_tool_call",
+    };
+    const bridge = createMcpStdioBridge({
+      client: { rpc: async () => { throw error; } },
+      profile: "codex",
+      adoptionSpool: null,
+    });
+    const response = await bridge.handleLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 217,
+      method: "tools/call",
+      params: {
+        name: "record_adoption_evidence",
+        arguments: {
+          harness: "codex_app",
+          execution_mode: "ask",
+          traffic_purpose: "organic",
+          result: "failed",
+          deterministic_check: "not_run",
+          reviewer_usefulness: "not_reported",
+          fallback_reason: "m5_unreachable",
+          eligible_opportunities: 7,
+        },
+      },
+    }));
+    const parsed = JSON.parse(response!);
+    expect(parsed.error.data.evidence_recovery).toEqual({
+      status: "not_recorded",
+      action: "retry_same_tool_call",
+    });
+    expect(response).not.toContain("/private/operator/adoption.jsonl");
+  });
+
   it("returns a deterministic failing layer for list_models on a dead connector route", async () => {
     const { saved, spool } = memorySpool();
     const bridge = await makeBridge(async () => {

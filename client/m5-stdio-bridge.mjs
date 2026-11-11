@@ -7,6 +7,7 @@ import {
   credentialRemediation,
   gatewayHttpRemediation,
   localTailnetRemediation,
+  normalizeEvidenceRecovery,
   redactText,
   spoolAdoptionOutageReport,
   transportRemediation,
@@ -105,24 +106,6 @@ function visibleFailureSuffix(error, failureLayer) {
   return ` [diagnostic_code=${diagnostic}; failure_layer=${layer}; retryable=${error.retryable === true}]`;
 }
 
-// Closed copy of the client's evidence-recovery shape (#242). Only a valid spooled /
-// spool-failed outcome travels; anything else falls back to the legacy contract so a
-// malformed carrier can never smuggle a locator or free-form text into bridge output.
-function validEvidenceRecovery(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  if (value.action !== "retry_same_tool_call") return undefined;
-  if (value.status === "spooled") {
-    if (typeof value.spool_id !== "string" || !/^adoption-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}$/.test(value.spool_id)) {
-      return undefined;
-    }
-    return { status: "spooled", spool_id: value.spool_id, action: "retry_same_tool_call" };
-  }
-  if (value.status === "spool_failed") {
-    return { status: "spool_failed", action: "retry_same_tool_call" };
-  }
-  return undefined;
-}
-
 async function bridgeError(error, profile, message, { resultRetryAttempted = false, adoptionSpool } = {}) {
   if (!(error instanceof M5ClientError)) {
     return { message: "The MCP bridge request failed." };
@@ -152,7 +135,7 @@ async function bridgeError(error, profile, message, { resultRetryAttempted = fal
   let evidenceRecovery;
   if (isAdoptionReport(message) && transportFailure) {
     evidenceRecovery =
-      validEvidenceRecovery(error.evidenceRecovery) ??
+      normalizeEvidenceRecovery(error.evidenceRecovery) ??
       (await spoolAdoptionOutageReport(adoptionSpool, {
         profile,
         report: message?.params?.arguments,

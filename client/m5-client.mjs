@@ -169,14 +169,16 @@ const ADOPTION_SPOOL_TRANSPORT_CODES = new Set(["network_failure", "timeout", "u
  * the spool id (timestamp + random hex) travels — never a filesystem path, which could
  * carry a username or other locator.
  */
-function isValidEvidenceRecovery(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  if (!ADOPTION_SPOOL_STATUSES.has(value.status)) return false;
-  if (value.action !== "retry_same_tool_call") return false;
+export function normalizeEvidenceRecovery(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  if (!ADOPTION_SPOOL_STATUSES.has(value.status)) return undefined;
+  if (value.action !== "retry_same_tool_call") return undefined;
   if (value.status === "spooled") {
-    return typeof value.spool_id === "string" && ADOPTION_SPOOL_ID.test(value.spool_id);
+    if (typeof value.spool_id !== "string" || !ADOPTION_SPOOL_ID.test(value.spool_id)) return undefined;
+    return { status: "spooled", spool_id: value.spool_id, action: "retry_same_tool_call" };
   }
-  return !Object.prototype.hasOwnProperty.call(value, "spool_id");
+  if (Object.prototype.hasOwnProperty.call(value, "spool_id")) return undefined;
+  return { status: "spool_failed", action: "retry_same_tool_call" };
 }
 const EXECUTION_FEEDBACK_VALUES = new Set(["pass", "partial", "redo", "wrong"]);
 const FEEDBACK_HANDLE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -264,9 +266,8 @@ export class M5ClientError extends Error {
       const quota = normalizeQuotaFailure(options.quota);
       if (quota !== null) this.quota = quota;
     }
-    if (isValidEvidenceRecovery(options.evidenceRecovery)) {
-      this.evidenceRecovery = { ...options.evidenceRecovery };
-    }
+    const evidenceRecovery = normalizeEvidenceRecovery(options.evidenceRecovery);
+    if (evidenceRecovery !== undefined) this.evidenceRecovery = evidenceRecovery;
     if (CREDENTIAL_FAILURE_CODES.has(code)) {
       // Credential failures have one owner-attended recovery action. Do not retain a
       // gateway- or caller-supplied remediation: it may contain a locator, credential, or
@@ -290,6 +291,7 @@ export class M5ClientError extends Error {
     const backoff = this.code === "model_temporarily_unavailable"
       ? normalizeModelUnavailableBackoff(this.backoff, this.retryAfterSeconds)
       : null;
+    const evidenceRecovery = normalizeEvidenceRecovery(this.evidenceRecovery);
     return {
       error: {
         code: this.code,
@@ -305,7 +307,7 @@ export class M5ClientError extends Error {
         ...(backoff === null ? {} : { backoff }),
         ...(isValidRequestId(this.requestId) ? { request_id: this.requestId } : {}),
         ...(quota === null ? {} : { quota }),
-        ...(this.evidenceRecovery === undefined ? {} : { evidence_recovery: { ...this.evidenceRecovery } }),
+        ...(evidenceRecovery === undefined ? {} : { evidence_recovery: evidenceRecovery }),
         ...(remediation === undefined ? {} : { remediation }),
       },
     };
