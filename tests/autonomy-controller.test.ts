@@ -14,6 +14,9 @@ import { join } from "node:path";
 
 import {
   runAutonomyTick,
+  runShadowAutonomyTick,
+  saveAdoptionIntent,
+  loadAdoptionIntent,
   evaluateStatisticalSufficiency,
   computeRiskBudgetStatus,
   routeCooldownActive,
@@ -34,6 +37,7 @@ import {
 } from "../src/homeserver/autonomy-controller.js";
 import {
   loadWatchdogState,
+  saveWatchdogState,
   saveQuarantineState,
   recordAdoptionForWatch,
   type GuardMetricSnapshot,
@@ -695,5 +699,109 @@ describe("emptyTierState / DEFAULT_AUTONOMY_POLICY sanity", () => {
     expect(DEFAULT_AUTONOMY_POLICY.maxAdoptionsPerWindow).toBe(3);
     expect(DEFAULT_AUTONOMY_POLICY.tier1UnlockCycles).toBe(10);
     expect(DEFAULT_AUTONOMY_POLICY.tier2RevertRateMax).toBe(0.2);
+  });
+});
+
+// Shadow intentionally retains recovery/bookkeeping. Compare both entrypoints on the same
+// logical fixtures so the legacy kill-switched contract remains explicit during extraction.
+describe("runShadowAutonomyTick — compatibility and absent acting phases", () => {
+  const cases = ["proposal", "noop", "planned", "table-written", "canary-passed", "failed-restore", "busy", "breach", "unresolved", "dry-run"] as const;
+
+  it.each(cases)("preserves the kill-switched report and durable state: %s", async (scenario) => {
+    const outcomes = [];
+    for (const shadow of [false, true]) {
+      const dataDir = tmp();
+      saveTierState(dataDir, { ...emptyTierState(), tier: 2, tier1EnteredAt: NOW, consecutiveHealthyCycles: 20 });
+      const fixture = fakeAdoptDeps({ initialTable: ADOPTED_TABLE_JSON,
+        reload: scenario === "failed-restore" ? () => ({ ok: false, error: "test reload failure" }) : undefined,
+      });
+      const notifications: string[] = [];
+      let writes = 0;
+      const writeTable = fixture.deps.writeTable;
+      fixture.deps.writeTable = (path, raw) => { writes++; writeTable(path, raw); };
+      const { deps } = baseTickDeps({ dataDir, adoptDepsFixture: fixture,
+        review: scenario === "noop" || scenario === "unresolved" ? noopReview() : baseReview(),
+        killSwitchOn: () => true,
+        queryGuardMetrics: (taskTypes, _since, until) => taskTypes.map((taskType) => snapshot({
+          taskType, errorRate: until === "2026-07-17T00:00:00.000Z" ? 0.05 : 0.3,
+        })),
+      });
+      deps.notify = (json) => { notifications.push(json); };
+      if (["planned", "table-written", "canary-passed", "failed-restore", "dry-run"].includes(scenario)) {
+        const { tableContentHash } = await import("../src/homeserver/evidence-identity.js");
+        saveAdoptionIntent(dataDir, {
+          schemaVersion: 1, id: "prior-intent", createdAt: NOW, taskType: "classify",
+          candidateHash: tableContentHash(ADOPTED_TABLE_JSON), decisionRef: "prior", approvedBy: "prior",
+          tier: 1, priorRaw: ADOPTED_TABLE_JSON,
+          phase: scenario === "canary-passed" ? "canary-passed" : scenario === "table-written" ? "table-written" : "planned",
+          status: "pending",
+        });
+      }
+      if (["breach", "unresolved", "canary-passed"].includes(scenario)) {
+        saveWatchdogState(dataDir, { schemaVersion: 1, records: [{
+          id: "prior-watch", adoptedAt: "2026-07-17T00:00:00.000Z", candidateHash: "prior",
+          decisionRef: "prior", approvedBy: "prior", changedTaskTypes: ["extract"], snapshotPath: null,
+          status: scenario === "unresolved" ? "reverting" : "pending", lastEvaluatedAt: null,
+          ...(scenario === "canary-passed" ? { intentId: "prior-intent" } : {}),
+          ...(scenario === "unresolved" ? { revertAttempts: 3, lastRevertError: "prior failure" } : {}),
+        }] });
+      }
+      const lock = scenario === "busy"
+        ? (await import("../src/homeserver/mutation-lock.js")).acquireMutationLock(dataDir) : null;
+      const before = { tier: loadTierState(dataDir), proposal: loadStandingProposal(dataDir), intent: loadAdoptionIntent(dataDir), watch: loadWatchdogState(dataDir) };
+      try {
+        const opts = { dryRun: scenario === "dry-run" };
+        // Even an old-style runtime object requesting acting cannot arm shadow.
+        if (shadow) {
+          deps.killSwitchOn = () => false;
+          deps.recomputeCalibrationGate = () => { throw new Error("shadow cannot recheck for a new adoption"); };
+        }
+        const report = shadow ? await runShadowAutonomyTick(deps, opts) : await runAutonomyTick(deps, opts);
+        const state = { tier: loadTierState(dataDir), proposal: loadStandingProposal(dataDir), intent: loadAdoptionIntent(dataDir), watch: loadWatchdogState(dataDir) };
+        expect(report.adopted).toEqual([]);
+        expect(report.killSwitchActive).toBe(true);
+        expect(report.tierEvent?.kind).not.toBe("promotion");
+        if (scenario === "proposal") {
+          expect(report.axisEvaluations[0]?.eligible).toBe(true);
+          expect(writes).toBe(0);
+        }
+        if (scenario === "planned" || scenario === "table-written") {
+          expect(writes).toBe(1);
+          expect(state.intent?.status).toBe("aborted");
+        }
+        if (scenario === "failed-restore") {
+          expect(report.cycleOutcome).toBe("unhealthy");
+          expect(state.intent?.status).toBe("pending");
+          expect(state.intent?.restoreAttempts).toBe(1);
+        }
+        if (scenario === "busy") expect(report.cycleOutcome).toBe("neutral");
+        if (scenario === "breach") expect(report.tierEvent?.kind).toBe("demotion");
+        if (scenario === "unresolved") {
+          expect(report.unresolvedReverts[0]?.revertAttempts).toBe(3);
+          expect(notifications).toHaveLength(1);
+          const repeated = shadow ? await runShadowAutonomyTick(deps, opts) : await runAutonomyTick(deps, opts);
+          expect(repeated.unresolvedReverts).toEqual(report.unresolvedReverts);
+          expect(notifications).toHaveLength(2);
+        }
+        if (opts.dryRun) {
+          expect(state).toEqual(before);
+          expect(writes).toBe(0);
+        }
+        outcomes.push(JSON.parse(JSON.stringify({ report, state, notifications, writes, fs: [...fixture.fs] }).replaceAll(dataDir, "<dataDir>")));
+      } finally { lock?.release(); }
+    }
+    expect(outcomes[1]).toEqual(outcomes[0]);
+  });
+
+  it("cannot promote a tier even after enough healthy cycles", async () => {
+    const dataDir = tmp();
+    saveTierState(dataDir, { ...emptyTierState(), consecutiveHealthyCycles: 20 });
+    const { deps } = baseTickDeps({ dataDir, review: noopReview() });
+    // Runtime objects may still carry old controls; the shadow API must ignore them.
+    deps.killSwitchOn = () => false;
+    deps.recomputeCalibrationGate = () => { throw new Error("acting gate must never run"); };
+    const report = await runShadowAutonomyTick(deps);
+    expect(report.tierAfter).toBe(0);
+    expect(report.tierEvent).toBeNull();
   });
 });

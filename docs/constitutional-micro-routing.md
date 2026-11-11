@@ -12,7 +12,18 @@ only for historical validation. It was never deployed as a W1 recovery protocol,
 recovery service accepts journal-v2 only; this avoids ambiguous v1/v2 epoch dispatch.
 
 The legacy autonomy timer remains useful for review, evidence evaluation, and standing proposals,
-but is structurally shadow-only. Autonomous route writes use only the production composition in
+but is structurally shadow-only. `scripts/autonomy-tick-cli.ts` calls
+`runShadowAutonomyTick`, whose composition includes no fresh adoption or promotion phase. Its pure
+review planner is shared with the historical `runAutonomyTick` compatibility engine; that engine
+remains available for its regression tests.
+
+Shadow preserves prior-intent reconciliation, watchdog evaluation, breach acknowledgement and
+demotion, standing proposals, state bookkeeping, and unresolved-revert reports/notifications.
+Reconciliation can still restore or delete an unconfirmed prior table and reload the gateway;
+shadow does not mean zero IO. `--dry-run` continues to suppress durable writes. The shadow dependency
+contract therefore retains explicit recovery IO, while omitting kill-switch and fresh calibration
+recheck controls that could enable a new adoption. Manual adoption/recovery behavior is unchanged.
+Fresh autonomous route writes use only the production composition in
 `scripts/constitutional-routing-cli.ts`.
 
 Production remains inert. The repository ships no live authorization, owner key, recovery private
