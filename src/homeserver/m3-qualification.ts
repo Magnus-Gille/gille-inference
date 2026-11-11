@@ -1059,67 +1059,68 @@ function invalidSnapshotValue(raw: unknown): { sha256: string; observedAt: strin
   };
 }
 
-export function evaluateM3Qualification(input: M3QualificationInput): M3QualificationDecision {
-  const raw = input as unknown;
-  const record = isRecord(raw) ? raw : {};
-  const globalReasons: string[] = [];
-  if (record.contract !== M3_QUALIFICATION_CONTRACT || record.version !== M3_QUALIFICATION_VERSION) globalReasons.push("invalid_input");
-
+function validateTemporalEvidence(
+  record: AnyRecord,
+  reasons: string[],
+): {
+  asOf: string;
+  asOfMillis: number | null;
+  window: QualificationWindow;
+  startMillis: number | null;
+  endMillis: number | null;
+  snapshot: { sha256: string; observedAt: string };
+  observedMillis: number | null;
+} {
   const evaluation = isRecord(record.evaluation) ? record.evaluation : {};
   const asOfMillis = parseCanonicalIso(evaluation.asOf);
-  const asOf = asOfMillis === null ? "" : (evaluation.asOf as string);
-  if (asOfMillis === null) globalReasons.push("invalid_input");
+  const asOf = asOfMillis === null ? "" : evaluation.asOf as string;
+  if (asOfMillis === null) reasons.push("invalid_input");
 
   const window = invalidWindowValue(record.window);
   const startMillis = parseCanonicalIso(window.start);
   const endMillis = parseCanonicalIso(window.end);
-  if (startMillis === null || endMillis === null || startMillis >= endMillis) globalReasons.push("invalid_window");
-  if (asOfMillis !== null && endMillis !== null && endMillis > asOfMillis) globalReasons.push("window_after_asof");
+  if (startMillis === null || endMillis === null || startMillis >= endMillis) reasons.push("invalid_window");
+  if (asOfMillis !== null && endMillis !== null && endMillis > asOfMillis) reasons.push("window_after_asof");
 
   const snapshot = invalidSnapshotValue(record.snapshot);
   const snapshotRecord = isRecord(record.snapshot) ? record.snapshot : {};
   const observedMillis = parseCanonicalIso(snapshot.observedAt);
-  if (!digest(snapshotRecord.sha256) || snapshotRecord.immutable !== true || observedMillis === null) globalReasons.push("invalid_snapshot");
-  if (asOfMillis !== null && observedMillis !== null) {
-    if (observedMillis > asOfMillis) globalReasons.push("snapshot_after_asof");
+  if (!digest(snapshotRecord.sha256) || snapshotRecord.immutable !== true || observedMillis === null) {
+    reasons.push("invalid_snapshot");
   }
-  if (endMillis !== null && observedMillis !== null && observedMillis < endMillis) {
-    globalReasons.push("snapshot_before_window_end");
-  }
+  if (asOfMillis !== null && observedMillis !== null && observedMillis > asOfMillis) reasons.push("snapshot_after_asof");
+  if (endMillis !== null && observedMillis !== null && observedMillis < endMillis) reasons.push("snapshot_before_window_end");
 
-  const thresholdValue = record.thresholds;
-  let thresholds: QualificationThresholds | null = null;
-  if (thresholdValue === null) {
-    globalReasons.push("missing_thresholds");
-  } else {
-    const validated = validateThresholds(thresholdValue);
-    thresholds = validated.thresholds;
-    globalReasons.push(...validated.reasons);
-  }
+  return { asOf, asOfMillis, window, startMillis, endMillis, snapshot, observedMillis };
+}
+
+function validateEvidenceFreshness(
+  temporal: ReturnType<typeof validateTemporalEvidence>,
+  thresholds: { maxEvidenceAgeMs: number; review: QualificationThresholdReview } | null,
+  reasons: string[],
+): void {
+  const { asOfMillis, startMillis, endMillis, observedMillis } = temporal;
   if (thresholds !== null && startMillis !== null) {
     const reviewedMillis = parseCanonicalIso(thresholds.review.reviewedAt);
-    if (reviewedMillis !== null && reviewedMillis >= startMillis) globalReasons.push("review_after_window");
+    if (reviewedMillis !== null && reviewedMillis >= startMillis) reasons.push("review_after_window");
   }
   if (thresholds !== null && asOfMillis !== null && observedMillis !== null) {
     const age = asOfMillis - observedMillis;
-    if (age < 0 || age > thresholds.maxEvidenceAgeMs) globalReasons.push("stale_snapshot");
+    if (age < 0 || age > thresholds.maxEvidenceAgeMs) reasons.push("stale_snapshot");
   }
   if (thresholds !== null && asOfMillis !== null && endMillis !== null) {
     const age = asOfMillis - endMillis;
-    if (age > thresholds.maxEvidenceAgeMs) globalReasons.push("stale_window");
+    if (age > thresholds.maxEvidenceAgeMs) reasons.push("stale_window");
   }
+}
 
-  const rawCandidates = Array.isArray(record.candidates) ? record.candidates : [];
-  if (!Array.isArray(record.candidates)) globalReasons.push("invalid_input");
-  const reports: QualificationCandidateReport[] = [];
-  for (const rawCandidate of rawCandidates) {
-    reports.push(validateCandidate(rawCandidate, thresholds));
-  }
+function sortAndMarkDuplicateCandidates(reports: QualificationCandidateReport[]): void {
   reports.sort((left, right) => {
     const leftKey = keyString(left.key);
     const rightKey = keyString(right.key);
     return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
   });
+
   const keyCounts = new Map<string, number>();
   for (const report of reports) {
     const stableKey = keyString(report.key);
@@ -1131,6 +1132,7 @@ export function evaluateM3Qualification(input: M3QualificationInput): M3Qualific
       report.diagnostic = "HOLD";
     }
   }
+
   const identityCounts = new Map<string, number>();
   for (const report of reports) {
     if (IDENTITY_FIELDS.every((field) => digest(report.identity[field]))) {
@@ -1145,6 +1147,35 @@ export function evaluateM3Qualification(input: M3QualificationInput): M3Qualific
       report.diagnostic = "HOLD";
     }
   }
+}
+
+export function evaluateM3Qualification(input: M3QualificationInput): M3QualificationDecision {
+  const raw = input as unknown;
+  const record = isRecord(raw) ? raw : {};
+  const globalReasons: string[] = [];
+  if (record.contract !== M3_QUALIFICATION_CONTRACT || record.version !== M3_QUALIFICATION_VERSION) globalReasons.push("invalid_input");
+
+  const temporal = validateTemporalEvidence(record, globalReasons);
+  const { asOf, window, snapshot } = temporal;
+
+  const thresholdValue = record.thresholds;
+  let thresholds: QualificationThresholds | null = null;
+  if (thresholdValue === null) {
+    globalReasons.push("missing_thresholds");
+  } else {
+    const validated = validateThresholds(thresholdValue);
+    thresholds = validated.thresholds;
+    globalReasons.push(...validated.reasons);
+  }
+  validateEvidenceFreshness(temporal, thresholds, globalReasons);
+
+  const rawCandidates = Array.isArray(record.candidates) ? record.candidates : [];
+  if (!Array.isArray(record.candidates)) globalReasons.push("invalid_input");
+  const reports: QualificationCandidateReport[] = [];
+  for (const rawCandidate of rawCandidates) {
+    reports.push(validateCandidate(rawCandidate, thresholds));
+  }
+  sortAndMarkDuplicateCandidates(reports);
   const passing = reports.filter((report) => report.diagnostic === "PASS");
   if (passing.length > 1) globalReasons.push("multiple_passing_candidates");
   const hasGlobalHold = globalReasons.length > 0;
@@ -1196,23 +1227,8 @@ export function evaluateM3FirstCanaryQualification(input: M3FirstCanaryInput): M
   if (record.mode !== "cost-unassessed") globalReasons.push("invalid_mode");
   if (!validateFirstCanaryDeferral(record.costDeferral)) globalReasons.push("invalid_cost_deferral");
 
-  const evaluation = isRecord(record.evaluation) ? record.evaluation : {};
-  const asOfMillis = parseCanonicalIso(evaluation.asOf);
-  const asOf = asOfMillis === null ? "" : (evaluation.asOf as string);
-  if (asOfMillis === null) globalReasons.push("invalid_input");
-
-  const window = invalidWindowValue(record.window);
-  const startMillis = parseCanonicalIso(window.start);
-  const endMillis = parseCanonicalIso(window.end);
-  if (startMillis === null || endMillis === null || startMillis >= endMillis) globalReasons.push("invalid_window");
-  if (asOfMillis !== null && endMillis !== null && endMillis > asOfMillis) globalReasons.push("window_after_asof");
-
-  const snapshot = invalidSnapshotValue(record.snapshot);
-  const snapshotRecord = isRecord(record.snapshot) ? record.snapshot : {};
-  const observedMillis = parseCanonicalIso(snapshot.observedAt);
-  if (!digest(snapshotRecord.sha256) || snapshotRecord.immutable !== true || observedMillis === null) globalReasons.push("invalid_snapshot");
-  if (asOfMillis !== null && observedMillis !== null && observedMillis > asOfMillis) globalReasons.push("snapshot_after_asof");
-  if (endMillis !== null && observedMillis !== null && observedMillis < endMillis) globalReasons.push("snapshot_before_window_end");
+  const temporal = validateTemporalEvidence(record, globalReasons);
+  const { asOf, window, snapshot } = temporal;
 
   const thresholdValue = record.thresholds;
   let thresholds: M3FirstCanaryThresholds | null = null;
@@ -1223,55 +1239,14 @@ export function evaluateM3FirstCanaryQualification(input: M3FirstCanaryInput): M
     thresholds = validated.thresholds;
     globalReasons.push(...validated.reasons);
   }
-  if (thresholds !== null && startMillis !== null) {
-    const reviewedMillis = parseCanonicalIso(thresholds.review.reviewedAt);
-    if (reviewedMillis !== null && reviewedMillis >= startMillis) globalReasons.push("review_after_window");
-  }
-  if (thresholds !== null && asOfMillis !== null && observedMillis !== null) {
-    const age = asOfMillis - observedMillis;
-    if (age < 0 || age > thresholds.maxEvidenceAgeMs) globalReasons.push("stale_snapshot");
-  }
-  if (thresholds !== null && asOfMillis !== null && endMillis !== null) {
-    const age = asOfMillis - endMillis;
-    if (age > thresholds.maxEvidenceAgeMs) globalReasons.push("stale_window");
-  }
+  validateEvidenceFreshness(temporal, thresholds, globalReasons);
 
   const rawCandidates = Array.isArray(record.candidates) ? record.candidates : [];
   if (!Array.isArray(record.candidates)) globalReasons.push("invalid_input");
   const reports: QualificationCandidateReport[] = rawCandidates.map((candidate) =>
     validateCandidate(candidate, thresholds, "unassessed"),
   );
-  reports.sort((left, right) => {
-    const leftKey = keyString(left.key);
-    const rightKey = keyString(right.key);
-    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
-  });
-
-  const keyCounts = new Map<string, number>();
-  for (const report of reports) {
-    const stableKey = keyString(report.key);
-    keyCounts.set(stableKey, (keyCounts.get(stableKey) ?? 0) + 1);
-  }
-  for (const report of reports) {
-    if ((keyCounts.get(keyString(report.key)) ?? 0) > 1) {
-      report.reasons = sortedReasons([...report.reasons, "duplicate_candidate"]);
-      report.diagnostic = "HOLD";
-    }
-  }
-  const identityCounts = new Map<string, number>();
-  for (const report of reports) {
-    if (IDENTITY_FIELDS.every((field) => digest(report.identity[field]))) {
-      const identityKey = IDENTITY_FIELDS.map((field) => report.identity[field]).join("\u001f");
-      identityCounts.set(identityKey, (identityCounts.get(identityKey) ?? 0) + 1);
-    }
-  }
-  for (const report of reports) {
-    const identityKey = IDENTITY_FIELDS.map((field) => report.identity[field]).join("\u001f");
-    if ((identityCounts.get(identityKey) ?? 0) > 1) {
-      report.reasons = sortedReasons([...report.reasons, "duplicate_identity"]);
-      report.diagnostic = "HOLD";
-    }
-  }
+  sortAndMarkDuplicateCandidates(reports);
 
   const passing = reports.filter((report) => report.diagnostic === "PASS");
   if (passing.length > 1) globalReasons.push("multiple_passing_candidates");
