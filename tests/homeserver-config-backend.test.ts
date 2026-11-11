@@ -1,11 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { loadConfig, resetConfig } from "../src/homeserver/config.js";
 
-/**
- * Config-loader coverage for HOMESERVER_BACKEND (#146). llama-swap is the only backend that
- * still gets production traffic — lmstudio is deprecated — so an env omission (fresh deploy,
- * restore from backup) must land on llamaswap, not silently reactivate the deprecated adapter.
- */
+/** The retired adapter fails explicitly; supported and unknown legacy settings retain llama-swap. */
 
 const KEY = "HOMESERVER_BACKEND";
 const STARTUP_EXCLUSIVE_KEY = "HOMESERVER_STARTUP_EXCLUSIVE_UNTIL";
@@ -33,10 +29,10 @@ describe("HOMESERVER_BACKEND config loader", () => {
     expect(loadConfig().backend).toBe("llamaswap");
   });
 
-  it("honours an explicit lmstudio override (deprecated, kept one release)", () => {
+  it("rejects the removed lmstudio backend with migration guidance", () => {
     process.env[KEY] = "lmstudio";
     resetConfig();
-    expect(loadConfig().backend).toBe("lmstudio");
+    expect(() => loadConfig()).toThrow(/HOMESERVER_BACKEND=lmstudio.*removed.*llama-swap/);
   });
 
   it("honours an explicit llamaswap override", () => {

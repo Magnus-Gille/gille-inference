@@ -244,15 +244,8 @@ export const DEFAULT_DELEGATE_POLICY: DelegatePolicyConfig = {
 export interface HomeserverConfig {
   /** OpenAI-compatible base, e.g. http://127.0.0.1:1234/v1 */
   lmStudioBaseUrl: string;
-  /** LM Studio native REST base, e.g. http://127.0.0.1:1234/api/v1 (richer model info) */
-  lmStudioRestUrl: string;
-  /**
-   * Which model-admin backend to use. Default: "llamaswap". The "lmstudio" adapter is
-   * DEPRECATED (#146) — kept for one release for callers still pointed at LM Studio, but
-   * an env omission (fresh deploy, restore from backup) must land on llamaswap, not
-   * silently reactivate the deprecated adapter.
-   */
-  backend: "lmstudio" | "llamaswap";
+  /** Model administration uses llama-swap. The LM Studio adapter has been removed. */
+  backend: "llamaswap";
   /**
    * Explicit roster-ID -> served-identity declarations for the direct chat relay (INFER-343).
    * Env `HOMESERVER_SERVED_MODEL_ALIASES="roster-id=served-name,..."`. A backend response whose
@@ -709,9 +702,12 @@ export function loadConfig(): HomeserverConfig {
   if (_config) return _config;
   loadEnv();
 
-  // LM Studio reachable base — accept either a /v1 URL or a bare host:port.
+  if (process.env["HOMESERVER_BACKEND"] === "lmstudio") {
+    throw new Error("HOMESERVER_BACKEND=lmstudio support was removed; migrate model administration to llama-swap and unset HOMESERVER_BACKEND or set it to llamaswap. LMSTUDIO_BASE_URL remains the OpenAI-compatible upstream URL.");
+  }
+
+  // OpenAI-compatible upstream base; retain the legacy environment name.
   const lmBase = (process.env["LMSTUDIO_BASE_URL"] ?? "http://127.0.0.1:1234/v1").replace(/\/$/, "");
-  const origin = lmBase.replace(/\/v1$/, "");
   const blindContextRoots = envColonList("HOMESERVER_BLIND_CONTEXT_ROOTS");
   const embeddingModels = envList("HOMESERVER_EMBEDDING_MODELS");
   if (embeddingModels.some((model) => !isEmbeddingModel(model)) ||
@@ -746,13 +742,12 @@ export function loadConfig(): HomeserverConfig {
     );
   }
   // The shared lmstudio-client reads LMSTUDIO_BASE_URL directly; keep it aligned so the
-  // orchestrator and the raw client never disagree on where LM Studio lives.
+  // orchestrator and the raw client never disagree on the upstream base URL.
   if (!process.env["LMSTUDIO_BASE_URL"]) process.env["LMSTUDIO_BASE_URL"] = lmBase;
 
   _config = {
     lmStudioBaseUrl: lmBase,
-    lmStudioRestUrl: `${origin}/api/v1`,
-    backend: (process.env["HOMESERVER_BACKEND"] === "lmstudio" ? "lmstudio" : "llamaswap"),
+    backend: "llamaswap",
     servedModelAliases: parseServedModelAliases(envList(SERVED_MODEL_ALIASES_ENV)),
     servedModelIdentity: parseServedModelIdentityMode(process.env[SERVED_MODEL_IDENTITY_MODE_ENV]),
     systemOneModels: envList("HOMESERVER_SYSTEMONE_MODELS"),

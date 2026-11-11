@@ -56,7 +56,6 @@ describe("currentModel — resolves via the configured backend (llamaswap)", () 
     setConfig({
       backend: "llamaswap",
       lmStudioBaseUrl: `http://127.0.0.1:${port}/v1`,
-      lmStudioRestUrl: `http://127.0.0.1:${port}/api/v1`, // would 404 — proves we do NOT use it
     });
     const model = await currentModel();
     expect(model).toBe("test-model");

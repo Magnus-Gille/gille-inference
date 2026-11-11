@@ -4309,7 +4309,7 @@ export function startGateway(
         console.warn(
           "⚠  No API keys configured (loopback only). Protected routes still require a bearer; mint the first key with the local CLI."
         );
-      console.log(`   proxying LM Studio at ${cfg.lmStudioBaseUrl}`);
+      console.log(`   proxying inference upstream at ${cfg.lmStudioBaseUrl}`);
       resolve({
         port,
         stop: async () => {

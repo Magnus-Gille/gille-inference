@@ -23,8 +23,8 @@ accumulates a verdict per `(node, task_type, model)` — `viable` / `marginal` /
 
 | File | Role |
 |---|---|
-| `config.ts` | Env-driven config: LM Studio URL, gateway host/port, API keys, routing policy. |
-| `lmstudio-admin.ts` | **DEPRECATED (#146)** — no production traffic (llama-swap is the default backend). Kept one release. Programmatic model control via the `lms` CLI + REST: list / load / unload / download / `ensureLoaded(minCtx)`. |
+| `config.ts` | Env-driven config: upstream URL, gateway host/port, API keys, routing policy. |
+| `model-admin.ts` / `llamaswap-admin.ts` | Model administration through llama-swap: catalogue, running observations, warm-up load, unload, and explicit unsupported download result. Shared types, validators and observation errors live in `model-admin-contract.ts`. |
 | `ledger.ts` | The capability ledger. Records delegations; computes verdicts; `shouldDelegate()` policy. |
 | `taxonomy.ts` | Task-type list + heuristic classifier. |
 | `verifier.ts` | Deterministic verifiers (exact / contains / regex / numeric / JSON / maxlen / predicate) + a TypeScript compile-and-run gate. |
@@ -1060,10 +1060,17 @@ tsx src/homeserver/cli.ts gpu status
 
 ## Environment variables
 
+The deprecated LM Studio model-admin adapter has been removed. Migrate installations using
+`HOMESERVER_BACKEND=lmstudio` to llama-swap and unset that variable or set it to `llamaswap`.
+The generic OpenAI-compatible client and its legacy `LMSTUDIO_BASE_URL` setting remain supported.
+Historical roster-proposal backend identities remain valid protocol values; they do not enable
+a removed serving adapter.
+
 ```
-LMSTUDIO_BASE_URL=http://127.0.0.1:1234/v1   # LM Studio OpenAI-compat base (also used as llama-swap base when HOMESERVER_BACKEND=llamaswap, strip /v1)
-HOMESERVER_BACKEND=llamaswap                  # Model-admin backend: "llamaswap" (default, #146) | "lmstudio" (DEPRECATED — kept one release)
-HOMESERVER_USE_ROUTING_TABLE=off              # "on" → orchestrator uses docs/m5-routing.json (routing-table.ts) to pick the model per task type + escalate gap types (sql) to frontier. Default "off" (loaded-model + ledger). Explicit task.modelId always wins. Pairs best with HOMESERVER_BACKEND=llamaswap (hot-swaps the routed model in); on the deprecated lmstudio backend a routed-but-not-resident model fails SAFE — the local call errors and escalates to frontier (never a wrong answer, just an extra escalation). Owner-tier /delegate path only.
+LMSTUDIO_BASE_URL=http://127.0.0.1:1234/v1   # legacy name for the OpenAI-compatible upstream base; llama-swap origin strips /v1
+HOMESERVER_BACKEND=llamaswap                  # Optional: llama-swap is the only model-admin backend; explicit lmstudio fails startup
+LLAMASWAP_BASE_URL=                          # Optional model-admin origin override; otherwise derived from LMSTUDIO_BASE_URL
+HOMESERVER_USE_ROUTING_TABLE=off              # "on" → orchestrator uses docs/m5-routing.json (routing-table.ts) to pick the model per task type + escalate gap types (sql) to frontier. Default "off" (loaded-model + ledger). Explicit task.modelId always wins. llama-swap hot-swaps the routed model in. Owner-tier /delegate path only.
 HOMESERVER_SHADOW_LANE=off                    # "on" → after a no-local-attempt frontier escalation, run a lowest-priority M5 candidate in the background and store shadow-flagged candidate evidence. Never returned to the caller; excluded from normal ledger rollups.
 HOMESERVER_SHADOW_LANE_MODEL=                  # Explicit local candidate model. Empty falls back to the currently loaded model.
 HOMESERVER_SHADOW_LANE_TASK_TYPES=             # Optional comma-separated allow-list; empty shadows every escalated task type.

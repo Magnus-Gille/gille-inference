@@ -4,7 +4,7 @@ import { createModelStartAdmission, HostMemoryAdmissionError } from "../src/home
 const GIB = 2 ** 30;
 function fixture(mode: "off" | "shadow" | "enforce") {
   const log = vi.fn();
-  const getRunning = vi.fn(async () => [] as import("../src/homeserver/lmstudio-admin.js").RunningSnapshotEntry[]);
+  const getRunning = vi.fn(async () => [] as import("../src/homeserver/model-admin-contract.js").RunningSnapshotEntry[]);
   const readMemory = vi.fn(async () => ({ ok: true as const, memory: {
     memTotalBytes: 100 * GIB, memAvailableBytes: 10 * GIB,
     cmaFreeBytes: null, gttUsedBytes: null, gttTotalBytes: null,
