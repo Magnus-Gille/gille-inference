@@ -389,6 +389,35 @@ function decInflight(alias: string): void {
   else keyInflight.set(alias, n);
 }
 
+/**
+ * Shared settlement tail for synchronous requests holding an admission slot. `quotaUsage` keeps each
+ * route's unit (tokens, audio seconds, or images) separate from `actualCredits`. A failed call
+ * passes zero so the exact quota/credit reservations are released. Async image workers settle in
+ * their own lifecycle and do not use this helper.
+ */
+function settlePostAdmissionUsage(input: {
+  release: () => void;
+  principal: Pick<PrincipalContext, "alias" | "tier" | "keyHash">;
+  node?: "m5" | "orin";
+  quotaUsage: number;
+  quotaReservation: QuotaReservation;
+  creditReserved: boolean;
+  reservedCredits: number;
+  actualCredits: number;
+}): void {
+  input.release();
+  decInflight(input.principal.alias);
+  inflightDec(input.principal.tier, input.node);
+  recordUsage(input.principal.alias, input.quotaUsage, Date.now(), input.quotaReservation);
+  if (input.principal.keyHash !== null) {
+    if (input.creditReserved) {
+      reconcileCredits(input.principal.keyHash, input.reservedCredits, input.actualCredits);
+    } else {
+      recordCreditUsage(input.principal.keyHash, input.actualCredits);
+    }
+  }
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────────
 
 /**
@@ -880,6 +909,38 @@ class BodyTooLargeError extends Error {
   }
 }
 
+type BoundedJsonBodyResult =
+  | { ok: true; value: unknown }
+  | { ok: false; reason: "too_large" | "read_error" | "invalid_json" };
+
+async function readBoundedJsonBody(req: IncomingMessage, maxBytes: number): Promise<BoundedJsonBodyResult> {
+  let raw: string;
+  try {
+    raw = await readBody(req, maxBytes);
+  } catch (err) {
+    return { ok: false, reason: err instanceof BodyTooLargeError ? "too_large" : "read_error" };
+  }
+  try {
+    return { ok: true, value: JSON.parse(raw) as unknown };
+  } catch {
+    return { ok: false, reason: "invalid_json" };
+  }
+}
+
+function sendBoundedJsonBodyError(
+  failure: Extract<BoundedJsonBodyResult, { ok: false }>,
+  res: ServerResponse,
+  lctx: LogCtx,
+): void {
+  const tooLarge = failure.reason === "too_large";
+  const errorClass = tooLarge ? "payload_too_large" : "invalid_request_error";
+  lctx.status = tooLarge ? 413 : 400;
+  lctx.outcome = "bad_request";
+  lctx.errorClass = errorClass;
+  const message = failure.reason === "invalid_json" ? "Request body must be valid JSON." : undefined;
+  sendError(res, makeError(errorClass, message === undefined ? undefined : { message }));
+}
+
 /**
  * Read the request body as a raw Buffer (BINARY-SAFE — never decodes to utf-8). Used for the
  * multipart audio upload, where a utf-8 round-trip would corrupt the audio bytes.
@@ -1275,25 +1336,17 @@ async function admitAndMeterLogged(
     // the canonical served model only.
     if (result.ttftMs !== null) recordTtft(lctx.model, result.ttftMs);
   } finally {
-    release();
-    decInflight(principal.alias);
-    inflightDec(principal.tier, lctx.node === "orin" ? "orin" : "m5");
-    // M1: reconcile the EXACT admitted quota event + daily delta via the reservation handle.
-    recordUsage(principal.alias, actualTokens, Date.now(), reservation);
-    // Settle the lifetime credit ledger for minted store keys (keyHash present). Legacy
-    // static keys have no credit row and are skipped.
-    if (principal.keyHash !== null) {
-      if (creditReserved) {
-        // Reconcile the atomic reservation to real usage: adjust by (real − reserve). An
-        // errored/non-completed call has actualTokens 0 (C2/HIGH-2), so the reserve is fully
-        // released — no charge for a failed completion.
-        reconcileCredits(principal.keyHash, creditReserve, actualCreditTokens);
-      } else {
-        // Uncapped key (creditLimit 0): nothing was reserved, so accrue real usage directly.
-        recordCreditUsage(principal.keyHash, actualCreditTokens);
-      }
-      creditsCharged = actualCreditTokens;
-    }
+    settlePostAdmissionUsage({
+      release,
+      principal,
+      node: lctx.node === "orin" ? "orin" : "m5",
+      quotaUsage: actualTokens,
+      quotaReservation: reservation,
+      creditReserved,
+      reservedCredits: creditReserve,
+      actualCredits: actualCreditTokens,
+    });
+    if (principal.keyHash !== null) creditsCharged = actualCreditTokens;
     // M3: feed the credits charged for this request into the metrics record site.
     lctx.creditsCharged = creditsCharged;
     afterRelease?.();
@@ -3455,27 +3508,15 @@ async function handleAudioTranscriptionAdmitted(
       sendJson(res, 200, { text: transcript });
     }
   } finally {
-    release();
-    decInflight(principal.alias);
-    inflightDec(principal.tier);
-    // Reconcile the quota reservation to the REAL audio-seconds (worst-case estimate → actual).
-    // A failed call left actualSeconds 0, so the TPM/daily reservation is fully released; the chat
-    // path's recordUsage(...reservation) contract reconciles by event id under concurrency.
-    recordUsage(principal.alias, actualSeconds, Date.now(), q.reservation);
-    // Settle the lifetime credit ledger for minted store keys. We reserved worstCaseCost up-front;
-    // reconcile it DOWN to the real cost (a valid duration refunds the difference; a fault keeps the
-    // full reservation; a failed call → actualCost 0 → full refund). Legacy static keys
-    // (keyHash null) reserved nothing and are uncapped by design.
-    if (principal.keyHash !== null) {
-      if (creditReserved) {
-        reconcileCredits(principal.keyHash, worstCaseCost, actualCost);
-        creditReserved = false;
-      } else {
-        // Uncapped minted key (creditLimit 0): nothing reserved → accrue real usage directly
-        // (recordCreditUsage is a no-op for cost 0, so a failed call still charges nothing).
-        recordCreditUsage(principal.keyHash, actualCost);
-      }
-    }
+    settlePostAdmissionUsage({
+      release,
+      principal,
+      quotaUsage: actualSeconds,
+      quotaReservation: q.reservation,
+      creditReserved,
+      reservedCredits: worstCaseCost,
+      actualCredits: actualCost,
+    });
   }
 }
 
@@ -3740,19 +3781,15 @@ async function handleImageGeneration(
     }
     sendJson(res, 200, { created: Math.floor(callStart / 1000), data: b64.map((s) => ({ b64_json: s })) });
   } finally {
-    release();
-    decInflight(principal.alias);
-    inflightDec(principal.tier);
-    // Reconcile quota to delivered images (failed call → 0 → full release).
-    recordUsage(principal.alias, delivered, Date.now(), q.reservation);
-    if (principal.keyHash !== null) {
-      if (creditReserved) {
-        reconcileCredits(principal.keyHash, worstCaseCost, actualCost);
-        creditReserved = false;
-      } else {
-        recordCreditUsage(principal.keyHash, actualCost);
-      }
-    }
+    settlePostAdmissionUsage({
+      release,
+      principal,
+      quotaUsage: delivered,
+      quotaReservation: q.reservation,
+      creditReserved,
+      reservedCredits: worstCaseCost,
+      actualCredits: actualCost,
+    });
   }
 }
 
@@ -5081,28 +5118,12 @@ export async function handleRequest(
         );
         return;
       }
-      let raw: string;
-      try {
-        raw = await readBody(req, 32 * 1024);
-      } catch (err) {
-        const tooLarge = err instanceof BodyTooLargeError;
-        lctx.status = tooLarge ? 413 : 400;
-        lctx.outcome = "bad_request";
-        lctx.errorClass = tooLarge ? "payload_too_large" : "invalid_request_error";
-        sendError(res, makeError(tooLarge ? "payload_too_large" : "invalid_request_error"));
+      const body = await readBoundedJsonBody(req, 32 * 1024);
+      if (!body.ok) {
+        sendBoundedJsonBodyError(body, res, lctx);
         return;
       }
-      let body: unknown;
-      try {
-        body = JSON.parse(raw);
-      } catch {
-        lctx.status = 400;
-        lctx.outcome = "bad_request";
-        lctx.errorClass = "invalid_request_error";
-        sendError(res, makeError("invalid_request_error", { message: "Request body must be valid JSON." }));
-        return;
-      }
-      const parsed = parseTaskExposureLookupRequest(body);
+      const parsed = parseTaskExposureLookupRequest(body.value);
       if (!parsed.ok) {
         lctx.status = 400;
         lctx.outcome = "bad_request";
@@ -5137,28 +5158,12 @@ export async function handleRequest(
         sendError(res, makeError("route_not_allowed", { message: "This endpoint requires a minted owner-admin key." }));
         return;
       }
-      let raw: string;
-      try {
-        raw = await readBody(req, 16 * 1024);
-      } catch (err) {
-        const tooLarge = err instanceof BodyTooLargeError;
-        lctx.status = tooLarge ? 413 : 400;
-        lctx.outcome = "bad_request";
-        lctx.errorClass = tooLarge ? "payload_too_large" : "invalid_request_error";
-        sendError(res, makeError(tooLarge ? "payload_too_large" : "invalid_request_error"));
+      const body = await readBoundedJsonBody(req, 16 * 1024);
+      if (!body.ok) {
+        sendBoundedJsonBodyError(body, res, lctx);
         return;
       }
-      let body: unknown;
-      try {
-        body = JSON.parse(raw);
-      } catch {
-        lctx.status = 400;
-        lctx.outcome = "bad_request";
-        lctx.errorClass = "invalid_request_error";
-        sendError(res, makeError("invalid_request_error", { message: "Request body must be valid JSON." }));
-        return;
-      }
-      const result = ingestExposureReceipt(body, principal.alias);
+      const result = ingestExposureReceipt(body.value, principal.alias);
       res.setHeader("cache-control", "no-store");
       if (result.status === "rejected") {
         sendJson(res, 400, result);
@@ -5187,29 +5192,15 @@ export async function handleRequest(
         sendError(res, makeError("route_not_allowed", { message: "This endpoint requires a minted owner-admin key." }));
         return;
       }
-      let raw: string;
-      try {
-        raw = await readBody(req, 4 * 1024);
-      } catch (err) {
-        const tooLarge = err instanceof BodyTooLargeError;
-        lctx.status = tooLarge ? 413 : 400;
-        lctx.outcome = "bad_request";
-        lctx.errorClass = tooLarge ? "payload_too_large" : "invalid_request_error";
-        sendError(res, makeError(tooLarge ? "payload_too_large" : "invalid_request_error"));
-        return;
-      }
-      let body: unknown;
-      try {
-        body = JSON.parse(raw);
-      } catch {
-        lctx.status = 400;
-        lctx.outcome = "bad_request";
-        lctx.errorClass = "invalid_request_error";
-        sendError(res, makeError("invalid_request_error", { message: "Request body must be valid JSON." }));
+      const body = await readBoundedJsonBody(req, 4 * 1024);
+      if (!body.ok) {
+        sendBoundedJsonBodyError(body, res, lctx);
         return;
       }
       const surfaceParsed = exposureReceiptSurfaceSchema.safeParse(
-        body !== null && typeof body === "object" ? (body as Record<string, unknown>)["surface"] : undefined
+        body.value !== null && typeof body.value === "object"
+          ? (body.value as Record<string, unknown>)["surface"]
+          : undefined
       );
       if (!surfaceParsed.success) {
         lctx.status = 400;
@@ -5242,28 +5233,12 @@ export async function handleRequest(
     if (path === "/admin/experiments/import" && method === "POST") {
       lctx.admission = "n/a";
       if (!requireAdmin()) return;
-      let raw: string;
-      try {
-        raw = await readBody(req, 1 * 1024 * 1024);
-      } catch (err) {
-        const tooLarge = err instanceof BodyTooLargeError;
-        lctx.status = tooLarge ? 413 : 400;
-        lctx.outcome = "bad_request";
-        lctx.errorClass = tooLarge ? "payload_too_large" : "invalid_request_error";
-        sendError(res, makeError(tooLarge ? "payload_too_large" : "invalid_request_error"));
+      const body = await readBoundedJsonBody(req, 1 * 1024 * 1024);
+      if (!body.ok) {
+        sendBoundedJsonBodyError(body, res, lctx);
         return;
       }
-      let body: unknown;
-      try {
-        body = JSON.parse(raw);
-      } catch {
-        lctx.status = 400;
-        lctx.outcome = "bad_request";
-        lctx.errorClass = "invalid_request_error";
-        sendError(res, makeError("invalid_request_error", { message: "Request body must be valid JSON." }));
-        return;
-      }
-      const parsed = parseHuginExperimentOutcomeBundle(body);
+      const parsed = parseHuginExperimentOutcomeBundle(body.value);
       if (!parsed.ok) {
         lctx.status = 400;
         lctx.outcome = "bad_request";

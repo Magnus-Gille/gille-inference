@@ -114,6 +114,27 @@ describe("POST /admin/experiments/import (#8)", () => {
     expect(j.error.code).toBe("invalid_request_error");
   });
 
+  it("keeps the import JSON parser error and 1 MiB byte cap", async () => {
+    const maxBytes = 1 * 1024 * 1024;
+    const atLimit = await fetch(url("/admin/experiments/import"), {
+      method: "POST",
+      headers: auth(ownerKey),
+      body: " ".repeat(maxBytes),
+    });
+    expect(atLimit.status).toBe(400);
+    expect(await atLimit.json()).toMatchObject({
+      error: { code: "invalid_request_error", message: "Request body must be valid JSON." },
+    });
+
+    const overLimit = await fetch(url("/admin/experiments/import"), {
+      method: "POST",
+      headers: auth(ownerKey),
+      body: " ".repeat(maxBytes + 1),
+    });
+    expect(overLimit.status).toBe(413);
+    expect(await overLimit.json()).toMatchObject({ error: { code: "payload_too_large" } });
+  });
+
   it("admits a well-formed admissible bundle and makes it visible on GET /ledger", async () => {
     const res = await postImport(ownerKey, admissibleBundle({ experimentId: "exp-gw-admit" }));
     expect(res.status).toBe(200);
