@@ -390,7 +390,7 @@ function decInflight(alias: string): void {
 }
 
 /**
- * Shared settlement tail for synchronous requests holding a GPU lease. `quotaUsage` keeps each
+ * Shared settlement tail for synchronous requests holding an admission slot. `quotaUsage` keeps each
  * route's unit (tokens, audio seconds, or images) separate from `actualCredits`. A failed call
  * passes zero so the exact quota/credit reservations are released. Async image workers settle in
  * their own lifecycle and do not use this helper.
