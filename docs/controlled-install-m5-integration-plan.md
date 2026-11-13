@@ -262,6 +262,15 @@ ceilings, expiry and supplied artifact hashes. It neither authenticates qualific
 executes the packet; the privileged packet/launcher tooling must still be built/tested at G0. Refuse execution
 until every packet field is concrete. The merged diagnostic SHA is not the future integrated release.
 
+**Downstream revision pins.** If the gateway SHA changed, Mímir's search reader must be re-pinned. Mímir's
+`mimir/search-semantic` Heimdall panel turns `fail` (`embedding_gateway_revision_mismatch`) within about five
+minutes. On the reader host, as the reader user, run `search.pyz ops repin-embedding` as a dry run. Confirm that
+`new_revision` equals this deploy's SHA, then run it again with `--apply --expect-gateway <deployed SHA>` and
+restart `mimir-search.service`. The model SHA-256 is unchanged by a gateway-only deploy, and the command refuses a
+model change. See Mímir [`docs/artifact-search-operations.md`](https://github.com/Magnus-Gille/mimir/blob/main/docs/artifact-search-operations.md#gateway-revision-drift)
+(`#gateway-revision-drift`). The re-pin is not automated on either side; it is an explicit, owner-approved operator
+action. `search.pyz`, `ops repin-embedding` and `mimir-search.service` live in the Mímir repo, not in this one.
+
 ### G2 bootstrap and availability impact
 
 Choose an explicitly approved **stop-and-replace outage** to bootstrap telemetry. Before instrumentation
