@@ -190,13 +190,32 @@ StandardOutput=journal
 StandardError=null
 UNIT
 done
+# Failure evidence only. The listener writes no output, so the excerpt holds manager
+# lines for this one fixture unit; every other value is a fixed fixture name or host fact.
+report_socket_fixture_failure() {
+  local unit=gi-observer-fixture-sockets.service
+  {
+    echo "--- $unit state ---"
+    systemctl show "$unit" -p LoadState -p ActiveState -p SubState -p Result \
+      -p ExecMainCode -p ExecMainStatus -p MainPID || true
+    echo "--- $unit journal, last 20 lines ---"
+    journalctl --quiet -u "$unit" --output=cat --no-pager -n 20 | cut -c1-240 || true
+    echo '--- fixture filesystem ---'
+    uname -r || true
+    findmnt -n -o TARGET,FSTYPE,OPTIONS -T "$fixture" || true
+    stat -c '%A %U:%G %n' "$fixture" "$fixture/socket-listener" "$fixture/peers" || true
+    find "$fixture/peers" -mindepth 1 -maxdepth 1 -printf '%M %u:%g %f\n' | head -n 8 || true
+  } >&2
+}
 systemctl daemon-reload
 systemctl start gi-observer-fixture-sockets.service
 for ((attempt=0; attempt<100; attempt++)); do
   [[ ! -f $fixture/peers/socket.ready ]] || break
   sleep 0.02
 done
-[[ -f $fixture/peers/socket.ready ]] || { echo 'socket fixture readiness failed' >&2; exit 1; }
+[[ -f $fixture/peers/socket.ready ]] || {
+  echo 'socket fixture readiness failed' >&2; report_socket_fixture_failure; exit 1;
+}
 systemctl start gi-observer-fixture-target.service
 systemctl show gi-observer-fixture-target.service -p MainPID --value > "$fixture/target.pid"
 chmod 0644 "$fixture/target.pid"

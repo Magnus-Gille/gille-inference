@@ -28,6 +28,9 @@ jobs:
           sudo -n apt-get install --no-install-recommends -y libsystemd-dev libseccomp-dev
           dpkg-query -W -f='${Package} ${Version}\n' libsystemd-dev libsystemd0 libseccomp-dev libseccomp2 apparmor
           cc --version | head -n 1
+          # Hosted VMs differ by cloud; record the kernel and the fixture's parent mount.
+          uname -r
+          findmnt -n -o TARGET,FSTYPE,OPTIONS /run
       - name: Build native fixture and test metadata parser
         run: |
           mkdir "$RUNNER_TEMP/observer-native"
