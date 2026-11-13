@@ -47,10 +47,12 @@ ggml; there is no release branch, so treat it like any other pinned commit.
   and is 1,926 commits behind this candidate. The candidate contains `qwen4exp`, which upstream
   added for a different model. Whether Qwen 4 27B uses it is unknown: do not add a family entry
   from this note.
-- Evidence so far is a read of the upstream v0.9.0 to v1.0.0 release notes plus a check that the
-  source tokens the compatibility checker requires for the Qwen3.5 families are present at this
-  commit. The checker has not been run against it, nothing was built, and nothing was measured on
-  the M5.
+- Evidence so far is a read of the upstream v0.9.0 to v1.0.0 release notes and one checker run on
+  2026-11-13: `check-model-runtime-compatibility.ts` reports PASS for `Qwen/Qwen3.8-27B` at this
+  commit. The run used Hub revision `37561816e66b5b9153b1b64c10968c18c1e6f4a0`, whose
+  `config.json` is identical to the reviewed revision's. That proves source-level wiring for
+  `Qwen3_5ForConditionalGeneration` only; the MoE family was not run. Nothing was built and
+  nothing was measured on the M5.
 
 Re-validate before relying on it (upstream llama.cpp pull request numbers):
 
