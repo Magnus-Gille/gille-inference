@@ -26,7 +26,7 @@ while IFS= read -r profile; do
   [[ $profile != gi-observer-fixture\ * ]] || { echo 'refusing: profile already loaded' >&2; exit 2; }
 done < /sys/kernel/security/apparmor/profiles
 root=$(cd "$(dirname "$0")/../.." && pwd -P)
-created_users=() created_units=() profile_loaded=0 created_profile=0 created_polkit=0 created_dir=0
+created_users=() created_units=() profile_loaded=0 created_profile=0 created_polkit=0 created_dir=0 mounted_dir=0
 cleanup() {
   local original=$? cleanup_failed=0 unit account group path populated
   trap - EXIT
@@ -53,6 +53,11 @@ cleanup() {
       # Remove only fixture-owned names after the units are proven empty. No recursion.
       for path in probe socket-listener target.pid forbidden peers/forbidden.sock peers/socket.ready; do rm -f -- "$fixture/$path" || cleanup_failed=1; done
       if [[ -d $fixture/peers ]]; then rmdir -- "$fixture/peers" || cleanup_failed=1; fi
+      if (( mounted_dir )); then
+        # An unexpected leftover must fail cleanup instead of vanishing with the mount.
+        if [[ -n $(find "$fixture" -mindepth 1 -maxdepth 1 -print -quit) ]]; then cleanup_failed=1
+        else umount -- "$fixture" || cleanup_failed=1; fi
+      fi
       rmdir -- "$fixture" || cleanup_failed=1
     fi
     for account in "${created_users[@]}"; do
@@ -65,6 +70,10 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir -m 0755 "$fixture"; created_dir=1
+# Hosted VMs disagree on whether /run allows execution: under a noexec /run the sockets
+# unit exits 203/EXEC before any check runs. The fixture owns the mount its two binaries
+# run from instead of inheriting that host policy. /run itself is left as the host mounted it.
+mount -t tmpfs -o nosuid,nodev,mode=0755,size=16m gi-observer-fixture "$fixture"; mounted_dir=1
 install -m 0755 "$1" "$fixture/probe"
 install -m 0755 "$2" "$fixture/socket-listener"
 printf 'synthetic, non-secret fixture\n' > "$fixture/forbidden"

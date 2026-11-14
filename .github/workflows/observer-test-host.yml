@@ -45,20 +45,15 @@ jobs:
           python3 native/tests/test-unit-identity-regression.py "$RUNNER_TEMP/observer-native"
           sha256sum "$RUNNER_TEMP/observer-native/boundary-probe" "$RUNNER_TEMP/observer-native/socket-listener" \
             native/observer/lockdown.c native/tests/socket_listener.c native/tests/observer-fixture.apparmor
+      # AWS-hosted VMs mount /run noexec and Azure-hosted ones do not (INFER-514). Pin the
+      # stricter policy on this disposable VM so every run proves the fixture does not
+      # depend on executing from the host's /run, whichever cloud the job lands on.
+      - name: Pin the stricter hosted /run mount policy
+        run: |
+          sudo -n mount -o remount,noexec /run
+          findmnt -n -o TARGET,FSTYPE,OPTIONS /run
       - name: Prove Linux MAC and syscall boundary with distinct UIDs
         run: |
-          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C \
-            GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
-            bash native/tests/run-linux-boundary.sh "$RUNNER_TEMP/observer-native/boundary-probe" \
-              "$RUNNER_TEMP/observer-native/socket-listener"
-      # TEMPORARY (INFER-514): causal check on the same VM with the same binaries. Only the
-      # exec flag of /run changes. The job stays failed; remove this step with the matrix.
-      - name: TEMPORARY repeat the fixture with an exec-capable /run after a failure
-        if: failure()
-        run: |
-          findmnt -n -o TARGET,FSTYPE,OPTIONS /run
-          sudo -n mount -o remount,exec /run
-          findmnt -n -o TARGET,FSTYPE,OPTIONS /run
           sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C \
             GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
             bash native/tests/run-linux-boundary.sh "$RUNNER_TEMP/observer-native/boundary-probe" \

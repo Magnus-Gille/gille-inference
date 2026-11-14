@@ -69,6 +69,9 @@ kernel peer binding, not observer confinement or deployment readiness.
 The `native-boundary` job uses a fresh GitHub-hosted Ubuntu 24.04 VM. It installs only the requested
 native development dependencies (`libsystemd-dev` and `libseccomp-dev`, with necessary distribution
 dependencies), records their resolved versions/compiler and hashes both fixture executables and the policy.
+It also records the kernel release and the VM's `/run` mount options, because hosted VMs differ by cloud:
+AWS-hosted ones mount `/run` `noexec`, Azure-hosted ones do not. The job then remounts `/run` `noexec`
+on its disposable VM, so every run proves the fixture under the stricter policy.
 These receipts describe that CI candidate; they do not establish a reproducible M5 release.
 The existing digest-bound main CI workflow remains unchanged.
 
@@ -76,7 +79,10 @@ The root fixture script refuses ordinary local invocation and pre-existing fixtu
 units or profile. These environment checks are accident guards, not an authentication boundary.
 Only invoke it in the named disposable CI job. It creates two dedicated service UIDs and seven
 exact units under `gi-observer-fixture-`, one temporary profile, one observer-specific polkit deny
-rule, and files under `/run/gi-observer-fixture`. It performs no global procfs or ptrace changes.
+rule, and files under `/run/gi-observer-fixture`. That directory is a 16 MiB `nosuid,nodev` tmpfs the
+script mounts and unmounts itself: both fixture binaries run from it, so they must not inherit the
+host's `/run` exec policy. If socket readiness fails, the script prints that unit's state, a bounded
+journal excerpt and the fixture's mount options. It performs no global procfs or ptrace changes.
 The observer test unit uses restricted procfs, only CAP_SYS_PTRACE, 128 MiB/no swap, 25% CPU,
 four tasks and a ten-second start timeout. CAP_DAC_READ_SEARCH is not granted by this fixture.
 
