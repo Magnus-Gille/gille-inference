@@ -28,7 +28,7 @@ done < /sys/kernel/security/apparmor/profiles
 root=$(cd "$(dirname "$0")/../.." && pwd -P)
 created_users=() created_units=() profile_loaded=0 created_profile=0 created_polkit=0 created_dir=0 mounted_dir=0
 cleanup() {
-  local original=$? cleanup_failed=0 unit account group path populated
+  local original=$? cleanup_failed=0 unit account group path populated leftover
   trap - EXIT
   for unit in "${created_units[@]}"; do
     group=$(systemctl show "$unit" -p ControlGroup --value)
@@ -54,9 +54,11 @@ cleanup() {
       for path in probe socket-listener target.pid forbidden peers/forbidden.sock peers/socket.ready; do rm -f -- "$fixture/$path" || cleanup_failed=1; done
       if [[ -d $fixture/peers ]]; then rmdir -- "$fixture/peers" || cleanup_failed=1; fi
       if (( mounted_dir )); then
-        # An unexpected leftover must fail cleanup instead of vanishing with the mount.
-        if [[ -n $(find "$fixture" -mindepth 1 -maxdepth 1 -print -quit) ]]; then cleanup_failed=1
-        else umount -- "$fixture" || cleanup_failed=1; fi
+        # An unexpected leftover must fail cleanup instead of vanishing with the mount, and so
+        # must a listing that fails: only a successful, empty listing permits the unmount.
+        if leftover=$(find "$fixture" -mindepth 1 -maxdepth 1 -print -quit) && [[ -z $leftover ]]; then
+          umount -- "$fixture" || cleanup_failed=1
+        else cleanup_failed=1; fi
       fi
       rmdir -- "$fixture" || cleanup_failed=1
     fi
