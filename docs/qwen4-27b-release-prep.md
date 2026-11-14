@@ -35,6 +35,37 @@ A newer llama.cpp revision also means a new relocatable runtime bundle (origin-r
 checksums, `readelf -d`/`ldd` with nothing resolving through `scratch`); see
 [`deploy/README.md`](../deploy/README.md#deploying-llama-swap-roster-changes).
 
+### Runtime candidate (noted 2026-11-13, not a pin)
+
+Start the runtime search at llama.cpp
+[`v1.0.0`](https://github.com/ggml-org/llama.cpp/releases/tag/v1.0.0), commit
+`b1b770d90d94cad9e9ea5b993bdbc383a522fb28`. Use a later commit instead if the official
+architecture is not supported there. The version number marks C API versioning for libllama and
+ggml; there is no release branch, so treat it like any other pinned commit.
+
+- The Qwen3.8 runtime pin `9b05354ec6fb58b4e665e9a39ebc40285c015638` has no Qwen 4 architecture
+  and is 1,926 commits behind this candidate. The candidate contains `qwen4exp`, which upstream
+  added for a different model. Whether Qwen 4 27B uses it is unknown: do not add a family entry
+  from this note.
+- Evidence so far is a read of the upstream v0.9.0 to v1.0.0 release notes and one checker run on
+  2026-11-13: `check-model-runtime-compatibility.ts` reports PASS for `Qwen/Qwen3.8-27B` at this
+  commit. The run used Hub revision `37561816e66b5b9153b1b64c10968c18c1e6f4a0`, whose
+  `config.json` is identical to the reviewed revision's. That proves source-level wiring for
+  `Qwen3_5ForConditionalGeneration` only; the MoE family was not run. Nothing was built and
+  nothing was measured on the M5.
+
+Re-validate before relying on it (upstream llama.cpp pull request numbers):
+
+- Native MTP: 32078 removes the non-fused GDN paths; 31660 and 31927 change MTP state handling.
+  Repeat the MTP acceptance and parity checks instead of carrying over the Qwen3.8 results.
+- Images: private media URLs now need `--media-allow-private-urls` (32115). Confirm how the image
+  canary reaches the server before choosing flags.
+- Build: the web UI takes brand assets from a GitHub tarball (32112). Confirm that
+  `-DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF` still fetches nothing.
+- Q8 KV on Vulkan: upstream work (31526, 30487) may supersede the isolated backport in
+  [`strix-kv-dequant-candidate-2026-08-15.md`](./strix-kv-dequant-candidate-2026-08-15.md).
+  Compare the two before carrying the backport forward.
+
 ## 3. Stage weights (M5, owner-confirmed download)
 
 ```bash
