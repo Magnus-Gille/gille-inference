@@ -18,12 +18,6 @@ jobs:
     # Every job gets a fresh hosted VM. Nothing here connects to M5.
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    # TEMPORARY (INFER-514): hosted placement cannot be chosen, so sample VMs until one is
-    # AWS-hosted. Remove this strategy block before the pull request leaves draft.
-    strategy:
-      fail-fast: false
-      matrix:
-        sample: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
