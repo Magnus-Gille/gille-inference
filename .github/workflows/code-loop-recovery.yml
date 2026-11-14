@@ -55,6 +55,19 @@ jobs:
           env -i PATH="$TASK_PATH" HOME="$RUNNER_TEMP/recovery-deps-home" \
             node "$NPM_ROOT/npm/node_modules/node-gyp/bin/node-gyp.js" \
             rebuild --release --directory=node_modules/better-sqlite3 --nodedir="$NODE_ROOT"
+      # Hosted VMs differ by cloud: AWS-hosted ubuntu-24.04 VMs mount /run noexec and
+      # Azure-hosted ones do not (INFER-514). Record the kernel and the mounts as booted,
+      # then pin the stricter policy on this disposable VM so every run proves the fixture
+      # does not depend on executing from the host's /run, whichever cloud the job lands on.
+      - name: Pin the stricter hosted /run mount policy
+        run: |
+          uname -r
+          findmnt -n -o TARGET,FSTYPE,OPTIONS /run
+          findmnt -n -o TARGET,FSTYPE,OPTIONS -T /tmp
+          findmnt -n -o TARGET,FSTYPE,OPTIONS -T /dev/shm
+          sudo -n mount -o remount,noexec /run
+          findmnt -n -o TARGET,FSTYPE,OPTIONS /run
+          findmnt -n -o OPTIONS /run | tr ',' '\n' | grep -qx noexec
       - name: Exact candidate and fixture launch
         run: |
           env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin bash native/tests/test-code-loop-recovery-preflight.sh

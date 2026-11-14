@@ -56,6 +56,7 @@ done
 for cmd in node systemd-run pasta bwrap git python3; do command -v "$cmd" >/dev/null || die "missing native prerequisite: $cmd"; done
 CREATED_ACCOUNT=0
 CREATED_TREE=0
+MOUNTED_TREE=0
 CREATED_UNITS=0
 CREATED_LINGER=0
 CREATED_ETC_TARGET=0
@@ -96,7 +97,13 @@ cleanup() {
     userdel "$USER_NAME" || cleanup_failed=1
     if getent group "$USER_NAME" >/dev/null; then groupdel "$USER_NAME" || cleanup_failed=1; fi
   fi
-  if ((CREATED_TREE)) && ((cleanup_failed==0)); then rm -rf -- "$ROOT"; fi
+  if ((CREATED_TREE)) && ((cleanup_failed==0)); then
+    # Everything the fixture wrote lives on its own mount and leaves with it. A busy
+    # mount, or anything found beneath the mount point afterwards, fails restoration:
+    # rmdir removes only the empty directory this fixture created.
+    if ((MOUNTED_TREE)); then umount -- "$ROOT" || cleanup_failed=1; fi
+    if ((cleanup_failed==0)); then rmdir -- "$ROOT" || cleanup_failed=1; fi
+  fi
   printf '{"cleanup_complete":%s}\n' "$([[ "$cleanup_failed" = 0 ]] && echo true || echo false)" > "$OUTPUT/cleanup.json"
   chmod 0644 "$OUTPUT/cleanup.json" || cleanup_failed=1
   ((cleanup_failed==0)) || status=1
@@ -105,8 +112,16 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
-mkdir -p "$ROOT"/{source,bin,home,gate}
+mkdir -m 0755 "$ROOT"
 CREATED_TREE=1
+# Hosted VMs disagree on whether /run allows execution. This tree holds the restart
+# gate, the synthetic Pi, esbuild and the native SQLite addon, all of which must run or
+# be mapped executable. The fixture owns the mount they run from instead of inheriting
+# that host policy; 1 GiB bounds the source archive, node_modules and job state. /run
+# itself is left as the host mounted it.
+mount -t tmpfs -o nosuid,nodev,mode=0755,size=1g gi-code-loop-recovery-fixture "$ROOT"
+MOUNTED_TREE=1
+mkdir "$ROOT"/{source,bin,home,gate}
 chmod 755 "$ROOT" "$ROOT/bin" "$ROOT/source"
 # The unchanged cage masks this canonical application directory after binding
 # /etc read-only. bwrap cannot create a missing target below a read-only mount.
