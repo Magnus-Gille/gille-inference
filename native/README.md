@@ -61,8 +61,14 @@ without external Go modules. A root synthetic producer and UID 65534 client exer
 idle, unknown, wrong peer/identity/start ticks, replay, malformed/oversized replies, timeout and
 changed socket metadata. A compiled client with nonce checking removed must fail the replay
 regression. Only this disposable GitHub-hosted VM creates the fixed fixture directory; existing
-paths are refused and owned resources are removed. This tests protocol interoperability and
-kernel peer binding, not observer confinement or deployment readiness.
+paths are refused and owned resources are removed. That directory is a 32 MiB `nosuid,nodev` tmpfs
+the fixture mounts and unmounts itself: the copied client runs from it, so it must not inherit the
+host's `/run` exec policy, which differs by cloud (AWS-hosted VMs mount `/run` `noexec`, Azure-hosted
+ones do not). The job records the kernel release and the `/run`, `/tmp` and `/dev/shm` mount options
+as booted, then remounts `/run` `noexec` on its disposable VM, so every run proves the fixture under
+the stricter policy.
+This tests protocol interoperability and kernel peer binding, not observer confinement or
+deployment readiness.
 
 ### Observer confinement
 

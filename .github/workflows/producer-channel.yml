@@ -43,6 +43,19 @@ jobs:
           cp native/tests/producer_channel_test.go "$RUNNER_TEMP/producer-channel-source/"
           cd "$RUNNER_TEMP/producer-channel-source"
           go test -c -o "$RUNNER_TEMP/producer-channel-tests"
+      # AWS-hosted VMs mount /run noexec and Azure-hosted ones do not (INFER-514). Record
+      # the kernel and the mounts as booted, then pin the stricter policy on this disposable
+      # VM so every run proves the fixture does not depend on executing from the host's
+      # /run, whichever cloud the job lands on.
+      - name: Pin the stricter hosted /run mount policy
+        run: |
+          uname -r
+          findmnt -n -o TARGET,FSTYPE,OPTIONS /run
+          findmnt -n -o TARGET,FSTYPE,OPTIONS -T /tmp
+          findmnt -n -o TARGET,FSTYPE,OPTIONS -T /dev/shm
+          sudo -n mount -o remount,noexec /run
+          findmnt -n -o TARGET,FSTYPE,OPTIONS /run
+          findmnt -n -o OPTIONS /run | tr ',' '\n' | grep -qx noexec
       - name: Verify cross-UID identity, freshness, bounds and unknown results
         run: |
           sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
