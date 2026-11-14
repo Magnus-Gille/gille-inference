@@ -46,6 +46,10 @@ jobs:
         run: |
           sudo -n mount -o remount,noexec /run
           findmnt -n -o TARGET,FSTYPE,OPTIONS /run
+          case ",$(findmnt -n -o OPTIONS /run)," in
+            *,noexec,*) ;;
+            *) echo '/run is not mounted noexec' >&2; exit 1 ;;
+          esac
       - name: Prove Linux MAC and syscall boundary with distinct UIDs
         run: |
           sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C \

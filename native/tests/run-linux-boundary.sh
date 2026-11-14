@@ -219,7 +219,9 @@ report_socket_fixture_failure() {
   } >&2
 }
 systemctl daemon-reload
-systemctl start gi-observer-fixture-sockets.service
+systemctl start gi-observer-fixture-sockets.service || {
+  echo 'socket fixture start failed' >&2; report_socket_fixture_failure; exit 1;
+}
 for ((attempt=0; attempt<100; attempt++)); do
   [[ ! -f $fixture/peers/socket.ready ]] || break
   sleep 0.02
