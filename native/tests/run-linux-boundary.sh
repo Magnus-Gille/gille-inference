@@ -26,9 +26,9 @@ while IFS= read -r profile; do
   [[ $profile != gi-observer-fixture\ * ]] || { echo 'refusing: profile already loaded' >&2; exit 2; }
 done < /sys/kernel/security/apparmor/profiles
 root=$(cd "$(dirname "$0")/../.." && pwd -P)
-created_users=() created_units=() profile_loaded=0 created_profile=0 created_polkit=0 created_dir=0
+created_users=() created_units=() profile_loaded=0 created_profile=0 created_polkit=0 created_dir=0 mounted_dir=0
 cleanup() {
-  local original=$? cleanup_failed=0 unit account group path populated
+  local original=$? cleanup_failed=0 unit account group path populated leftover
   trap - EXIT
   for unit in "${created_units[@]}"; do
     group=$(systemctl show "$unit" -p ControlGroup --value)
@@ -53,6 +53,13 @@ cleanup() {
       # Remove only fixture-owned names after the units are proven empty. No recursion.
       for path in probe socket-listener target.pid forbidden peers/forbidden.sock peers/socket.ready; do rm -f -- "$fixture/$path" || cleanup_failed=1; done
       if [[ -d $fixture/peers ]]; then rmdir -- "$fixture/peers" || cleanup_failed=1; fi
+      if (( mounted_dir )); then
+        # An unexpected leftover must fail cleanup instead of vanishing with the mount, and so
+        # must a listing that fails: only a successful, empty listing permits the unmount.
+        if leftover=$(find "$fixture" -mindepth 1 -maxdepth 1 -print -quit) && [[ -z $leftover ]]; then
+          umount -- "$fixture" || cleanup_failed=1
+        else cleanup_failed=1; fi
+      fi
       rmdir -- "$fixture" || cleanup_failed=1
     fi
     for account in "${created_users[@]}"; do
@@ -65,6 +72,10 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir -m 0755 "$fixture"; created_dir=1
+# Hosted VMs disagree on whether /run allows execution: under a noexec /run the sockets
+# unit exits 203/EXEC before any check runs. The fixture owns the mount its two binaries
+# run from instead of inheriting that host policy. /run itself is left as the host mounted it.
+mount -t tmpfs -o nosuid,nodev,mode=0755,size=16m gi-observer-fixture "$fixture"; mounted_dir=1
 install -m 0755 "$1" "$fixture/probe"
 install -m 0755 "$2" "$fixture/socket-listener"
 printf 'synthetic, non-secret fixture\n' > "$fixture/forbidden"
@@ -190,13 +201,34 @@ StandardOutput=journal
 StandardError=null
 UNIT
 done
+# Failure evidence only. The listener writes no output, so the excerpt holds manager
+# lines for this one fixture unit; every other value is a fixed fixture name or host fact.
+report_socket_fixture_failure() {
+  local unit=gi-observer-fixture-sockets.service
+  {
+    echo "--- $unit state ---"
+    systemctl show "$unit" -p LoadState -p ActiveState -p SubState -p Result \
+      -p ExecMainCode -p ExecMainStatus -p MainPID || true
+    echo "--- $unit journal, last 20 lines ---"
+    journalctl --quiet -u "$unit" --output=cat --no-pager -n 20 | cut -c1-240 || true
+    echo '--- fixture filesystem ---'
+    uname -r || true
+    findmnt -n -o TARGET,FSTYPE,OPTIONS -T "$fixture" || true
+    stat -c '%A %U:%G %n' "$fixture" "$fixture/socket-listener" "$fixture/peers" || true
+    find "$fixture/peers" -mindepth 1 -maxdepth 1 -printf '%M %u:%g %f\n' | head -n 8 || true
+  } >&2
+}
 systemctl daemon-reload
-systemctl start gi-observer-fixture-sockets.service
+systemctl start gi-observer-fixture-sockets.service || {
+  echo 'socket fixture start failed' >&2; report_socket_fixture_failure; exit 1;
+}
 for ((attempt=0; attempt<100; attempt++)); do
   [[ ! -f $fixture/peers/socket.ready ]] || break
   sleep 0.02
 done
-[[ -f $fixture/peers/socket.ready ]] || { echo 'socket fixture readiness failed' >&2; exit 1; }
+[[ -f $fixture/peers/socket.ready ]] || {
+  echo 'socket fixture readiness failed' >&2; report_socket_fixture_failure; exit 1;
+}
 systemctl start gi-observer-fixture-target.service
 systemctl show gi-observer-fixture-target.service -p MainPID --value > "$fixture/target.pid"
 chmod 0644 "$fixture/target.pid"

@@ -28,6 +28,9 @@ jobs:
           sudo -n apt-get install --no-install-recommends -y libsystemd-dev libseccomp-dev
           dpkg-query -W -f='${Package} ${Version}\n' libsystemd-dev libsystemd0 libseccomp-dev libseccomp2 apparmor
           cc --version | head -n 1
+          # Hosted VMs differ by cloud; record the kernel and the fixture's parent mount.
+          uname -r
+          findmnt -n -o TARGET,FSTYPE,OPTIONS /run
       - name: Build native fixture and test metadata parser
         run: |
           mkdir "$RUNNER_TEMP/observer-native"
@@ -36,6 +39,17 @@ jobs:
           python3 native/tests/test-unit-identity-regression.py "$RUNNER_TEMP/observer-native"
           sha256sum "$RUNNER_TEMP/observer-native/boundary-probe" "$RUNNER_TEMP/observer-native/socket-listener" \
             native/observer/lockdown.c native/tests/socket_listener.c native/tests/observer-fixture.apparmor
+      # AWS-hosted VMs mount /run noexec and Azure-hosted ones do not (INFER-514). Pin the
+      # stricter policy on this disposable VM so every run proves the fixture does not
+      # depend on executing from the host's /run, whichever cloud the job lands on.
+      - name: Pin the stricter hosted /run mount policy
+        run: |
+          sudo -n mount -o remount,noexec /run
+          findmnt -n -o TARGET,FSTYPE,OPTIONS /run
+          case ",$(findmnt -n -o OPTIONS /run)," in
+            *,noexec,*) ;;
+            *) echo '/run is not mounted noexec' >&2; exit 1 ;;
+          esac
       - name: Prove Linux MAC and syscall boundary with distinct UIDs
         run: |
           sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C \
