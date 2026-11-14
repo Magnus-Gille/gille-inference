@@ -17,7 +17,7 @@ Declared resources before the reviewed workflow runs:
 
 | Resource | Exact fixture target |
 | --- | --- |
-| Tree | /run/gi-code-loop-recovery-fixture |
+| Tree | /run/gi-code-loop-recovery-fixture; a 1 GiB `nosuid,nodev` tmpfs the fixture mounts on that newly created directory and unmounts in cleanup |
 | Empty application mount target | /etc/gille-inference; pre-existing path refuses, only fixture-created empty directory is removed with rmdir |
 | Account/UID | gi-code-loop-ci / 62056; existing identity refuses execution |
 | Parent slice | girecovery.slice; 2 GiB, no swap, two CPU quota, 128 tasks |
@@ -45,10 +45,19 @@ bundled read-only headers. No prebuilt-binary or header download is allowed by t
 Native packages come from the worker's official Ubuntu sources. No personal HOME, keys or live state
 enter the fixture. The private synthetic client key file is removed and is never an uploaded artifact.
 
+The tree holds files that must run or be mapped executable: the restart gate, the synthetic Pi,
+esbuild and the native SQLite addon. Hosted VMs differ by cloud in whether `/run` allows that
+(AWS-hosted Ubuntu24 VMs mount `/run` `noexec`, Azure-hosted ones do not), so the fixture owns the
+mount they run from instead of inheriting the host's policy. The workflow records the kernel release
+and the `/run`, `/tmp` and `/dev/shm` mount options as booted, then remounts `/run` `noexec` on its
+disposable VM before the fixture, so every run proves the fixture under the stricter policy.
+
 Cleanup stops only declared fixture units, checks zero unit PIDs and an empty remaining slice, disables
-only fixture-created lingering and removes only created configuration/account/tree. Incomplete cleanup
-fails the job. An independent workflow step checks cleanup evidence, missing task tree/account and
-preserves exact source/launcher receipts. The test runner itself is disposable.
+only fixture-created lingering and removes only created configuration/account/tree. The tree leaves
+with its mount: a busy mount, or anything found beneath the mount point after unmounting, fails
+restoration instead of being deleted. Incomplete cleanup fails the job. An independent workflow step
+checks cleanup evidence, missing task tree/account and preserves exact source/launcher receipts. The
+test runner itself is disposable.
 
 The conductor records each full hosted fixture attempt against the owner's six-attempt limit.
 No production service, GPU/model, user credentials, repository setting or deployment is authorized here.
