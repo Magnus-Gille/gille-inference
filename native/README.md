@@ -63,10 +63,10 @@ changed socket metadata. A compiled client with nonce checking removed must fail
 regression. Only this disposable GitHub-hosted VM creates the fixed fixture directory; existing
 paths are refused and owned resources are removed. That directory is a 32 MiB `nosuid,nodev` tmpfs
 the fixture mounts and unmounts itself: the copied client runs from it, so it must not inherit the
-host's `/run` exec policy, which differs by cloud (AWS-hosted VMs mount `/run` `noexec`, Azure-hosted
-ones do not). The job records the kernel release and the `/run`, `/tmp` and `/dev/shm` mount options
-as booted, then remounts `/run` `noexec` on its disposable VM, so every run proves the fixture under
-the stricter policy.
+host's `/run` exec policy, which differs by cloud (AWS-hosted `ubuntu-24.04` VMs were observed to
+mount `/run` `noexec`, Azure-hosted ones not; INFER-514). The job records the kernel release and the
+`/run`, `/tmp` and `/dev/shm` mount options as booted, then remounts `/run` `noexec` on its
+disposable VM, so every run proves the fixture under the stricter policy.
 This tests protocol interoperability and kernel peer binding, not observer confinement or
 deployment readiness.
 

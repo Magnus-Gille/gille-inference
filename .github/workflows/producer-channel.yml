@@ -82,7 +82,9 @@ jobs:
               str(Path(os.environ['RUNNER_TEMP']) / 'producer-channel-tests'),
               '-test.run', '^TestNativeProducerChannel/replay$', '-test.v', '-test.timeout=10s'],
               capture_output=True, text=True, timeout=15, check=False)
-          if result.returncode != 1 or 'native producer case failed: replay' not in result.stdout:
+          # The probe exits 1 only after it has started and failed a check. A client that
+          # cannot start reports an exec error instead and must not count as a rejection.
+          if result.returncode != 1 or 'native producer case failed: replay (exit status 1)' not in result.stdout:
               raise SystemExit('replay mutant did not fail its behavioral assertion')
           print('red: replay regression rejects missing nonce validation')
           PY
