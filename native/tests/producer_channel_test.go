@@ -36,6 +36,7 @@ func TestNativeProducerChannel(t *testing.T) {
 	// Register cleanup before any subsequent operation can fail.
 	copiedProbe := directory + "/probe"
 	var copiedInfo os.FileInfo
+	mounted := false
 	t.Cleanup(func() {
 		if copiedInfo != nil {
 			current, err := os.Lstat(copiedProbe)
@@ -47,10 +48,32 @@ func TestNativeProducerChannel(t *testing.T) {
 				t.Error("probe cleanup failed")
 			}
 		}
+		if mounted {
+			// An unexpected leftover must fail cleanup instead of vanishing with the mount.
+			leftovers, err := os.ReadDir(directory)
+			if err != nil || len(leftovers) != 0 {
+				t.Error("fixture mount not empty; cleanup refused")
+				return
+			}
+			if err := syscall.Unmount(directory, 0); err != nil {
+				t.Error("fixture mount cleanup failed")
+				return
+			}
+		}
 		if err := os.Remove(directory); err != nil {
 			t.Error("fixture directory cleanup failed")
 		}
 	})
+	// Hosted VMs disagree on whether /run allows execution: under a noexec /run the
+	// copied probe cannot start and every case fails before it connects. The fixture
+	// owns the mount the probe runs from instead of inheriting that host policy. The
+	// 32 MiB bound exceeds the largest probe accepted above. This test leaves /run
+	// itself as the host mounted it.
+	if err := syscall.Mount("gi-producer-channel-fixture", directory, "tmpfs",
+		syscall.MS_NOSUID|syscall.MS_NODEV, "mode=0755,size=32m"); err != nil {
+		t.Fatal("fixture mount failed")
+	}
+	mounted = true
 	// Copy only the compiled fixture into this newly owned traversable directory.
 	probeBytes, err := os.ReadFile(probe)
 	if err != nil {
@@ -75,7 +98,8 @@ func TestNativeProducerChannel(t *testing.T) {
 		command.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 65534, Gid: 65534}}
 		command.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin"}
 		if err := command.Run(); err != nil {
-			t.Fatal("native producer case failed: " + mode)
+			// The error names only the fixed probe path and its exit status or errno.
+			t.Fatalf("native producer case failed: %s (%v)", mode, err)
 		}
 		if time.Since(started) > 1500*time.Millisecond {
 			t.Fatal("native producer deadline exceeded")
