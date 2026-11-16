@@ -1,0 +1,20 @@
+[Unit]
+Description=Report gateway/model readiness journey outcome to Heimdall (content-free)
+After=network-online.target home-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=magnus
+# Host-owned private file (mode 0600) with GATEWAY_READINESS_URL, GATEWAY_READINESS_MONITOR_KEY,
+# HEIMDALL_SYNTHETIC_JOURNEYS_URL and HEIMDALL_GATEWAY_JOURNEY_TOKEN. Never committed.
+EnvironmentFile=/etc/gille-inference/readiness-journey.env
+WorkingDirectory=/home/magnus/home-server-eval
+ExecStart=/usr/bin/npx --no-install tsx scripts/post-readiness-journey.ts
+TimeoutStartSec=60
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+# No [Install]: inert until the owner installs it together with the timer.

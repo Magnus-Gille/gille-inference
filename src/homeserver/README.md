@@ -1058,6 +1058,25 @@ tsx src/homeserver/cli.ts gpu status
 - It is **advisory** — only jobs that opt in via `gpu run` are coordinated. A job that hits
   llama-swap directly without wrapping still bypasses it.
 
+## Heimdall readiness journey (`gateway-model-readiness`, INFER-250)
+
+`scripts/post-readiness-journey.ts` runs one content-free readiness attempt with a read-only
+**monitor** key and delivers the closed `synthetic-journey-outcome` v1 document (owned by Heimdall,
+HEIM-49) to `POST /api/synthetic-journeys`. Exactly two steps run in one attempt:
+`gateway-readiness` (`GET /healthz` → `ok:true`) and `model-readiness` (`GET /models/residency` →
+200 with a `models` array; `503 unavailable` is a failure). An idle backend is still ready: this
+proves the backend snapshot is observable, not that a given model is loaded, and it never grades
+model quality. Missing config is a *runner* failure (`runner_outcome:"failed"`, outcome `unknown`),
+distinct from a dependency failure. Nothing from a response (model names, aliases, bodies) and no
+key is copied into the outcome. Delivery retries re-send the identical attempt (idempotent in
+Heimdall); the script exits non-zero only when delivery fails.
+
+Host-owned private env (`/etc/gille-inference/readiness-journey.env`, mode 0600, never committed):
+`GATEWAY_READINESS_URL`, `GATEWAY_READINESS_MONITOR_KEY`, `HEIMDALL_SYNTHETIC_JOURNEYS_URL`,
+`HEIMDALL_GATEWAY_JOURNEY_TOKEN`. Units: `deploy/systemd/gille-gateway-readiness-journey.{service,timer}`
+(five-minute cadence; the service has no `[Install]`, so it is inert until the owner installs it).
+Rollback: stop and disable the timer; the gateway is unchanged.
+
 ## Environment variables
 
 The deprecated LM Studio model-admin adapter has been removed. Migrate installations using
