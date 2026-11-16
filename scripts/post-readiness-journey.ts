@@ -9,9 +9,9 @@
  *   HEIMDALL_SYNTHETIC_JOURNEYS_URL      https://<heimdall>/api/synthetic-journeys
  *   HEIMDALL_GATEWAY_JOURNEY_TOKEN       dedicated gateway journey credential
  *
- * Exit status: 0 when the outcome (pass OR fail) was delivered — a failing dependency is
- * Heimdall's alert to raise, not a failed unit. Exit 1 when delivery failed, so a broken
- * delivery path is itself visible in systemd. Output is one JSON line of classes only.
+ * Exit status: 0 when a runner-ok outcome (pass OR fail) was delivered — a failing dependency is
+ * Heimdall's alert to raise, not a failed unit. Exit 1 when delivery failed or the runner itself
+ * failed (bad config/credential), so those are visible in systemd. Output is one JSON line of classes only.
  */
 import { readFileSync } from "node:fs";
 import { deliverOutcome, runReadinessAttempt } from "../src/homeserver/readiness-journey.js";
@@ -43,4 +43,6 @@ process.stdout.write(`${JSON.stringify({
   attempts: delivery.attempts,
   delivery_error: delivery.error ?? null,
 })}\n`);
-process.exitCode = delivery.delivered ? 0 : 1;
+// A runner failure (bad config/credential) is invisible to Heimdall's alerts (unknown is not
+// graded), so it must fail the unit here.
+process.exitCode = delivery.delivered && outcome.runner_outcome === "ok" ? 0 : 1;

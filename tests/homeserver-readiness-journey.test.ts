@@ -52,12 +52,22 @@ describe("runReadinessAttempt", () => {
     expect(o.outcome).toBe("pass");
   });
 
-  it("reports gateway auth denial as a dependency failure and skips the model step", async () => {
-    const o = await runReadinessAttempt({ ...BASE, now: clock(), fetchFn: router({ ...healthy, "/healthz": () => res(401, {}) }) });
+  it("treats a rejected monitor key (on either route) as a runner failure, not a dependency failure", async () => {
+    for (const route of ["/healthz", "/models/residency"]) {
+      const o = await runReadinessAttempt({ ...BASE, now: clock(), fetchFn: router({ ...healthy, [route]: () => res(401, {}) }) });
+      expect(o.outcome).toBe("unknown");
+      expect(o.runner_outcome).toBe("failed");
+      expect(o.error_class).toBe("runner-auth");
+      expect(o.steps.every((s) => s.outcome === "skipped")).toBe(true);
+      expect(validateOutcome(o)).toEqual([]);
+    }
+  });
+
+  it("reports a failing gateway (5xx) as a dependency failure and skips the model step", async () => {
+    const o = await runReadinessAttempt({ ...BASE, now: clock(), fetchFn: router({ ...healthy, "/healthz": () => res(502, {}) }) });
     expect(o.outcome).toBe("fail");
     expect(o.runner_outcome).toBe("ok");
-    expect(o.error_class).toBe("auth-denied");
-    expect(o.steps[0]).toMatchObject({ id: "gateway-readiness", outcome: "fail", error_class: "auth-denied" });
+    expect(o.error_class).toBe("dependency-http");
     expect(o.steps[1]).toMatchObject({ id: "model-readiness", outcome: "skipped", error_class: "blocked-by-gateway" });
     expect(validateOutcome(o)).toEqual([]);
   });
@@ -209,6 +219,15 @@ describe("deliverOutcome", () => {
     const fetchFn = vi.fn(async () => { throw new TypeError("down"); }) as unknown as typeof fetch;
     const r = await deliverOutcome(o, { url: URL_, token: TOKEN, fetchFn, sleep: async () => {} });
     expect(r).toEqual({ delivered: false, attempts: 3, error: "delivery-transport" });
+  });
+
+  it("refuses plain-http (non-loopback) and wrong-path delivery URLs before sending the token", async () => {
+    const o = await outcome();
+    const fetchFn = vi.fn() as unknown as typeof fetch;
+    for (const url of ["http://heimdall.test/api/synthetic-journeys", "https://heimdall.test/api/other", "https://u:p@heimdall.test/api/synthetic-journeys", "https://heimdall.test/api/synthetic-journeys?x=1"]) {
+      expect((await deliverOutcome(o, { url, token: TOKEN, fetchFn })).error).toBe("delivery-config");
+    }
+    expect(fetchFn).not.toHaveBeenCalled();
   });
 
   it("fails closed without URL/token and never posts an invalid document", async () => {

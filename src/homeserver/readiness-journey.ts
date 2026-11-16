@@ -214,12 +214,16 @@ export async function runReadinessAttempt(opts: ReadinessOptions): Promise<Journ
 
   const fetchFn = opts.fetchFn ?? fetch;
   const timeoutMs = opts.timeoutMs ?? 5000;
+  // The monitor key is the runner's own credential, and /healthz is unauthenticated, so a
+  // rejected key surfaces on either route. That is a runner failure, not gateway/model failure.
   const gateway = await observe(`${origin}/healthz`, opts.monitorKey, fetchFn, timeoutMs, now, acceptHealthz);
   const steps: JourneyStep[] = [];
   let errorClass: string | null = null;
+  if (gateway.errorClass === "auth-denied") return runnerFailure("runner-auth");
   if (gateway.ok) {
     steps.push(step("gateway-readiness", "pass", gateway.latencyMs));
     const model = await observe(`${origin}/models/residency`, opts.monitorKey, fetchFn, timeoutMs, now, acceptResidency);
+    if (model.errorClass === "auth-denied") return runnerFailure("runner-auth");
     if (model.ok) steps.push(step("model-readiness", "pass", model.latencyMs));
     else {
       steps.push(step("model-readiness", "fail", model.latencyMs, model.errorClass));
@@ -263,9 +267,23 @@ export interface DeliveryResult {
   error?: string;
 }
 
+/** https only (plain http solely for loopback), exact ingest path, no userinfo/query/fragment. */
+function safeDeliveryUrl(raw: string): boolean {
+  try {
+    const u = new URL(raw);
+    const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(u.hostname);
+    return (u.protocol === "https:" || (u.protocol === "http:" && loopback)) &&
+      u.pathname === "/api/synthetic-journeys" && u.username === "" && u.password === "" &&
+      u.search === "" && u.hash === "";
+  } catch {
+    return false;
+  }
+}
+
 /** POST the outcome; retry only transport errors and 5xx. 4xx (including replay conflicts) are final. */
 export async function deliverOutcome(outcome: JourneyOutcome, opts: DeliveryOptions): Promise<DeliveryResult> {
   if (!opts.url || !opts.token) return { delivered: false, attempts: 0, error: "delivery-config" };
+  if (!safeDeliveryUrl(opts.url)) return { delivered: false, attempts: 0, error: "delivery-config" };
   const errors = validateOutcome(outcome);
   if (errors.length > 0) return { delivered: false, attempts: 0, error: "invalid-outcome" };
   const fetchFn = opts.fetchFn ?? fetch;
