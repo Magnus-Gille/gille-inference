@@ -156,7 +156,10 @@ and never reads logs, keystore rows, paths or backend configuration. It is compu
 ```
 
 - `capture`: `content` (request/response content persisted), `metadata_only` (content-blind
-  telemetry only), or `none` (no durable per-request record). Tier and scope are reported
+  telemetry only), or `none` (no durable per-request record: only a guest with the request log and
+  the access log both off; an owner call always leaves content-blind exposure digests). `ask`
+  reports `content` for any minted owner key even with the owner log off, because the capability
+  ledger keeps a prompt excerpt. Tier and scope are reported
   separately: scope decides `available`, tier/key decides `capture`. Guests and legacy static admin
   keys are never `content`.
 - `retention.horizon_days` is `"unknown"` whenever anything is persisted: the gateway does not
@@ -167,6 +170,9 @@ and never reads logs, keystore rows, paths or backend configuration. It is compu
   honoured for this caller and route, and the gateway key is provisioned.
 - `observed_at` and `policy_id` (a hash of the inputs that change the answer) identify the snapshot;
   re-fetch rather than caching it. Observing a policy is not authorization to process data under it.
+
+Only the listed route classes are described; other content-capturing surfaces (audio, image
+owner-log capture) are not covered by this response and must not be inferred from `chat`.
 
 Ordinary client preflight: call `GET /portal/capture-policy` with the key you will use, check the
 entry for the route you intend to call, and send Restricted content only if `capture` is acceptable

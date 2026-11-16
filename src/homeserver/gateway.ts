@@ -5800,6 +5800,7 @@ export async function handleRequest(
       sendJson(res, 200, describeCapturePolicy({
         ownerRequestLog: cfg.ownerRequestLog,
         requestLog: cfg.requestLog,
+        accessLog: cfg.accessLog,
         principal,
         optOutAvailable: isKeyedExposureFingerprintAvailable(),
         embeddingGranted: embeddingGranted(principal, EMBEDDING_MODEL_ID),

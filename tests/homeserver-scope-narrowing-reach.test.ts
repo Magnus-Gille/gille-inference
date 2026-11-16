@@ -27,6 +27,7 @@ const ROUTES: Probe[] = [
   { name: "GET /models/residency", method: "GET", path: "/models/residency" },
   { name: "GET /ops/summary", method: "GET", path: "/ops/summary" },
   { name: "GET /portal/me", method: "GET", path: "/portal/me" },
+  { name: "GET /portal/capture-policy", method: "GET", path: "/portal/capture-policy" },
   { name: "GET /admin/keys", method: "GET", path: "/admin/keys" },
   { name: "POST /admin/keys", method: "POST", path: "/admin/keys", body: {} },
   { name: "POST /delegate", method: "POST", path: "/delegate", body: {} },
@@ -98,9 +99,9 @@ afterAll(async () => {
 });
 
 describe("scope narrowing order matches gateway grants (INFER-152)", () => {
-  it("pins the ask decision: ask reaches only MCP ask (no files), tokenize/list_models/model_status and three GETs", () => {
+  it("pins the ask decision: ask reaches only MCP ask (no files), tokenize/list_models/model_status and four GETs", () => {
     expect([...reach.get("ask")!].sort()).toEqual([
-      "GET /healthz", "GET /portal/me", "GET /v1/models", "POST /mcp",
+      "GET /healthz", "GET /portal/capture-policy", "GET /portal/me", "GET /v1/models", "POST /mcp",
       "mcp tool ask", "mcp tool list_models", "mcp tool model_status", "mcp tool tokenize",
     ]);
     expect(reach.get("ask")!.has("mcp ask accepts files")).toBe(false);

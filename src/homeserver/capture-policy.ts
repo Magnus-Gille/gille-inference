@@ -48,11 +48,15 @@ export interface CapturePolicy {
 export interface CapturePolicyInput {
   ownerRequestLog: "on" | "off";
   requestLog: "on" | "off";
+  /** Structured access log (`gateway_request` events carry alias and token counts). */
+  accessLog: "on" | "off";
   principal: Readonly<{
     tier: "owner" | "guest";
     scope: string;
     isAdmin: boolean;
     keyHash: string | null;
+    /** Static read-only monitor key (scope "inference" with isMonitor). */
+    isMonitor?: boolean;
   }>;
   /** `isKeyedExposureFingerprintAvailable()`: the per-call opt-out is only honoured when true. */
   optOutAvailable: boolean;
@@ -64,8 +68,17 @@ export interface CapturePolicyInput {
 const OWNER_LOG_DECLARED_DAYS = RETENTION_DATA_CLASSES["transient-task-artifact"].retentionDays;
 const METADATA_DECLARED_DAYS = RETENTION_DATA_CLASSES["operational-telemetry"].retentionDays;
 
-function metadataOrNone(requestLog: "on" | "off"): CaptureMode {
-  return requestLog === "on" ? "metadata_only" : "none";
+/**
+ * `none` is claimed only when no durable per-request record can exist. Owner-tier calls always
+ * leave content-blind exposure digests, so an owner is never `none`; guests are `none` only with
+ * both the durable request log and the structured access log off.
+ */
+function metadataOrNone(
+  requestLog: "on" | "off",
+  accessLog: "on" | "off",
+  tier: "owner" | "guest",
+): CaptureMode {
+  return requestLog === "off" && accessLog === "off" && tier === "guest" ? "none" : "metadata_only";
 }
 
 function retentionFor(capture: CaptureMode, declared: number | null): CaptureRouteEntry["retention"] {
@@ -77,11 +90,17 @@ export function describeCapturePolicy(input: CapturePolicyInput): CapturePolicy 
   const { principal, optOutAvailable } = input;
   const scope = principal.scope;
   const owner = principal.tier === "owner";
-  const monitor = scope === "monitor";
+  const monitor = scope === "monitor" || principal.isMonitor === true;
   const ownerContent = shouldCaptureOwnerContent(input.ownerRequestLog, principal);
-  const chatCapture: CaptureMode = ownerContent ? "content" : metadataOrNone(input.requestLog);
+  const metaMode = metadataOrNone(input.requestLog, input.accessLog, principal.tier);
+  const chatCapture: CaptureMode = ownerContent ? "content" : metaMode;
   const chatDeclared = ownerContent ? OWNER_LOG_DECLARED_DAYS : METADATA_DECLARED_DAYS;
   const optOutOnOwnerContent = optOutAvailable && ownerContent;
+  // MCP `ask` also persists a prompt excerpt in the capability ledger for every real minted owner
+  // key, independent of the owner-log switch (mcp.ts isOwnerContent), so it can be `content`
+  // even when chat is not. The opt-out is honoured there too and nulls that excerpt.
+  const askOwnerContent = owner && principal.keyHash !== null;
+  const askCapture: CaptureMode = askOwnerContent ? "content" : chatCapture;
 
   const chatAvailable = !monitor && scope !== "ask";
   const askAvailable = !monitor;
@@ -106,7 +125,12 @@ export function describeCapturePolicy(input: CapturePolicyInput): CapturePolicy 
   // per-call opt-out keeps it in memory only. Its retention window is not declared anywhere.
   const routes: Record<CaptureRouteClass, CaptureRouteEntry> = {
     chat: entry(chatAvailable, chatCapture, chatDeclared, optOutOnOwnerContent),
-    ask: entry(askAvailable, chatCapture, chatDeclared, optOutOnOwnerContent),
+    ask: entry(
+      askAvailable,
+      askCapture,
+      askOwnerContent ? OWNER_LOG_DECLARED_DAYS : chatDeclared,
+      optOutAvailable && askOwnerContent,
+    ),
     code_loop: entry(codeLoopAvailable, "content", null, optOutAvailable),
     // The capability ledger keeps a payload-derived prompt excerpt; the opt-out is refused here.
     delegate: entry(
@@ -116,7 +140,7 @@ export function describeCapturePolicy(input: CapturePolicyInput): CapturePolicy 
       false,
     ),
     // Embedding inputs are never persisted; only content-blind request metadata is. Opt-out refused.
-    embeddings: entry(embeddingsAvailable, metadataOrNone(input.requestLog), METADATA_DECLARED_DAYS, false),
+    embeddings: entry(embeddingsAvailable, metaMode, METADATA_DECLARED_DAYS, false),
   };
 
   // Identity of the effective policy: only the inputs that change the answer, never secrets.
@@ -129,6 +153,7 @@ export function describeCapturePolicy(input: CapturePolicyInput): CapturePolicy 
       admin: principal.isAdmin,
       owner_log: input.ownerRequestLog,
       request_log: input.requestLog,
+      access_log: input.accessLog,
       opt_out: optOutAvailable,
       embeddings: input.embeddingGranted,
     }))

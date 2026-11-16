@@ -10,6 +10,7 @@ function input(over: Partial<CapturePolicyInput> & { principal?: Partial<Capture
   return {
     ownerRequestLog: "on",
     requestLog: "on",
+    accessLog: "on",
     optOutAvailable: true,
     embeddingGranted: false,
     now: NOW,
@@ -51,10 +52,31 @@ describe("describeCapturePolicy (INFER-344)", () => {
     expect(p.routes.chat.per_call_opt_out).toBe(false);
   });
 
-  it("'none' only when no durable record exists, and then retention is not_applicable", () => {
-    const p = describeCapturePolicy(input({ ownerRequestLog: "off", requestLog: "off" }));
+  it("'none' only for a guest with every durable record off; retention is then not_applicable", () => {
+    const guest = { tier: "guest" as const, scope: "inference" };
+    const off = { ownerRequestLog: "off" as const, requestLog: "off" as const };
+    // access log still on: a durable per-request event exists
+    expect(describeCapturePolicy(input({ ...off, principal: guest })).routes.chat.capture).toBe("metadata_only");
+    const p = describeCapturePolicy(input({ ...off, accessLog: "off", principal: guest }));
     expect(p.routes.chat.capture).toBe("none");
     expect(p.routes.chat.retention.horizon_days).toBe("not_applicable");
+    // owner calls always leave exposure digests, so an owner is never "none"
+    const owner = describeCapturePolicy(input({ ...off, accessLog: "off" }));
+    expect(owner.routes.chat.capture).toBe("metadata_only");
+  });
+
+  it("ask keeps a ledger prompt excerpt for a minted owner key even with the owner log off", () => {
+    const p = describeCapturePolicy(input({ ownerRequestLog: "off" }));
+    expect(p.routes.chat.capture).toBe("metadata_only");
+    expect(p.routes.ask.capture).toBe("content");
+    expect(p.routes.ask.per_call_opt_out).toBe(true);
+    const legacy = describeCapturePolicy(input({ ownerRequestLog: "off", principal: { keyHash: null } }));
+    expect(legacy.routes.ask.capture).toBe("metadata_only");
+  });
+
+  it("static monitor key (scope inference + isMonitor) reaches nothing", () => {
+    const p = describeCapturePolicy(input({ principal: { scope: "inference", isMonitor: true } }));
+    for (const r of Object.values(p.routes)) expect(r.available).toBe(false);
   });
 
   it("guests and legacy static admins are never content-captured", () => {
@@ -75,7 +97,8 @@ describe("describeCapturePolicy (INFER-344)", () => {
           const p = describeCapturePolicy(input({ ownerRequestLog: mode, principal: { tier, keyHash } }));
           const expected = shouldCaptureOwnerContent(mode, { tier, keyHash });
           expect(p.routes.chat.capture === "content").toBe(expected);
-          expect(p.routes.ask.capture === "content").toBe(expected);
+          // ask additionally records a ledger excerpt for any real owner key (mcp.ts isOwnerContent)
+          expect(p.routes.ask.capture === "content").toBe(expected || (tier === "owner" && keyHash !== null));
         }
       }
     }

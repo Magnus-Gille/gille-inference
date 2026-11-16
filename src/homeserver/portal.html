@@ -963,6 +963,7 @@ curl -fsSL https://inference.example.com/hs -o ~/bin/hs &amp;&amp; chmod +x ~/bi
           <tr><td><span class="badge mono">hs login --url &lt;base&gt; --key &lt;key&gt;</span></td><td>Save an existing key manually</td></tr>
           <tr><td><span class="badge mono">hs models</span></td><td>List the models your key may use</td></tr>
           <tr><td><span class="badge mono">hs ask [-m &lt;model&gt;] [--system &lt;s&gt;] &lt;prompt&gt;</span></td><td>Ask a question — streams tokens as they arrive</td></tr>
+          <tr><td><span class="badge mono">GET /portal/capture-policy</span></td><td>See what your key's requests persist per route (content, metadata only, none) before sending sensitive data</td></tr>
           <tr><td><span class="badge mono">hs usage</span></td><td>Show your tier, allowed models, and credit usage (calls <span class="badge mono">GET /portal/me</span>)</td></tr>
           <tr><td><span class="badge mono">hs whoami</span></td><td>Show stored base URL and masked key from <span class="badge mono">~/.config/hs/config.json</span></td></tr>
         </table>

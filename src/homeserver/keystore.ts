@@ -1386,7 +1386,7 @@ export function buildCredentialPlan(report: CredentialInventoryReport): Credenti
  * tests/homeserver-scope-narrowing-reach.test.ts. `admin` reaches every route `agent`, `inference`,
  * `ask` and `monitor` reach; `agent` reaches `inference` and `ask`; `inference` reaches `ask`.
  * `ask` (INFER-450: MCP ask without files, tokenize, list_models, model_status, /portal/me,
- * /v1/models, /healthz) is a strict subset of each of those three, so they may narrow to it, but
+ * /portal/capture-policy, /v1/models, /healthz) is a strict subset of each of those three, so they may narrow to it, but
  * only for OWNER-tier keys (see {@link restrictKey}). `monitor` (read-only observer routes that
  * `agent`, `inference` and `ask` cannot read) is incomparable with them, and `monitor` reaches
  * none of `ask`'s routes, so `→monitor` is only a narrowing from `admin`, and `monitor→ask` is not.
