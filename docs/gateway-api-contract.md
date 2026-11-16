@@ -34,7 +34,7 @@ privacy/admission tier, route scope, and model allow-list:
 | Tier | `guest` | Content-blind guest admission; cannot carry privileged scopes. |
 | Scope | `admin` | Operator routes plus agent/inference surfaces. Explicit for new keys; legacy null-scope owner rows retain it compatibly. |
 | Scope | `agent` | `ask` + `code_loop` and ordinary owner inference, but never `/delegate`, `/admin/*`, or `/ledger`. |
-| Scope | `ask` | Owner tier only (INFER-450). MCP `ask` plus its read-only helpers `list_models`, `model_status`, `tokenize`; and the preflight reads `GET /portal/me`, `GET /v1/models`, `GET /healthz`. Enforced as a closed route allow-list (every other route, including `/v1/chat/completions`, returns `403 route_not_allowed`), and per MCP tool: `tools/list` omits, and `tools/call` answers the unknown-tool error for, `code_loop_*` and `record_adoption_evidence`; `ask.files` is rejected and not advertised; no execution-feedback handle. Intended for an unprivileged on-box agent account. `ask` keys are owner tier: prompts enter the owner content log and get owner-priority admission, so always mint them with `--models` and credit/quota limits. A gateway older than this scope reads the stored value as owner `inference`; run `keys revoke --scope ask --confirm` before any rollback below this version. |
+| Scope | `ask` | Owner tier only (INFER-450). MCP `ask` plus its read-only helpers `list_models`, `model_status`, `tokenize`; and the preflight reads `GET /portal/me`, `GET /portal/capture-policy`, `GET /v1/models`, `GET /healthz`. Enforced as a closed route allow-list (every other route, including `/v1/chat/completions`, returns `403 route_not_allowed`), and per MCP tool: `tools/list` omits, and `tools/call` answers the unknown-tool error for, `code_loop_*` and `record_adoption_evidence`; `ask.files` is rejected and not advertised; no execution-feedback handle. Intended for an unprivileged on-box agent account. `ask` keys are owner tier: prompts enter the owner content log and get owner-priority admission, so always mint them with `--models` and credit/quota limits. A gateway older than this scope reads the stored value as owner `inference`; run `keys revoke --scope ask --confirm` before any rollback below this version. |
 | Scope | `inference` | Ordinary inference only. Legacy guest-key default. |
 | Scope | `monitor` | Read-only `GET /healthz`, `/models*`, `/metrics`, `/ledger*`, and `/ops/summary`; no inference or mutation. |
 
@@ -139,8 +139,38 @@ echoed for them.
 `contentCaptureOptOut: "content-capture-none-v1"` for every authenticated key, and `tools/list` advertises `content_capture` (`enum: ["none"]`) on `ask` and
 `code_loop_start`. An older gateway silently ignores the unknown argument or header, so a caller must
 check one of these before sending Restricted content; the m5 client and stdio bridge do this
-automatically. This is a per-call capability advertisement, not the full effective-capture
-discovery requested in #344 (retention horizon, per-route/scope policy), which remains open.
+automatically. This is a per-call capability advertisement; the effective-capture policy is below.
+
+**Effective capture preflight (`GET /portal/capture-policy`, INFER-344).** Authenticated, read-only,
+`Cache-Control: no-store`, content-free, and available to every scope except `monitor` (including
+the closed `ask` allow-list). It reports what the gateway would persist for the *calling* principal
+and never reads logs, keystore rows, paths or backend configuration. It is computed from the same
+`shouldCaptureOwnerContent` decision the runtime routes use, so it cannot drift from behaviour.
+
+```json
+{ "contract": "capture-policy-v1", "observed_at": "2026-11-17T00:00:00.000Z", "policy_id": "<16 hex>",
+  "principal": { "tier": "owner", "scope": "agent" },
+  "routes": { "chat": { "available": true, "capture": "content",
+    "retention": { "horizon_days": "unknown", "declared_days": 30 }, "per_call_opt_out": true },
+    "ask": {}, "code_loop": {}, "delegate": {}, "embeddings": {} } }
+```
+
+- `capture`: `content` (request/response content persisted), `metadata_only` (content-blind
+  telemetry only), or `none` (no durable per-request record). Tier and scope are reported
+  separately: scope decides `available`, tier/key decides `capture`. Guests and legacy static admin
+  keys are never `content`.
+- `retention.horizon_days` is `"unknown"` whenever anything is persisted: the gateway does not
+  enforce a window itself (pruning is an operator job), so a capturing or metadata route is never
+  presented as non-retaining. `declared_days` is the documented target from the retention registry
+  (or `null`), not a guarantee. `"not_applicable"` appears only with `capture: "none"`.
+- `per_call_opt_out` is `true` only where `X-Content-Capture: none` / `content_capture:"none"` is
+  honoured for this caller and route, and the gateway key is provisioned.
+- `observed_at` and `policy_id` (a hash of the inputs that change the answer) identify the snapshot;
+  re-fetch rather than caching it. Observing a policy is not authorization to process data under it.
+
+Ordinary client preflight: call `GET /portal/capture-policy` with the key you will use, check the
+entry for the route you intend to call, and send Restricted content only if `capture` is acceptable
+or `per_call_opt_out` is `true` and you send the opt-out. Needs no admin log access and no inference.
 
 ## Error envelope (OpenAI-shaped)
 
