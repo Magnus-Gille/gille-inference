@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the gateway/model readiness journey every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=gille-gateway-readiness-journey.service
+
+[Install]
+WantedBy=timers.target
