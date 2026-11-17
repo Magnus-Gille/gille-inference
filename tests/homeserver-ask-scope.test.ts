@@ -234,7 +234,7 @@ describe("ask scope: HTTP routes are a closed allow-list", () => {
     expect(upstreamHits).toBe(before);
   });
 
-  it.each(["/portal/me", "/v1/models", "/healthz"])("GET %s stays reachable for preflight", async (path) => {
+  it.each(["/portal/me", "/portal/capture-policy", "/v1/models", "/healthz"])("GET %s stays reachable for preflight", async (path) => {
     const res = await http(keys["ask"]!, "GET", path);
     expect(res.status).toBe(200);
   });
@@ -367,6 +367,8 @@ describe("ask scope: gate and router share one (method, pathname) view (N1)", ()
     ["HEAD", "/portal/me"], ["OPTIONS", "/portal/me"], ["PUT", "/portal/me"], ["DELETE", "/portal/me"],
     ["HEAD", "/v1/models"], ["OPTIONS", "/v1/models"], ["PUT", "/v1/models"], ["DELETE", "/v1/models"],
     ["GET", "/mcp"], ["HEAD", "/mcp"], ["OPTIONS", "/mcp"], ["PUT", "/mcp"], ["DELETE", "/mcp"],
+    ["HEAD", "/portal/capture-policy"], ["PUT", "/portal/capture-policy"], ["DELETE", "/portal/capture-policy"],
+    ["POST", "/portal/capture-policy"],
     ["POST", "/portal/me"], ["POST", "/healthz"], ["POST", "/v1/models"],
   ])("%s %s is not an allowed method/path pair", async (method, path) => {
     const before = upstreamHits;

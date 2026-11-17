@@ -85,6 +85,7 @@ import { modelEvalsPayload } from "./model-evals-portal.js";
 import { poisonClearOnDisconnect, requestPoisonClear } from "./poison-clear.js";
 import { DegeneracyWatchdog } from "./degeneracy-watchdog.js";
 import { recordOwnerRequest, shouldCaptureOwnerContent } from "./owner-log.js";
+import { describeCapturePolicy } from "./capture-policy.js";
 import {
   CONTENT_CAPTURE_HEADER,
   CONTENT_CAPTURE_OPT_OUT_CONTRACT,
@@ -239,6 +240,7 @@ interface PrincipalContext {
 const ASK_SCOPE_ROUTES: ReadonlySet<string> = new Set([
   "POST /mcp",
   "GET /portal/me",
+  "GET /portal/capture-policy",
   "GET /v1/models",
   "GET /healthz",
 ]);
@@ -4522,7 +4524,7 @@ export async function handleRequest(
         res,
         makeError("route_not_allowed", {
           param: null,
-          message: "This is an ask-only key (allowed: POST /mcp, GET /portal/me, GET /v1/models and GET /healthz).",
+          message: "This is an ask-only key (allowed: POST /mcp, GET /portal/me, GET /portal/capture-policy, GET /v1/models and GET /healthz).",
         })
       );
       return;
@@ -5786,6 +5788,24 @@ export async function handleRequest(
         rpm: principal.limits.rpm,
         tpm: principal.limits.tpm,
       });
+      lctx.status = 200;
+      lctx.outcome = "ok";
+      lctx.admission = "n/a";
+      return;
+    }
+    // INFER-344: effective content-capture preflight for the authenticated caller. Content-free;
+    // derived from the same eligibility decision the runtime routes use (owner-log.ts).
+    if (path === "/portal/capture-policy" && method === "GET") {
+      res.setHeader("cache-control", "no-store");
+      sendJson(res, 200, describeCapturePolicy({
+        ownerRequestLog: cfg.ownerRequestLog,
+        requestLog: cfg.requestLog,
+        accessLog: cfg.accessLog,
+        principal,
+        optOutAvailable: isKeyedExposureFingerprintAvailable(),
+        embeddingGranted: embeddingGranted(principal, EMBEDDING_MODEL_ID),
+        now: new Date(),
+      }));
       lctx.status = 200;
       lctx.outcome = "ok";
       lctx.admission = "n/a";
