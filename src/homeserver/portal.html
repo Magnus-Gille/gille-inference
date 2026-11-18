@@ -869,6 +869,13 @@ for chunk in stream:
   https://inference.example.com/mcp \
   --header "Authorization: Bearer hs_..."</pre>
         <p>
+          <strong>Owner, from claude.ai (cloud sessions, Projects):</strong> when the operator has
+          enabled OAuth, add <span class="badge mono">https://inference.example.com/mcp</span> as a
+          custom connector and enter the one-time consent code minted on the box. The connector
+          gets exactly the scope, models and credits of the key that code was minted for, and
+          only on <span class="badge mono">/mcp</span>.
+        </p>
+        <p>
           The same key, credit budget, and model allow-list apply as for the HTTP API.
           Basic tools are exposed to every permitted key. A real minted owner-agent key also gets
           the bounded code-loop tools and a content-free adoption-report tool:
