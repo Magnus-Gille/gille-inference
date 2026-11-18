@@ -132,7 +132,7 @@ up to date. Every other document (`AGENTS.md`'s "Deploying the M5 gateway" secti
 `docs/`) points here instead of repeating these facts — if you find a stale copy elsewhere, fix it
 to point here rather than re-describing the topology.
 
-**Live facts** (topology verified 2026-07-19/20, issue #23; deployment receipt last updated 2026-10-21):
+**Live facts** (topology verified 2026-07-19/20, issue #23; deployment receipt last updated 2026-11-18):
 
 - systemd unit: `home-gateway.service`
 - `WorkingDirectory`: `/home/magnus/home-server-eval`
@@ -141,13 +141,16 @@ to point here rather than re-describing the topology.
   `git -C /home/magnus/home-server-eval rev-parse` fails with "not a git repository". There is no
   local history to diff against on the box; `.deployed-commit` (below) is the only record of
   deployed identity.
-- Deployed commit: **`60a008aba40b2f411c17499ea4f0a918afa83b2a`**, accepted 2026-10-21 at
-  21:26:54 UTC after the gateway restart at 21:24:58 UTC. Deployment and verification passed;
-  five live source hashes matched, and the
-  authenticated MCP `tools/list` check exposed the expected optional `response_format` field.
-  One synthetic JSON-mode ask returned the expected model and stop reason, was not truncated, and
-  was metered. This is a readiness probe, not quality calibration. This line is a convenience and
-  goes stale; `scripts/deploy-gateway.sh verify` reads the live marker and is the source of truth.
+- Deployed commit: **`f291e9e2aee8f0540dd07d6638e8b4b494b8b5e5`** (INFER-518, OAuth 2.1 on
+  `POST /mcp`), accepted 2026-11-18 after the gateway restart at 16:15:22 UTC. The deploy passed
+  tailnet health, the authenticated capability probe, the public-edge check and the autonomy
+  timer; `verify` matched the marker and source hashes. OAuth was enabled in the private
+  environment file. Through the public hostname, both OAuth metadata documents returned 200, an
+  unauthenticated `POST /mcp` returned 401 with the `resource_metadata` challenge, and the
+  metadata GET was not blocked by Cloudflare for `Claude-User` or `python-httpx` user agents. The
+  previously deployed commit, and the rollback target, is
+  `c79360e4fe993e7f16f6c81a6204a7aea3f1deac`. This line is a convenience and goes stale;
+  `scripts/deploy-gateway.sh verify` reads the live marker and is the source of truth.
 - Paired client: **`1.5.3`**, unchanged in this gateway rollout. Its installation from a verified
   local tarball and the npm publication blocker were recorded on 2026-10-04; registry publication
   was not rechecked for this release. The historical bounded (60-second) offline dispatch smoke
