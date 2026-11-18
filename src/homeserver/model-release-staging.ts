@@ -102,6 +102,9 @@ const MAX_TREE_BYTES = 32 * 1024 * 1024;
 const MAX_INDEX_BYTES = 64 * 1024 * 1024;
 const TREE_PAGE_LIMIT = 100;
 const MAX_TREE_PAGES = 100;
+/** Default-branch history pages searched for a pinned commit before failing closed. */
+const MAX_COMMIT_PAGES = 50;
+const MAX_COMMITS_BYTES = 4 * 1024 * 1024;
 const MAX_TREE_ENTRIES = 10_000;
 const CONTROL_FILES = new Set([
   "added_tokens.json",
@@ -372,6 +375,52 @@ function validateTreePageUrl(urlText: string, encodedModel: string, revision: st
   return url.href;
 }
 
+function validateCommitPageUrl(urlText: string, encodedModel: string): string {
+  const url = new URL(urlText);
+  if (
+    url.origin !== HUB_BASE ||
+    url.pathname !== `/api/models/${encodedModel}/commits/main` ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.hash !== ""
+  ) {
+    throw new Error(`unsafe commit-history pagination URL: ${urlText}`);
+  }
+  for (const key of url.searchParams.keys()) {
+    if (!["p", "limit", "cursor"].includes(key)) {
+      throw new Error(`unexpected commit-history pagination parameter: ${key}`);
+    }
+  }
+  return url.href;
+}
+
+/**
+ * The metadata request is made at the pinned revision so that a repository whose `main` has
+ * since moved can still be staged. That endpoint also resolves commits reachable only from
+ * Hub pull-request refs (`refs/pr/*`), so separately require the pinned commit to appear in
+ * the default branch's history and fail closed when it cannot be found within the bounds.
+ */
+async function assertOnDefaultBranch(
+  encodedModel: string,
+  revision: string,
+  fetchImpl: typeof fetch
+): Promise<void> {
+  let pageUrl: string | null = validateCommitPageUrl(`${HUB_BASE}/api/models/${encodedModel}/commits/main`, encodedModel);
+  const seen = new Set<string>();
+  while (pageUrl !== null) {
+    if (seen.has(pageUrl)) throw new Error("commit-history pagination cycle detected");
+    if (seen.size >= MAX_COMMIT_PAGES) break;
+    seen.add(pageUrl);
+    const response = await fetchImpl(pageUrl, { headers: { accept: "application/json" } });
+    const commits = JSON.parse(await boundedResponse(response, MAX_COMMITS_BYTES, "commit history")) as unknown;
+    if (!Array.isArray(commits)) throw new Error("commit history response must be an array");
+    if (commits.some((commit) => (commit as { id?: unknown } | null)?.id === revision)) return;
+    const next = nextTreePage(response.headers.get("link"));
+    pageUrl = next === null ? null : validateCommitPageUrl(next, encodedModel);
+  }
+  throw new Error(`pinned revision ${revision} is not on the default branch history`);
+}
+
 export async function collectPublicStagePlan(
   model: string,
   revision: string,
@@ -380,12 +429,13 @@ export async function collectPublicStagePlan(
   validateModel(model);
   validateRevision(revision);
   const encodedModel = model.split("/").map(encodeURIComponent).join("/");
-  const metadataResponse = await fetchImpl(`${HUB_BASE}/api/models/${encodedModel}`, {
+  const metadataResponse = await fetchImpl(`${HUB_BASE}/api/models/${encodedModel}/revision/${revision}`, {
     headers: { accept: "application/json" },
   });
   const metadata = JSON.parse(
     await boundedResponse(metadataResponse, MAX_METADATA_BYTES, "model metadata")
   ) as HuggingFaceStageMetadata;
+  await assertOnDefaultBranch(encodedModel, revision, fetchImpl);
   let treePageUrl: string | null = validateTreePageUrl(
     `${HUB_BASE}/api/models/${encodedModel}/tree/${revision}?recursive=true&expand=true&limit=${TREE_PAGE_LIMIT}`,
     encodedModel,

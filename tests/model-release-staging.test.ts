@@ -142,11 +142,14 @@ describe("collectPublicStagePlan", () => {
     let treePage = 0;
     const fetchImpl = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
-      if (url.endsWith("/api/models/Qwen/Qwen3.8-27B")) {
+      if (url.endsWith(`/api/models/Qwen/Qwen3.8-27B/revision/${REVISION}`)) {
         return new Response(
           JSON.stringify({ id: "Qwen/Qwen3.8-27B", sha: REVISION, private: false, gated: false }),
           { status: 200, headers: { "content-type": "application/json" } }
         );
+      }
+      if (url.endsWith("/api/models/Qwen/Qwen3.8-27B/commits/main")) {
+        return new Response(JSON.stringify([{ id: "f".repeat(40) }, { id: REVISION }]), { status: 200 });
       }
       if (url.includes(`/tree/${REVISION}?`)) {
         treePage++;
@@ -171,18 +174,22 @@ describe("collectPublicStagePlan", () => {
     const plan = await collectPublicStagePlan("Qwen/Qwen3.8-27B", REVISION, fetchImpl as typeof fetch);
     expect(plan.revision).toBe(REVISION);
     expect(plan.files.filter((file) => file.kind === "weight")).toHaveLength(2);
-    expect(fetchImpl.mock.calls.map(([url]) => String(url))).toHaveLength(4);
+    expect(fetchImpl.mock.calls.map(([url]) => String(url))).toHaveLength(5);
+    expect(fetchImpl.mock.calls.every(([url]) => !/\/api\/models\/Qwen\/Qwen3\.8-27B$/.test(String(url)))).toBe(true);
     expect(fetchImpl.mock.calls.every(([url]) => !String(url).includes("/resolve/main/"))).toBe(true);
   });
 
   it("rejects an untrusted next-page URL instead of following it", async () => {
     const fetchImpl = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
-      if (url.endsWith("/api/models/Qwen/Qwen3.8-27B")) {
+      if (url.endsWith(`/api/models/Qwen/Qwen3.8-27B/revision/${REVISION}`)) {
         return new Response(
           JSON.stringify({ id: "Qwen/Qwen3.8-27B", sha: REVISION, private: false, gated: false }),
           { status: 200 }
         );
+      }
+      if (url.includes("/commits/main")) {
+        return new Response(JSON.stringify([{ id: REVISION }]), { status: 200 });
       }
       return new Response(JSON.stringify(tree()), {
         status: 200,
@@ -192,6 +199,51 @@ describe("collectPublicStagePlan", () => {
     await expect(
       collectPublicStagePlan("Qwen/Qwen3.8-27B", REVISION, fetchImpl as typeof fetch)
     ).rejects.toThrow(/unsafe release-tree pagination URL/);
+  });
+
+  function historyFetch(pages: Array<{ ids: string[]; next?: string }>) {
+    let page = 0;
+    return vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith(`/api/models/Qwen/Qwen3.8-27B/revision/${REVISION}`)) {
+        return new Response(
+          JSON.stringify({ id: "Qwen/Qwen3.8-27B", sha: REVISION, private: false, gated: false }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/commits/main")) {
+        const current = pages[page++]!;
+        return new Response(JSON.stringify(current.ids.map((id) => ({ id }))), {
+          status: 200,
+          headers: current.next === undefined ? {} : { link: `<${current.next}>; rel="next"` },
+        });
+      }
+      if (url.includes(`/tree/${REVISION}?`)) return new Response(JSON.stringify(tree()), { status: 200 });
+      if (url.includes(`/resolve/${REVISION}/model.safetensors.index.json`)) return new Response(INDEX, { status: 200 });
+      throw new Error(`unexpected URL: ${url}`);
+    });
+  }
+
+  it("rejects a pinned commit that is not on the default branch (for example a refs/pr-only commit)", async () => {
+    const fetchImpl = historyFetch([{ ids: ["a".repeat(40), "b".repeat(40)] }]);
+    await expect(
+      collectPublicStagePlan("Qwen/Qwen3.8-27B", REVISION, fetchImpl as typeof fetch)
+    ).rejects.toThrow(/not on the default branch/);
+    expect(fetchImpl.mock.calls.some(([url]) => String(url).includes("/tree/"))).toBe(false);
+  });
+
+  it("follows bounded default-branch history pages to find an older pin", async () => {
+    const next = "https://huggingface.co/api/models/Qwen/Qwen3.8-27B/commits/main?p=1";
+    const fetchImpl = historyFetch([{ ids: ["a".repeat(40)], next }, { ids: [REVISION] }]);
+    const plan = await collectPublicStagePlan("Qwen/Qwen3.8-27B", REVISION, fetchImpl as typeof fetch);
+    expect(plan.revision).toBe(REVISION);
+  });
+
+  it("rejects an untrusted commit-history page URL", async () => {
+    const fetchImpl = historyFetch([{ ids: ["a".repeat(40)], next: "https://evil.example/api/models/x/commits/main" }]);
+    await expect(
+      collectPublicStagePlan("Qwen/Qwen3.8-27B", REVISION, fetchImpl as typeof fetch)
+    ).rejects.toThrow(/unsafe commit-history pagination URL/);
   });
 });
 
