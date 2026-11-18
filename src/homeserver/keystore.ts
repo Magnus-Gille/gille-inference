@@ -1835,3 +1835,22 @@ export function listInvites(): InvitePublic[] {
     redeemedKeyAlias: r.redeemed_key_alias,
   }));
 }
+
+// ─── Lookup by alias (INFER-518) ────────────────────────────────────────────────────
+
+/**
+ * Active (not revoked, not expired) key by alias, or null. Used ONLY by the OAuth layer, which
+ * binds each grant to an operator-minted backing key: the OAuth access token is the credential,
+ * and the backing key's record supplies tier, scope, limits, allow-lists and credit row. Revoking
+ * or expiring the backing key therefore ends every OAuth token bound to it.
+ */
+export function lookupActiveKeyByAlias(alias: string, now: Date = new Date()): ApiKeyRecord | null {
+  const db = ksDb();
+  const row = db
+    .prepare(`SELECT * FROM api_keys WHERE alias = ? AND revoked_at IS NULL`)
+    .get(alias) as KeyRow | undefined;
+  if (!row) return null;
+  const rec = rowToRecord(row);
+  if (rec.expiresAt !== null && new Date(rec.expiresAt).getTime() <= now.getTime()) return null;
+  return rec;
+}

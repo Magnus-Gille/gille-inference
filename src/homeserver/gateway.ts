@@ -105,6 +105,7 @@ import {
 import { queryM5UsageSummary } from "./usage-summary.js";
 import { queryLatestSuccessfulM5InferenceAt } from "./inference-freshness.js";
 import { getDb } from "../db.js";
+import { handleOAuthRequest, isOAuthAccessToken, OAUTH_PUBLIC_PATHS, protectedResourceMetadataUrl, resolveAccessToken } from "./oauth.js";
 import { getCurrentModelLifecycleStartAtMsByModel } from "./model-lifecycle.js";
 import { diagnoseModelResidency, type ModelResidencyDiagnostic, type ModelResidencyFacts } from "./model-residency.js";
 import { startModelLifecycleObserver } from "./model-lifecycle-observer.js";
@@ -234,6 +235,11 @@ interface PrincipalContext {
   /** Lifetime credit cap snapshot (0 = unlimited). null when there is no credit row. */
   creditLimit: number;
   creditsUsed: number;
+  /**
+   * INFER-518: set when the credential is an OAuth access token. The principal then mirrors the
+   * grant's backing key, and the gateway accepts it on POST /mcp only.
+   */
+  oauthGrantId?: string;
 }
 
 /** Closed route allow-list for scope `ask` (INFER-450). Keys are `${METHOD} ${pathname}`. */
@@ -267,6 +273,31 @@ function resolvePrincipal(
 ): PrincipalContext | null {
   const token = bearerToken(req);
   if (!token) return null;
+
+  // (0) INFER-518 OAuth access token: resolves to its grant's backing key, never to a static key.
+  if (isOAuthAccessToken(token)) {
+    if (cfg.oauth.enabled !== "on") return null;
+    const resolved = resolveAccessToken(token);
+    if (!resolved) return null;
+    const key = resolved.key;
+    return {
+      alias: key.alias,
+      logicalAlias: key.logicalAlias ?? key.alias,
+      tier: key.tier,
+      scope: key.scope,
+      isAdmin: false,
+      isMonitor: false,
+      modelAllowList: key.modelAllowList,
+      systemOneModelAllowList: key.systemOneModelAllowList,
+      embeddingModelAllowList: key.embeddingModelAllowList,
+      limits: { rpm: key.rpm, tpm: key.tpm, dailyTokenBudget: key.dailyTokenBudget },
+      maxParallel: key.maxParallel,
+      keyHash: key.keyHash,
+      creditLimit: key.creditLimit,
+      creditsUsed: key.creditsUsed,
+      oauthGrantId: resolved.grantId,
+    };
+  }
 
   // (1) keystore
   const rec = lookupKey(token);
@@ -4530,6 +4561,22 @@ export async function handleRequest(
       return;
     }
 
+    // INFER-518: an OAuth access token is audience-bound to the MCP resource. It is refused on
+    // every other route, including the public portal routes, before any further dispatch.
+    if (principal?.oauthGrantId !== undefined && !(method === "POST" && path === "/mcp")) {
+      lctx.status = 403;
+      lctx.outcome = "forbidden";
+      lctx.errorClass = "route_not_allowed";
+      sendError(
+        res,
+        makeError("route_not_allowed", {
+          param: null,
+          message: "This OAuth access token is valid only for POST /mcp.",
+        })
+      );
+      return;
+    }
+
     // The Hugin roster credential is a route-scoped service principal, not a
     // general owner/admin key. Enforce its closed allowlist before public,
     // inference, or generic admin dispatch so tier=owner cannot widen it.
@@ -4654,6 +4701,35 @@ export async function handleRequest(
       );
       return false;
     };
+
+    // ─── OAuth 2.1 for remote MCP clients (INFER-518; UNauthenticated surface) ───
+    // Metadata, dynamic registration, consent and token routes. Grants are bound to an
+    // operator-minted ask/inference key via a one-time consent code; see oauth.ts.
+    if (OAUTH_PUBLIC_PATHS.has(path)) {
+      lctx.route = path;
+      lctx.admission = "n/a";
+      if (cfg.oauth.enabled === "on" && cfg.oauth.rpm > 0) {
+        const rl = checkRateWindow(`oauth-ip:${clientIp(req, cfg.trustedProxies)}`, cfg.oauth.rpm, cfg.publicWindowMs);
+        if (!rl.ok) {
+          lctx.status = 429;
+          lctx.outcome = "rate_limited";
+          lctx.errorClass = "rate_limit_exceeded";
+          lctx.retryAfterS = rl.retryAfterSeconds;
+          sendError(res, makeError("rate_limit_exceeded", {
+            retryAfterSeconds: rl.retryAfterSeconds,
+            message: `Too many requests from your IP. Retry after ${rl.retryAfterSeconds}s.`,
+          }));
+          return;
+        }
+      }
+      const outcome = await handleOAuthRequest(req, res, path, method, parsedUrl, cfg.oauth);
+      if (outcome) {
+        lctx.status = outcome.status;
+        lctx.outcome = outcome.outcome;
+        lctx.errorClass = outcome.errorClass;
+        return;
+      }
+    }
 
     if ((path === "/portal" || path === "/") && method === "GET") {
       lctx.route = "/portal";
@@ -4905,6 +4981,13 @@ export async function handleRequest(
       lctx.status = 401;
       lctx.outcome = "auth_failed";
       lctx.errorClass = "invalid_api_key";
+      // INFER-518 / RFC 9728: tell MCP clients where to discover the authorization server.
+      if (path === "/mcp" && cfg.oauth.enabled === "on") {
+        res.setHeader(
+          "www-authenticate",
+          `Bearer resource_metadata="${protectedResourceMetadataUrl(cfg.oauth)}"`
+        );
+      }
       sendError(res, makeError("invalid_api_key"));
       return;
     }

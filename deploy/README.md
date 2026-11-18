@@ -299,6 +299,36 @@ it before (or with) the restart that ships #487, then verify with an owner key t
 rows incomparable; the exposure lookup reports that as incomplete coverage rather than "fresh".
 Removing the key disables the opt-out again (rollback-safe: no schema or data change depends on it).
 
+### OAuth for cloud Claude sessions (INFER-518)
+
+Off by default; enabling it adds a new **public, unauthenticated** route family
+(`/.well-known/oauth-*`, `/oauth/*`) behind the existing Tunnel. Enabling it, minting the backing
+key and consent code, and registering the claude.ai connector all change live exposure and
+credentials, so each needs the owner's explicit go-ahead. To enable, add to the gateway's private
+environment file:
+
+```bash
+HOMESERVER_OAUTH=on
+HOMESERVER_OAUTH_ISSUER=https://<public host>     # bare https origin of the Tunnel hostname
+# optional: HOMESERVER_OAUTH_REDIRECT_URIS (default: claude.ai + claude.com connector callbacks)
+# optional: HOMESERVER_OAUTH_ACCESS_TTL_SECONDS=3600, HOMESERVER_OAUTH_REFRESH_TTL_SECONDS=2592000
+# optional: HOMESERVER_OAUTH_RPM=120
+```
+
+The gateway refuses to start if `HOMESERVER_OAUTH=on` has a missing or non-https issuer. After the
+restart, verify through the public hostname (not loopback) that
+`GET /.well-known/oauth-protected-resource/mcp` returns `200` with `resource` equal to
+`<issuer>/mcp`, and that an unauthenticated `POST /mcp` returns `401` with a
+`WWW-Authenticate: Bearer resource_metadata=…` header. Keep the Cloudflare HTTPS redirect, HSTS
+and WAF rules unchanged; check that Browser Integrity Check and bot rules admit the connector's
+requests to `/oauth/*`, `/.well-known/*` and `/mcp`. Then follow the operator flow in
+[`../src/homeserver/README.md`](../src/homeserver/README.md#oauth-for-remote-mcp-clients-infer-518).
+
+**Rollback:** set `HOMESERVER_OAUTH=off` (or remove it) and restart. All OAuth routes return
+`404` and every `hs_oat_` token is refused; bearer keys are unaffected. The `oauth_*` tables are
+additive and can stay. To cut a connector without a restart, `oauth revoke --key <alias>` or
+revoke the backing key.
+
 ### Deploying
 
 ```bash
@@ -981,6 +1011,7 @@ The ones that shape best-effort behaviour:
 | `HOMESERVER_PER_REQUEST_MAX_TOKENS` | `12288` | fleet default and ordinary-model hard `max_tokens` cap |
 | `HOMESERVER_MODEL_MAX_TOKENS` | `vibethinker-3b=32768` | comma-separated exact-model explicit-request ceilings; omitted requests still use the fleet default |
 | `HOMESERVER_KEY_DEFAULT_{RPM,TPM,DAILY_TOKENS,MAX_PARALLEL}` | `60 / 60000 / 0 / 1` | quota defaults for newly-minted keys |
+| `HOMESERVER_OAUTH` / `HOMESERVER_OAUTH_ISSUER` | `off` / unset | OAuth 2.1 on `POST /mcp` for claude.ai connectors (INFER-518); issuer must be the bare public https origin |
 
 > **Note on `DAILY_TOKENS=0`** — `0` means *unlimited*. For guest keys you
 > almost always want an explicit non-zero `--daily` at mint time, so a leaked

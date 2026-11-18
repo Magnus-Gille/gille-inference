@@ -186,6 +186,8 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `GET /v1/images/generations/jobs/{id}` | user | Poll an async job (scoped to the creator; bare `404` otherwise). `succeeded` returns `data:[{b64_json}]` until the result TTL sweeps it (`expired`). |
 | `DELETE /v1/images/generations/jobs/{id}` | user | Cancel + refund a job, **idempotent**; scoped to the creator. |
 | `POST /mcp` | user | **MCP Streamable-HTTP transport** (JSON-RPC 2.0). Exposes the local models to an MCP client as tools — `list_models` + `ask` (all keys; an owner `scope=ask` key sees only `tokenize`, `list_models`, `model_status` and `ask`, without the `files` input, and may call no other route) and, for a real minted owner-tier key with `scope=agent\|admin`, `code_loop_start` / `code_loop_status` / `code_loop_result` plus `record_adoption_evidence` (invisible + unknown-tool-shaped error otherwise, #116/#136). The adoption tool accepts only a closed, content-free evidence shape; its weekly dashboard is separate from evaluation/synthetic lab traffic and remains **SHADOW** for routing. Report calls suppress normal per-request correlation logs and are transiently telemetry-rate-limited. The first 25 valid reports per server day retain individual low-cardinality rows; later reports are coalesced into bounded content-free v2 aggregates preserving closed harness and execution-mode attribution. Legacy aggregates remain unchanged; windows with legacy or malformed attribution stay **INCOMPLETE**. Both overflow tables retain 90 days. Its structured acknowledgement distinguishes `retained`, `aggregated`, and `dropped`, uses telemetry-scoped limit reasons, and explicitly says inference availability is unaffected. Retry guidance applies only to `record_adoption_evidence`, never `ask`, `code_loop`, model access, credits, or owner inference. `ask` runs through the **same metered path** as `/v1/chat/completions` (credit reserve → quota → admission → reconcile) and the **same model allow-list**; it accepts optional `delegator_model_id` for savings accounting and an **OWNER-TIER** optional `files` array (blind-context delegation, issue #128). Its structured result exposes `finish_reason`, explicit `truncated`, content-blind `usage`, and `metered:true`; a token-limit finish returns `isError:true`, keeps the paid partial answer in the content block behind a loud warning, and means any retry is a new billable call. `GET /mcp` → `405`. See *MCP transport* + *code_loop* below. |
+| `GET /.well-known/oauth-protected-resource[/mcp]`, `GET /.well-known/oauth-authorization-server` | public (only when `HOMESERVER_OAUTH=on`) | **INFER-518 OAuth discovery** (RFC 9728 / RFC 8414) for remote MCP clients such as claude.ai connectors. `404` while OAuth is off. With OAuth on, a `401` from `POST /mcp` carries `WWW-Authenticate: Bearer resource_metadata="…"`. |
+| `POST /oauth/register`, `GET|POST /oauth/authorize`, `POST /oauth/token`, `POST /oauth/revoke` | public (only when `HOMESERVER_OAUTH=on`) | **INFER-518 OAuth 2.1** for `POST /mcp`: dynamic registration limited to an exact redirect allow-list, a consent page that requires a one-time operator consent code, PKCE S256, rotating refresh tokens. Access tokens (`hs_oat_…`) are accepted on `POST /mcp` only and carry exactly the authority of the `ask`/`inference` key the consent code was minted for. See *OAuth for remote MCP clients* below. |
 | `POST /delegate` | **owner-admin** | Orchestrated evidence-writing path: `{prompt, taskType?, systemPrompt?, maxTokens?, modelId?, temperature?, topP?, topK?, minP?, frontierModelId?, delegatorModelId?, premiumBaselineModelId?, verifier?, responseFormat?, learningTaskStamp?}`. A stamp opts the real Hugin inference lane into v1, requires explicit matching `taskType`, and returns `learningTaskGatewayEcho`; unstamped traffic remains legacy/ineligible. Sampling controls are validated and threaded to the local call. `modelId`/`frontierModelId` pin the local model + optional frontier fallback; `verifier` grades output so the ledger learns; `responseFormat` optionally grammar-constrains decode. Agent/guest → `403 route_not_allowed`. See `docs/gateway-api-contract.md`. |
 | `POST /admin/task-exposures/lookup` | **minted owner-admin** | Content-blind batch freshness lookup for the automatic evaluation factory. Accepts 1–100 exact `trim-utf8-sha256-v1` task fingerprints and returns seen/unknown plus first/last time, lane/model/harness metadata, and an explicit coverage window. Never returns raw task text. Agent, guest, monitor, and identity-less static admins → `403`; `Cache-Control: no-store`. See `docs/task-exposure-contract.md`. |
 | `GET /models` | user | Models on disk + loaded. Decision and embedding models appear only when enabled and explicitly granted to guest keys. |
@@ -396,6 +398,59 @@ with enough credit/TPM headroom. `--envelope-ref` is only recorded in the output
 and the probe neither checks nor takes the GPU lease: the operator must arrange it. Do not run it
 concurrently with benchmarks or other traffic on the same key, since concurrent charges would
 confound the zero-charge evidence.
+
+### OAuth for remote MCP clients (INFER-518)
+
+Cloud Claude sessions (claude.ai/code, Claude Projects, routines) cannot hold an M5 bearer, and
+their containers cannot reach the gateway host directly. A **claude.ai custom connector** can:
+connector calls go through Anthropic's servers, so no secret enters the cloud container and the
+cloud environment's network allow-list needs no change. Custom connectors authenticate with OAuth,
+so the gateway exposes a small OAuth 2.1 authorization server in front of `POST /mcp`. It is
+**off by default** (`HOMESERVER_OAUTH=on` plus `HOMESERVER_OAUTH_ISSUER=https://<public host>`).
+
+Authority model (`oauth.ts`):
+
+- Every grant is bound to **one operator-minted backing key**. The OAuth access token is only a
+  handle: tier, scope, model allow-lists, RPM/TPM/daily budgets, credits and ledger alias are the
+  backing key's. Revoking or expiring that key ends every token bound to it.
+- Only **`ask` or `inference`** keys can back a grant. `admin`, `agent` (code_loop, owner
+  execution authority) and `monitor` keys are refused, so `code_loop_*` and blind-context
+  `files` are never reachable this way. Use a dedicated alias (for example `cloud-claude`) so
+  cloud traffic is distinguishable in the ledger, admission and adoption evidence.
+- OAuth access tokens are accepted on **`POST /mcp` only**; every other route returns `403`.
+- Consent requires a **one-time consent code** minted on the box. Dynamic client registration
+  alone grants nothing, and redirect URIs must exactly match `HOMESERVER_OAUTH_REDIRECT_URIS`
+  (default: the claude.ai and claude.com connector callbacks). Unused registrations are pruned
+  after 24 hours, and active clients are capped.
+- Enter a consent code only on a consent page reached from a connector setup **you** started in
+  your own claude.ai account. The code binds the grant to whichever account initiated that
+  authorization request, so someone who sends you an authorize link is asking for your key's
+  authority. The page names the client and the callback host; codes expire (default 15 minutes).
+- PKCE S256 is mandatory. Authorization codes live 120 s and are single-use; refresh tokens rotate
+  on every use. A replayed code or spent refresh token **revokes the whole grant**. Only sha256
+  hashes of codes and tokens are stored.
+- The OAuth routes have their own per-IP throttle (`HOMESERVER_OAUTH_RPM`, default 120 per
+  `HOMESERVER_PUBLIC_WINDOW_MS`), separate from `/portal/redeem`, because connector traffic arrives
+  from a few shared provider egress addresses.
+- Owner-tier backing keys are owner traffic for content capture, exactly as the same key would be
+  over a bearer. Back the grant with a guest `inference` key when the cloud path must be
+  content-blind.
+
+Operator flow:
+
+```bash
+# 1. Mint the backing key (ask scope: list_models, model_status, tokenize, ask; nothing else).
+tsx src/homeserver/cli.ts keys mint --alias cloud-claude --tier owner --scope ask \
+  --models qwen38-27b,mellum --credits 2000000 --ttl 2592000
+#    The plaintext key it prints is not needed for OAuth; do not store it anywhere.
+# 2. Mint a one-time consent code (default 15 minutes).
+tsx src/homeserver/cli.ts oauth consent-code --key cloud-claude
+# 3. In claude.ai: Settings → Connectors → Add custom connector → https://<public host>/mcp.
+#    The consent page asks for the code from step 2.
+# 4. Inventory and revoke.
+tsx src/homeserver/cli.ts oauth list [--all] [--json]
+tsx src/homeserver/cli.ts oauth revoke --grant hsg_... | --client hsc_... | --key cloud-claude
+```
 
 ### MCP transport (offload sub-tasks from Claude Code)
 
