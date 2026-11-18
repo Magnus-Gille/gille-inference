@@ -11,6 +11,8 @@ import {
 } from "../src/homeserver/served-provenance.js";
 import { SERVED_PROVENANCE_REASONS } from "../src/homeserver/served-provenance-collector.js";
 
+const PRE_ADAPTER_IDENTITY = "sha256:fc841f99bf250e2e0d64435fa6871b437beb933cec8102788290d40b94d0fe3c";
+
 const digest = (value: string) => createHash("sha256").update(value, "utf8").digest("hex");
 
 function artifact(seed: string, binding: "verified-immutable" | "unproven" | "stale" = "verified-immutable") {
@@ -97,6 +99,39 @@ describe("served provenance", () => {
     expect(result.launchConfiguration.contextSize).toEqual(unknown<number>());
     expect(result.configurationIdentity).toMatch(/^sha256:[a-f0-9]{64}$/);
     expect(servedProvenanceSchema.parse(result)).toEqual(result);
+  });
+
+  it("keeps the pre-adapter identity when no LoRA adapter is present", () => {
+    const omitted = collectServedProvenance(completeInput());
+    const empty = collectServedProvenance({ ...completeInput(), artifacts: { ...completeInput().artifacts, adapters: [] } });
+
+    // Golden identity computed for this exact input before the adapters field existed.
+    expect(omitted.configurationIdentity).toBe(PRE_ADAPTER_IDENTITY);
+    expect(empty.configurationIdentity).toBe(omitted.configurationIdentity);
+    expect(omitted.artifacts).not.toHaveProperty("adapters");
+  });
+
+  it("puts LoRA adapters in the identity and requires their evidence for completeness", () => {
+    const base = collectServedProvenance(completeInput());
+    const withAdapter = collectServedProvenance({
+      ...completeInput(),
+      artifacts: { ...completeInput().artifacts, adapters: [artifact("lora-pi-1")] },
+    });
+    const otherAdapter = collectServedProvenance({
+      ...completeInput(),
+      artifacts: { ...completeInput().artifacts, adapters: [artifact("lora-pi-2")] },
+    });
+    const unknownAdapter = collectServedProvenance({
+      ...completeInput(),
+      artifacts: { ...completeInput().artifacts, adapters: [{ contentSha256: unknown<string>(), binding: "unproven" }] },
+    });
+
+    expect(withAdapter.completeness).toBe("complete");
+    expect(withAdapter.configurationIdentity).not.toBe(base.configurationIdentity);
+    expect(otherAdapter.configurationIdentity).not.toBe(withAdapter.configurationIdentity);
+    expect(unknownAdapter.completeness).toBe("incomplete");
+    expect(unknownAdapter.reasons).toEqual(expect.arrayContaining(["required-evidence-unknown", "served-bytes-unproven"]));
+    expect(servedProvenanceSchema.parse(withAdapter)).toEqual(withAdapter);
   });
 
   it("represents same-path byte replacement through a changed content digest", () => {

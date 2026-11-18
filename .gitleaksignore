@@ -2,3 +2,6 @@
 # Keep these fingerprint-scoped so new token-shaped findings still fail CI.
 4787ed7e4771f457a1bfafec92ee06c8f745dfb5:gate-d/README.md:generic-api-key:126
 76474f130edfcf12661fb513446d227a36c571ed:gate-d/README.md:generic-api-key:126
+# INFER-519: the first PR commit asserted the served model ID inline in a toMatchObject literal.
+# The follow-up commit asserts it separately; this fingerprint covers only that historical line.
+a28449ce99522ee0e020659f376839b2ba243805:tests/manual-promotion.test.ts:generic-api-key:207

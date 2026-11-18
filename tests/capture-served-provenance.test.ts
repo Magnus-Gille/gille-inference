@@ -24,6 +24,7 @@ function observation(overrides: Partial<ServedProcessProvenance> = {}): ServedPr
     reasons: [],
     weights: [{ sha256: "a".repeat(64), binding: "unproven" }],
     projector: { kind: "not-applicable" },
+    adapters: [],
     runtimeSha256: "b".repeat(64),
     launchFlags: {
       contextSize: 32768,
@@ -57,6 +58,25 @@ describe("capture served provenance", () => {
     expect(() => parseCaptureServedProvenanceArgs(["--pid", "1", "--alias", "unsafe label"])).toThrow();
     expect(() => parseCaptureServedProvenanceArgs(["--pid", "1", "--alias", "models/demo"])).toThrow();
     expect(() => parseCaptureServedProvenanceArgs(["--pid", "1", "--alias", "demo", "--gateway-build", "A".repeat(40)])).toThrow();
+  });
+
+  it("carries observed LoRA adapters into the snapshot and its identity", () => {
+    const capture = (adapters: ServedProcessProvenance["adapters"]) => {
+      const stdout = vi.fn<(line: string) => void>();
+      expect(runCaptureServedProvenance(ARGV, {
+        captureProcess: () => observation({ adapters }), stdout, stderr: vi.fn(),
+      })).toBe(0);
+      return JSON.parse(stdout.mock.calls[0]![0]) as ReturnType<typeof servedProvenanceSchema.parse>;
+    };
+    const plain = capture([]);
+    const adapted = capture([{ sha256: "c".repeat(64), binding: "unproven" }]);
+
+    expect(plain.artifacts).not.toHaveProperty("adapters");
+    expect(adapted.artifacts.adapters).toEqual([
+      { contentSha256: { source: "observed", value: "c".repeat(64) }, binding: "unproven" },
+    ]);
+    expect(adapted.configurationIdentity).not.toBe(plain.configurationIdentity);
+    expect(servedProvenanceSchema.parse(adapted)).toEqual(adapted);
   });
 
   it("emits only schema JSON and preserves operator declaration versus observed evidence", () => {

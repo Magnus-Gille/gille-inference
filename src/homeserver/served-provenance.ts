@@ -252,6 +252,12 @@ const environmentSchema = z.object({
 export interface ServedProvenanceArtifacts {
   readonly weights: readonly ServedArtifact[];
   readonly projector: ProjectorEvidence;
+  /**
+   * LoRA adapters applied on top of `weights`, in launch order. Omitted (or empty) means the
+   * launch selected none; a present adapter is required evidence like any weight artifact.
+   * Absence leaves the configuration identity unchanged from records written before adapters.
+   */
+  readonly adapters?: readonly ServedArtifact[];
   readonly runtimeBinary: ServedArtifact;
   readonly gatewayBuild: GatewayBuildArtifact;
 }
@@ -259,6 +265,7 @@ export interface ServedProvenanceArtifacts {
 const artifactsSchema = z.object({
   weights: z.array(servedArtifactSchema).max(256),
   projector: projectorSchema,
+  adapters: z.array(servedArtifactSchema).max(16).optional(),
   runtimeBinary: servedArtifactSchema,
   gatewayBuild: gatewayBuildArtifactSchema,
 }).strict();
@@ -396,6 +403,11 @@ function stableConfigurationProjection(input: Pick<ServedProvenanceInput, "artif
       projector: projectorIdentity(projector),
       runtimeBinary: artifactIdentity(input.artifacts.runtimeBinary),
       gatewayBuild: gatewayBuildIdentity(input.artifacts.gatewayBuild),
+      // Only a non-empty adapter list enters the identity, so adapter-free configurations keep
+      // the identity they had before this field existed.
+      ...(input.artifacts.adapters !== undefined && input.artifacts.adapters.length > 0
+        ? { adapters: input.artifacts.adapters.map(artifactIdentity) }
+        : {}),
     },
     identities: {
       quantization: evidenceIdentity(input.identities.quantization),
@@ -510,6 +522,7 @@ function collectCompleteness(input: ServedProvenanceInput): { completeness: Serv
   for (const weight of input.artifacts.weights) checkArtifact(weight, reasons);
   const projector = normalizeProjector(input.artifacts.projector);
   if (!("kind" in projector)) checkArtifact(projector, reasons);
+  for (const adapter of input.artifacts.adapters ?? []) checkArtifact(adapter, reasons);
   checkArtifact(input.artifacts.runtimeBinary, reasons);
   if (!checkEvidence(input.artifacts.gatewayBuild.sha, reasons)) {
     // checkEvidence already records the source-specific reason.

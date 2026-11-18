@@ -128,6 +128,12 @@ Schema version `1` contains:
   process collector reports unknown when `--mmproj` is absent because it does not inspect
   environment or configuration sources. Artifact digests identify observed content when
   available; each artifact also carries a binding state.
+- Optional `artifacts.adapters`: LoRA adapters selected with plain `--lora`, in launch order,
+  each hashed like a weight artifact and required for completeness. The field is omitted when no
+  adapter is selected, so adapter-free snapshots keep their earlier `configurationIdentity`.
+  Scaled or deferred selectors (`--lora-scaled`, `--lora-init-without-apply`, control vectors)
+  remain unsupported and fail closed with `unsupported-model-loader-feature`. Readers built
+  before this field reject snapshots that carry it, because the schema is strict.
 - `identities.quantization`, `identities.tokenizer`, and `identities.chatTemplate`.
 - `launchConfiguration`, which records numeric values recovered from the observed launch command
   line. A missing flag, ambiguous/invalid flag, or unavailable process is unknown. This is separate
