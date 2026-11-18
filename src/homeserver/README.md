@@ -422,6 +422,10 @@ Authority model (`oauth.ts`):
   alone grants nothing, and redirect URIs must exactly match `HOMESERVER_OAUTH_REDIRECT_URIS`
   (default: the claude.ai and claude.com connector callbacks). Unused registrations are pruned
   after 24 hours, and active clients are capped.
+- Enter a consent code only on a consent page reached from a connector setup **you** started in
+  your own claude.ai account. The code binds the grant to whichever account initiated that
+  authorization request, so someone who sends you an authorize link is asking for your key's
+  authority. The page names the client and the callback host; codes expire (default 15 minutes).
 - PKCE S256 is mandatory. Authorization codes live 120 s and are single-use; refresh tokens rotate
   on every use. A replayed code or spent refresh token **revokes the whole grant**. Only sha256
   hashes of codes and tokens are stored.
