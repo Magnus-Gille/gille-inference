@@ -100,3 +100,13 @@ condition = "AND"
 regexTarget = "match"
 paths = ['''^deploy/specs/pplx-decider-v1-27b\.yaml$''']
 regexes = ['''^key: pplx-decider-v1-27b$''']
+
+# The pi-adapted Qwen3.8 evaluation placeholder's served ID is a model key, not a
+# credential (INFER-519). Scope the exception to that exact line in its spec.
+[[allowlists]]
+description = "pi-adapted Qwen3.8 evaluation model key"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "match"
+paths = ['''^deploy/specs/qwen38-27b-pi\.yaml$''']
+regexes = ['''^key: qwen38-27b-pi$''']

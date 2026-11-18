@@ -203,8 +203,8 @@ describe("manual-promotion spec contract (#217)", () => {
   it("keeps the pi-adapted Qwen3.8 evaluation placeholder text-only, thinking-off and LoRA-bound", () => {
     const fixture = readFileSync(new URL("../deploy/specs/qwen38-27b-pi.yaml", import.meta.url), "utf8");
     const spec = parseManualSpec(fixture);
+    expect(spec.key).toBe("qwen38-27b-pi");
     expect(spec).toMatchObject({
-      key: "qwen38-27b-pi",
       api: "chat",
       ctx: 65536,
       np: 1,
