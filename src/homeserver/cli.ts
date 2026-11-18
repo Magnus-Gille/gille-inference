@@ -43,6 +43,15 @@ import {
   type StaticKeyKillSwitch,
 } from "./static-keys.js";
 import { loadEnv } from "../env.js";
+import {
+  createConsentCode,
+  listClients,
+  listGrants,
+  OAuthError,
+  revokeClient,
+  revokeGrant,
+  revokeGrantsForKey,
+} from "./oauth.js";
 import { runCli as runDeepResearch } from "./deep-research-cli.js";
 import { acquireGpuLease, gpuLeaseStatus, type HolderSelection } from "./gpu-lease.js";
 import { observeGpuLeaseMutex, type GpuMutexObservation } from "./gpu-lease-observation.js";
@@ -1124,6 +1133,68 @@ async function cmdCodeLoop(rawArgs: string[]): Promise<void> {
   }
 }
 
+/**
+ * INFER-518 operator surface for the OAuth layer on POST /mcp. Never prints token material other
+ * than the one-time consent code it mints.
+ */
+export function cmdOAuth(args: ParsedArgs): void {
+  const sub = args.positional[0];
+  try {
+    if (sub === "consent-code") {
+      const key = strFlag(args.flags, "key");
+      if (!key) throw new Error("usage: oauth consent-code --key <alias> [--ttl-minutes N] [--label L]");
+      const minutes = numFlag(args.flags, "ttl-minutes");
+      const result = createConsentCode({
+        keyAlias: key,
+        ttlSeconds: minutes === undefined ? undefined : Math.round(minutes * 60),
+        label: strFlag(args.flags, "label"),
+      });
+      console.log(`✓ consent code '${result.label}' for key '${result.keyAlias}' (expires ${result.expiresAt}, single use)`);
+      console.log(`\n  ${result.code}\n`);
+      console.warn("⚠  Shown once; only its hash is stored. Paste it into the M5 consent page when connecting the client.");
+      return;
+    }
+    if (sub === "list") {
+      const includeRevoked = args.flags["all"] === true;
+      const grants = listGrants({ includeRevoked });
+      if (args.flags["json"] === true) {
+        const clients = listClients().filter((c) => includeRevoked || c.revokedAt === null);
+        console.log(JSON.stringify({ grants, clients }, null, 2));
+        return;
+      }
+      console.log(`${"GRANT".padEnd(42)} ${"KEY".padEnd(20)} ${"CLIENT".padEnd(24)} ${"CREATED".padEnd(24)} ${"LAST USED".padEnd(24)} REVOKED`);
+      for (const g of grants) {
+        console.log(
+          `${g.grantId.padEnd(42)} ${g.keyAlias.slice(0, 19).padEnd(20)} ${(g.clientName ?? g.clientId).slice(0, 23).padEnd(24)} ` +
+          `${g.createdAt.padEnd(24)} ${(g.lastUsedAt ?? "never").padEnd(24)} ${g.revokedAt ? `${g.revokedAt} (${g.revokedReason})` : "-"}`
+        );
+      }
+      return;
+    }
+    if (sub === "revoke") {
+      const grant = strFlag(args.flags, "grant");
+      const client = strFlag(args.flags, "client");
+      const key = strFlag(args.flags, "key");
+      if ([grant, client, key].filter((v) => v !== undefined).length !== 1) {
+        throw new Error("usage: oauth revoke --grant <id> | --client <id> | --key <alias>");
+      }
+      if (grant) {
+        console.log(revokeGrant(grant) ? `✓ revoked grant '${grant}'` : `✗ no such active grant '${grant}'`);
+      } else if (client) {
+        const r = revokeClient(client);
+        console.log(r.client ? `✓ revoked client '${client}' and ${r.grants} grant(s)` : `✗ no such active client '${client}'`);
+      } else if (key) {
+        console.log(`✓ revoked ${revokeGrantsForKey(key)} grant(s) bound to key '${key}' (the key itself is unchanged)`);
+      }
+      return;
+    }
+  } catch (err) {
+    if (err instanceof OAuthError) throw new Error(`oauth ${sub}: ${err.message}`);
+    throw err;
+  }
+  console.log("usage: oauth <consent-code|list|revoke> ...");
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
@@ -1163,6 +1234,9 @@ async function main(): Promise<void> {
     case "keys":
       cmdKeys(args);
       break;
+    case "oauth":
+      cmdOAuth(args);
+      break;
     case "deep-research":
       await cmdDeepResearch(args);
       break;
@@ -1175,7 +1249,7 @@ async function main(): Promise<void> {
       break;
     default:
       console.log(
-        "Commands: serve | models | load | unload | ensure-ctx | download | probe | delegate | ledger | residency | keys | deep-research | gpu | code-loop\n" +
+        "Commands: serve | models | load | unload | ensure-ctx | download | probe | delegate | ledger | residency | keys | oauth | deep-research | gpu | code-loop\n" +
           "Examples:\n" +
           "  tsx src/homeserver/cli.ts ensure-ctx --ctx 32768\n" +
           "  tsx src/homeserver/cli.ts probe --all\n" +
@@ -1194,6 +1268,9 @@ async function main(): Promise<void> {
           "  tsx src/homeserver/cli.ts keys commit --plan rot_...\n" +
           "  tsx src/homeserver/cli.ts keys invite --credits 500000 --tier guest --model qwen3\n" +
           "  tsx src/homeserver/cli.ts keys list\n" +
+          "  tsx src/homeserver/cli.ts oauth consent-code --key cloud-claude [--ttl-minutes 15]   # one-time code for the MCP OAuth consent page (INFER-518)\n" +
+          "  tsx src/homeserver/cli.ts oauth list [--all] [--json]\n" +
+          "  tsx src/homeserver/cli.ts oauth revoke --grant hsg_... | --client hsc_... | --key cloud-claude\n" +
           '  tsx src/homeserver/cli.ts deep-research --query "impact of GLP-1 drugs on cardiovascular outcomes" --depth thorough\n' +
           "  tsx src/homeserver/cli.ts gpu status\n" +
           '  tsx src/homeserver/cli.ts gpu run --model qwen3-coder-next-80b --eta 20m --purpose cascade -- tsx scripts/cascade-gate-experiment.ts\n' +

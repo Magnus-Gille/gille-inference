@@ -1,4 +1,5 @@
 import { loadEnv } from "../env.js";
+import { loadOAuthConfig, type OAuthConfig } from "./oauth-config.js";
 import { parseStaticKeyKillSwitch, type StaticKeyKillSwitch } from "./static-keys.js";
 import { isEmbeddingModel } from "./embedding-request.js";
 import { MAX_BLIND_CONTEXT_ROOTS } from "./blind-context.js";
@@ -436,6 +437,8 @@ export interface HomeserverConfig {
   feedbackRpm: number;
   /** Reverse-proxy peers (IP / CIDR) trusted to set CF-Connecting-IP. Default: loopback only. */
   trustedProxies: string[];
+  /** OAuth 2.1 layer for POST /mcp (INFER-518). Off unless HOMESERVER_OAUTH=on. */
+  oauth: OAuthConfig;
   /**
    * Model ids whose recurrent (SSM-style) memory is corrupted by an ABRUPT mid-stream disconnect
    * (the Qwen3-Next "?????" degeneration). On such a disconnect the gateway fire-and-forget unloads
@@ -925,6 +928,7 @@ export function loadConfig(): HomeserverConfig {
     accessLogHealthz:
       (process.env["HOMESERVER_ACCESS_LOG_HEALTHZ"] ?? "off") === "on" ? "on" : "off",
     redeemRpm: envNum("HOMESERVER_REDEEM_RPM", 10),
+    oauth: loadOAuthConfig(process.env),
     publicWindowMs: envNum("HOMESERVER_PUBLIC_WINDOW_MS", 600_000),
     feedbackRpm: envNum("HOMESERVER_FEEDBACK_RPM", 5),
     trustedProxies:
