@@ -87,6 +87,13 @@ export interface ServedProcessProvenance {
   reasons: ServedProvenanceReason[];
   weights: ServedArtifactObservation[];
   projector: ServedProjectorObservation;
+  /**
+   * LoRA adapters selected with plain `--lora`, in command-line order. An adapter changes the
+   * served weights, so each is hashed like the model. Scaled or deferred adapter selectors
+   * (`--lora-scaled`, `--lora-init-without-apply`, ...) stay unsupported and keep the result
+   * unavailable instead of being reported as a complete inventory.
+   */
+  adapters: ServedArtifactObservation[];
   runtimeSha256: string | null;
   launchFlags: ServedLaunchFlags;
   environment: ServedEnvironmentObservation;
@@ -147,6 +154,8 @@ interface ParsedArgs {
   modelCount: number;
   projector: string | null;
   projectorCount: number;
+  adapters: string[];
+  adapterInvalid: boolean;
   artifactInvalid: boolean;
   unsupported: boolean;
   remoteArtifact: boolean;
@@ -168,6 +177,7 @@ interface ArtifactFsStat {
 
 const MODEL_FLAGS = new Set(["-m", "--model"]);
 const PROJECTOR_FLAGS = new Set(["--mmproj"]);
+const ADAPTER_FLAGS = new Set(["--lora"]);
 const CONTEXT_FLAGS = new Set(["-c", "--ctx-size", "--context-size"]);
 const PARALLEL_FLAGS = new Set(["-np", "--parallel", "--parallelism"]);
 const TEMPERATURE_FLAGS = new Set(["--temp", "--temperature"]);
@@ -194,7 +204,6 @@ const UNSUPPORTED_MODEL_FLAGS = new Set([
   "--draft-model",
   "-md",
   "--draft",
-  "--lora",
   "--lora-scaled",
   "--adapter",
   "--adapter-file",
@@ -207,6 +216,7 @@ const UNSUPPORTED_MODEL_FLAGS = new Set([
 const ALL_VALUE_FLAGS = new Set([
   ...MODEL_FLAGS,
   ...PROJECTOR_FLAGS,
+  ...ADAPTER_FLAGS,
   ...CONTEXT_FLAGS,
   ...PARALLEL_FLAGS,
   ...TEMPERATURE_FLAGS,
@@ -395,6 +405,7 @@ function finiteNumber(raw: string): number | null {
 function canonicalFlag(flag: string): string {
   if (MODEL_FLAGS.has(flag)) return "model";
   if (PROJECTOR_FLAGS.has(flag)) return "projector";
+  if (ADAPTER_FLAGS.has(flag)) return "adapter";
   if (CONTEXT_FLAGS.has(flag)) return "contextSize";
   if (PARALLEL_FLAGS.has(flag)) return "parallelism";
   if (TEMPERATURE_FLAGS.has(flag)) return "temperature";
@@ -432,6 +443,8 @@ function parseArgs(argv: string[]): ParsedArgs {
   const flags = emptyLaunchFlags();
   const counts = new Map<string, number>();
   const values = new Map<string, string>();
+  const adapters: string[] = [];
+  let adapterInvalid = false;
   let unsupported = false;
   let remoteArtifact = false;
   let splitModel = false;
@@ -458,6 +471,19 @@ function parseArgs(argv: string[]): ParsedArgs {
 
     const key = canonicalFlag(rawFlag);
     const valueRead = readFlagValue(argv, index, rawFlag, inline?.value);
+    if (key === "adapter") {
+      // Every adapter is an artifact: a missing, empty, or remote value cannot be hashed, so the
+      // weight inventory is unavailable rather than silently missing one adapter.
+      if (valueRead.invalid || valueRead.value === "") {
+        artifactInvalid = true;
+        adapterInvalid = true;
+        continue;
+      }
+      index = valueRead.nextIndex;
+      if (isRemoteArtifact(valueRead.value)) remoteArtifact = true;
+      adapters.push(valueRead.value);
+      continue;
+    }
     if (valueRead.invalid) {
       if (key === "model" || key === "projector") {
         artifactInvalid = true;
@@ -504,6 +530,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     modelCount: counts.get("model") ?? 0,
     projector: values.get("projector") ?? null,
     projectorCount: counts.get("projector") ?? 0,
+    adapters,
+    adapterInvalid,
     artifactInvalid,
     unsupported,
     remoteArtifact,
@@ -516,6 +544,7 @@ function parseArgs(argv: string[]): ParsedArgs {
 
 function isUnsupportedModelFlag(flag: string): boolean {
   if (!flag.startsWith("-")) return false;
+  if (ADAPTER_FLAGS.has(flag)) return false;
   if (UNSUPPORTED_MODEL_FLAGS.has(flag)) return true;
   // llama-server has acquired several spelling variants for speculative decoding and
   // adapters over time.  Treat any explicit draft/LoRA/adapter selector as opaque rather
@@ -659,6 +688,7 @@ function unavailableResult(capturedAt: string, reasons: ServedProvenanceReason[]
     reasons: cleanReasons(reasons),
     weights: [],
     projector: { kind: "unknown" },
+    adapters: [],
     runtimeSha256: null,
     launchFlags: emptyLaunchFlags(),
     environment,
@@ -742,6 +772,25 @@ export function captureServedProcess(
     }
   }
 
+  const adapters: ServedArtifactObservation[] = [];
+  if (parsed.adapterInvalid) adapters.push({ sha256: null, binding: "unproven" });
+  for (const adapter of parsed.adapters) {
+    if (isRemoteArtifact(adapter)) {
+      adapters.push({ sha256: null, binding: "unproven" });
+    } else if (!processViewAvailable) {
+      reasons.push("process-view-unavailable");
+      adapters.push({ sha256: null, binding: "unproven" });
+    } else {
+      const adapterPath = resolveProcessPath(pid, adapter, deps);
+      if (adapterPath === null) {
+        reasons.push("artifact-path-unavailable");
+        adapters.push({ sha256: null, binding: "unproven" });
+      } else {
+        adapters.push(markArtifact(observeArtifact(adapterPath, deps), reasons));
+      }
+    }
+  }
+
   let runtimeSha256: string | null = null;
   try {
     const runtime = observeArtifact(runtimePath(pid, before.exe, deps, dependencyOverrides), deps);
@@ -768,7 +817,7 @@ export function captureServedProcess(
     reasons.push("process-view-changed");
   }
 
-  return finalizeCapture(capturedAt, reasons, weights, projector, runtimeSha256, parsed.launchFlags, environment);
+  return finalizeCapture(capturedAt, reasons, weights, projector, adapters, runtimeSha256, parsed.launchFlags, environment);
 }
 
 function finalizeCapture(
@@ -776,6 +825,7 @@ function finalizeCapture(
   reasons: ServedProvenanceReason[],
   weights: ServedArtifactObservation[],
   projector: ServedProjectorObservation,
+  adapters: ServedArtifactObservation[],
   runtimeSha256: string | null,
   launchFlags: ServedLaunchFlags,
   environment: ServedEnvironmentObservation,
@@ -798,6 +848,7 @@ function finalizeCapture(
     reasons: cleanedReasons,
     weights,
     projector,
+    adapters,
     runtimeSha256,
     launchFlags,
     environment,

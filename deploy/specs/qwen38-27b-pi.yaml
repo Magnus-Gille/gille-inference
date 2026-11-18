@@ -1,0 +1,34 @@
+# EVALUATION PLACEHOLDER for the harness-hub Qwen3.8-27B pi LoRA adapter; not reviewed, not live.
+# Plan and envelope: INFER ticket for the pi-adapted Qwen3.8 evaluation.
+# Base contract: docs/qwen38-27b-release-decision-2026-08-14.md (qwen38-27b).
+# Differences from qwen38-27b, each to be confirmed or replaced in Phase 1 from measured evidence:
+#   - Q8_0 base instead of Q4_K_M: the adapter was trained against BF16 and its card warns that
+#     Q4_K_M drifts further. Phase 1 A/Bs both bases with the adapter.
+#   - lora: our own convert_lora_to_gguf.py output at the pinned llama.cpp revision, not the
+#     vendor GGUF.
+#   - thinking off at the server: the adapter was never trained with thinking. Confirm that the
+#     pinned runtime accepts `--reasoning off` and that a request cannot turn it back on.
+#   - no multimodal projector: the adapter was trained and evaluated text-only.
+#   - native MTP is kept only if draft acceptance and parity hold with the adapter applied
+#     (the LoRA does not adapt the MTP head); otherwise drop the spec_* lines.
+#   - /operator-resolve/ paths must be replaced with stable non-scratch operator paths kept in
+#     the private operations tracker.
+key: qwen38-27b-pi
+api: chat
+gguf: /operator-resolve/models/qwen38-27b/Qwen3.8-27B-Q8_0.gguf
+lora: /operator-resolve/models/qwen38-27b/lora/Qwen3.8-27B-pi-lora-F16.gguf
+runtime_bin: /operator-resolve/llama-runtime/releases/9b05354ec/bin/llama-server
+ctx: 65536
+ngl: 999
+ubatch: 512
+np: 1
+jinja: true
+fa: on
+spec_type: draft-mtp
+spec_draft_n_max: 2
+reasoning_format: auto
+reasoning: off
+cache_ram_mib: 2048
+ctk: q8_0
+ctv: q8_0
+ttl: 1800

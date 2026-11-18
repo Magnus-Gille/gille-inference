@@ -39,6 +39,7 @@ const SPEC_FIELDS = new Set([
   "ctv",
   "mmproj",
   "image_min_tokens",
+  "lora",
   "spec_type",
   "spec_draft_n_max",
   "reasoning_format",
@@ -79,6 +80,12 @@ export interface LlamaServingSpec {
   ctv: string;
   mmproj: string | null;
   imageMinTokens: number | null;
+  /**
+   * Optional LoRA adapter GGUF applied at scale 1.0 on top of `gguf` (INFER harness adapters).
+   * A LoRA changes the served weights, so it is a first-class artifact: it must exist on disk
+   * before promotion and the served-provenance collector hashes it alongside the model.
+   */
+  lora: string | null;
   specType: string | null;
   specDraftNMax: number | null;
   reasoningFormat: string | null;
@@ -273,6 +280,7 @@ export function parseManualSpec(text: string): ManualServingSpec {
     ctv: flagToken(get("ctv"), "ctv", KV_QUANT_RE),
     mmproj: opt("mmproj") === null ? null : absolutePath(opt("mmproj"), "mmproj"),
     imageMinTokens: optInt("image_min_tokens"),
+    lora: opt("lora") === null ? null : commandPath(opt("lora"), "lora"),
     specType,
     specDraftNMax,
     reasoningFormat:
@@ -308,6 +316,7 @@ export function renderManualEntry(spec: ManualServingSpec): string {
   ];
   if (spec.mmproj !== null) lines.push(`      -mm ${spec.mmproj}`);
   if (spec.imageMinTokens !== null) lines.push(`      --image-min-tokens ${spec.imageMinTokens}`);
+  if (spec.lora !== null) lines.push(`      --lora ${spec.lora}`);
   lines.push(
     `      -ngl ${spec.ngl}` +
       (spec.batch !== null ? ` -b ${spec.batch}` : "") +
@@ -411,6 +420,9 @@ export async function applyManualPromotion(
     }
     if (spec.mmproj !== null && !deps.fileExists(spec.mmproj)) {
       fail(`served mmproj not present on disk: ${spec.mmproj}`);
+    }
+    if (spec.lora !== null && !deps.fileExists(spec.lora)) {
+      fail(`served LoRA adapter not present on disk: ${spec.lora}`);
     }
   }
 

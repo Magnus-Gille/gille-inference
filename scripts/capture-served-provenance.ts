@@ -202,6 +202,9 @@ function inputFromObservation(
     artifacts: {
       weights: observation.weights.map((weight) => artifactFor(observation, weight.sha256, weight.binding)),
       projector,
+      ...(observation.adapters.length > 0
+        ? { adapters: observation.adapters.map((adapter) => artifactFor(observation, adapter.sha256, adapter.binding)) }
+        : {}),
       runtimeBinary: artifactFor(observation, observation.runtimeSha256),
       // This is never observed by the process collector. A supplied value remains a declaration.
       gatewayBuild: {

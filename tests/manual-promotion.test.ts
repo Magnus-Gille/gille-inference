@@ -102,12 +102,36 @@ describe("manual-promotion spec contract (#217)", () => {
       ctv: "q8_0",
       mmproj: "/m/mmproj-BF16.gguf",
       imageMinTokens: 1024,
+      lora: null,
       specType: "draft-mtp",
       specDraftNMax: 2,
       reasoningFormat: "auto",
       reasoning: "auto",
       ttl: 1800,
     });
+  });
+
+  it("parses and renders an optional LoRA adapter next to the model artifacts", () => {
+    const spec = parseManualSpec(`${FULL_SPEC_TEXT}\nlora: /m/lora/pi-lora-F16.gguf`);
+    expect(spec).toMatchObject({ lora: "/m/lora/pi-lora-F16.gguf" });
+    const entry = renderManualEntry(spec);
+    expect(entry).toContain(
+      "      --image-min-tokens 1024\n      --lora /m/lora/pi-lora-F16.gguf\n      -ngl 999",
+    );
+    expect(renderManualEntry(parseManualSpec(FULL_SPEC_TEXT))).not.toContain("--lora");
+  });
+
+  it("rejects a LoRA path that is relative, traverses, or carries shell metacharacters", () => {
+    for (const bad of ["m/lora.gguf", "/m/../lora.gguf", "/m/lora.gguf;touch /tmp/x", "/m/lora file.gguf"]) {
+      expect(() => parseManualSpec(`${FULL_SPEC_TEXT}\nlora: ${bad}`)).toThrow(/lora/);
+    }
+    expect(() => parseManualSpec(`${FULL_SPEC_TEXT}\nlora: /a.gguf\nlora: /b.gguf`))
+      .toThrow(/duplicate spec field 'lora'/);
+  });
+
+  it("does not accept LoRA on a native runtime spec", () => {
+    expect(() => parseManualSpec(`${NATIVE_SPEC_TEXT}\nlora: /m/lora.gguf`))
+      .toThrow(/not supported by a native runtime/);
   });
 
   it("accepts a minimal text-only spec with optionals absent", () => {
@@ -174,6 +198,23 @@ describe("manual-promotion spec contract (#217)", () => {
     // Placeholder paths must never be mistaken for applied operator paths.
     expect(renderManualEntry(spec)).toContain("/operator-resolve/");
     expect(manualWarmupRequest(spec, spec.key).path).toBe("/v1/chat/completions");
+  });
+
+  it("keeps the pi-adapted Qwen3.8 evaluation placeholder text-only, thinking-off and LoRA-bound", () => {
+    const fixture = readFileSync(new URL("../deploy/specs/qwen38-27b-pi.yaml", import.meta.url), "utf8");
+    const spec = parseManualSpec(fixture);
+    expect(spec).toMatchObject({
+      key: "qwen38-27b-pi",
+      api: "chat",
+      ctx: 65536,
+      np: 1,
+      mmproj: null,
+      reasoning: "off",
+      lora: "/operator-resolve/models/qwen38-27b/lora/Qwen3.8-27B-pi-lora-F16.gguf",
+    });
+    const entry = renderManualEntry(spec);
+    expect(entry).toContain("--lora /operator-resolve/");
+    expect(entry).not.toContain("-mm ");
   });
 
   it("keeps the public Clef fixture on the typed System One serving path", () => {
@@ -359,6 +400,14 @@ describe("manual-promotion transaction (#217)", () => {
     const { deps, calls } = harness(`${BASE_CONFIG}aliases:\n  x: y\n`);
     await expect(applyManualPromotion(spec(), deps)).rejects.toThrow(/top-level key/);
     expect(calls.backups).toHaveLength(0);
+  });
+
+  it("refuses a missing LoRA adapter before any backup", async () => {
+    const { deps, calls } = harness(BASE_CONFIG);
+    const withLora = parseManualSpec(`${FULL_SPEC_TEXT}\nlora: /m/lora/pi-lora-F16.gguf`);
+    await expect(applyManualPromotion(withLora, deps)).rejects.toThrow(/LoRA adapter not present on disk/);
+    expect(calls.backups).toHaveLength(0);
+    expect(calls.commands).toHaveLength(0);
   });
 
   it("refuses a missing GGUF before any backup", async () => {

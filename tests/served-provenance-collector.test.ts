@@ -238,11 +238,53 @@ describe("captureServedProcess", () => {
     expect(result.weights[0]?.binding).toBe("unproven");
   });
 
+  it("hashes plain --lora adapters in launch order as first-class artifacts", () => {
+    const { root, deps } = fixture({
+      readProcCmdline: () => [
+        "llama-server", "--model", "/models/model.gguf", "--lora", "/models/pi.gguf", "--lora=/models/second.gguf",
+      ],
+    });
+    writeFileSync(join(root, "models", "pi.gguf"), "pi adapter bytes");
+    writeFileSync(join(root, "models", "second.gguf"), "second adapter bytes");
+    const result = captureServedProcess(42, deps);
+
+    expect(result.freshness).toBe("fresh");
+    expect(result.reasons).toEqual([]);
+    expect(result.adapters).toEqual([
+      { sha256: digest(join(root, "models", "pi.gguf")), binding: "unproven" },
+      { sha256: digest(join(root, "models", "second.gguf")), binding: "unproven" },
+    ]);
+    expect(result.weights).toEqual([{ sha256: digest(join(root, "models", "model.gguf")), binding: "unproven" }]);
+    expect(JSON.stringify(result)).not.toContain(root);
+  });
+
+  it("reports no adapters for an adapter-free launch", () => {
+    const { deps } = fixture();
+    expect(captureServedProcess(42, deps).adapters).toEqual([]);
+  });
+
+  it.each([
+    { name: "missing adapter file", argv: ["--lora", "/models/absent.gguf"], reason: "artifact-hash-failed" },
+    { name: "adapter flag without a value", argv: ["--lora"], reason: "artifact-path-unavailable" },
+    { name: "remote adapter", argv: ["--lora", "https://example.invalid/a.gguf"], reason: "artifact-remote" },
+    { name: "scaled adapter", argv: ["--lora-scaled", "/models/pi.gguf", "0.5"], reason: "unsupported-model-loader-feature" },
+    { name: "deferred adapter", argv: ["--lora", "/models/pi.gguf", "--lora-init-without-apply"], reason: "unsupported-model-loader-feature" },
+  ])("fails closed for a $name", ({ argv, reason }) => {
+    const { root, deps } = fixture({
+      readProcCmdline: () => ["llama-server", "--model", "/models/model.gguf", ...argv],
+    });
+    writeFileSync(join(root, "models", "pi.gguf"), "pi adapter bytes");
+    const result = captureServedProcess(42, deps);
+
+    expect(result.freshness).toBe("unavailable");
+    expect(result.reasons).toContain(reason);
+  });
+
   it("fails closed for remote, repeated, split, and auxiliary model inputs", () => {
     const { deps } = fixture({
       readProcCmdline: () => [
         "llama-server", "--model=https://example.invalid/model.gguf", "--model", "/models/other.gguf",
-        "--lora", "/models/adapter.gguf", "--mmproj", "/models/projector.gguf", "--mmproj", "/models/other.gguf",
+        "--lora-scaled", "/models/adapter.gguf", "--mmproj", "/models/projector.gguf", "--mmproj", "/models/other.gguf",
       ],
     });
     const result = captureServedProcess(42, deps);
