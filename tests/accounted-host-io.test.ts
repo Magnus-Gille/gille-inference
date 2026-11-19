@@ -145,6 +145,20 @@ describe("fixed IO helper bridge; synthetic executors only", () => {
     expect(calls).toBe(2);
     await expect(io.initializeJournal("invalid",digest,new AbortController().signal)).rejects.toThrow();expect(calls).toBe(2);
   });
+  it("labels local validation refusals with the operation that ran them (INFER-513)", async () => {
+    let calls = 0;
+    const clockIo = createAccountedHostIoBridge(binding, () => {calls++; return '{"result":{"boottimeNs":"x","utc":"y"},"status":"ok"}';});
+    let failure: unknown; try {clockIo.clock();} catch (error) {failure = error;}
+    expect(failure).toMatchObject({code:"helper_clock", outcome:"refused", operation:"clock"});
+    const challengeIo = createAccountedHostIoBridge(binding, () => JSON.stringify({result:{bytes:"x".repeat(16385)},status:"ok"}));
+    failure = undefined; try {await challengeIo.challenge(new AbortController().signal);} catch (error) {failure = error;}
+    expect(failure).toMatchObject({code:"challenge_bound", outcome:"refused", operation:"challenge"});
+    calls = 0;
+    const idle = createAccountedHostIoBridge(binding, () => {calls++; return "{}";});
+    await expect(idle.publish("", "123", new AbortController().signal)).rejects.toMatchObject({code:"publication_input", outcome:"refused", operation:"publish"});
+    await expect(idle.initializeJournal("invalid", "e".repeat(64), new AbortController().signal)).rejects.toMatchObject({code:"journal_bootstrap_expectation", outcome:"refused", operation:"initialize-journal"});
+    expect(calls).toBe(0);
+  });
   it("rejects arbitrary helper/configuration paths before invoking any executor", () => {
     for (const changed of [{helperPath:"/tmp/evil.py"},{configurationPath:"/etc/passwd"},{configurationDigest:"a".repeat(64)+"\n"}]) {
       let called = false;

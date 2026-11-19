@@ -76,7 +76,9 @@ afterEach(async () => {
   }
 });
 
-describe("accounted allocation intent ledger v3", () => {
+const ROOT_SKIP = ownerUid === 0;
+if (ROOT_SKIP) console.warn("accounted-allocation-intent-v3: skipped as root: these tests exercise owner-only file permissions, which root bypasses; run them as an unprivileged user (INFER-513)");
+describe.skipIf(ROOT_SKIP)("accounted allocation intent ledger v3", () => {
   it("plans a pure closed bootstrap and does not create storage", async () => {
     const plan = planAccountedAllocationLedgerV3Bootstrap(hostBootId);
     expect(plan.state).toEqual({ schemaVersion: 1, kind: "accounted-allocation-intent-ledger", hostBootId, reservation: null });

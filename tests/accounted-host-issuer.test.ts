@@ -82,7 +82,7 @@ describe("strict consumer v2; no fallback to legacy admission", () => {
     }
   });
   it("requires a concrete trusted digest before configuring a v2 issuer", () => {
-    for (const digest of ["", "x".repeat(64), consumer+"\n", undefined]) {
+    for (const digest of ["", "x".repeat(64), consumer+"\n", undefined, BROKKR_R3_MANIFEST]) {
       expect(() => createAccountedIssuerV2(digest as string)).toThrow();
     }
   });
@@ -122,12 +122,21 @@ describe("LOCAL issuer; no live providers or authority", () => {
     expect(f.state().lastSequence).toBe(1); expect(f.state().claims[0].committed).toBe(true); expect(f.casCount()).toBe(2);
     expect(r.admissionDigest).toBe(sha(raw));
   });
+  it("validates the owner context before handing issuerId to the owner verifier (INFER-513)", async () => {
+    for (const issuerId of ["../../etc/passwd", "", "x".repeat(65), 7]) {
+      const f = fixture(); (f.context as any).issuerId = issuerId;
+      const verify = vi.fn(f.providers.verifyOwnerEvidence); f.providers.verifyOwnerEvidence = verify;
+      expect(await issue(f)).toMatchObject({status: "refused", reason: "owner_context_invalid", executionAuthorized: false});
+      expect(verify).not.toHaveBeenCalled();
+      expect(f.publications.size).toBe(0);
+    }
+  });
   it("refuses the replay even through a fresh journal instance", async () => {
     const f = fixture(); expect((await issue(f)).status).toBe("published");
     f.providers.persistence = createAccountedIssuerPersistence(f.storage);
     expect((await issue(f)).status).toBe("refused"); expect(f.publications.size).toBe(1); expect(f.state().lastSequence).toBe(1);
   });
-  it("refuses requested time ceilings below R3's actual20/5/30 before consuming", async () => {
+  it("refuses requested time ceilings below R3's actual 20/5/30 before consuming", async () => {
     const f = fixture(); Object.assign(f.request, {workMaxSeconds: 1, stopMaxSeconds: 1, totalMaxSeconds: 2}); rebind(f);
     expect(await issue(f)).toMatchObject({status: "refused", attemptConsumed: false}); expect(f.publications.size).toBe(0);
   });

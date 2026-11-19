@@ -51,7 +51,9 @@ export function validateCgroupChannelV1(raw:string,expected:CgroupChannelExpecta
   need(canonicalNative(value.role_cgroups)===canonicalNative(expectedRoles),"cgroup_roles_drift");
   const from=value.observed_from_boottime_ns,until=value.observed_until_boottime_ns;
   need(run.allocated_from_boottime_ns<=from && from<=until && until-from<=1000000000n
-    && until<=run.allocated_until_boottime_ns
+    // The lease is half-open [allocated_from, allocated_until): an observation ending exactly
+    // at allocated_until is outside it, matching the Python worker and native checks.
+    && until<run.allocated_until_boottime_ns
     && until<=expected.nowNs && expected.nowNs-from<=expected.maximumAgeNs,"cgroup_observation_window");
   for(const scope of challenge.native_role_scopes)need(scope.started_boottime_lower_ns<=from
     && until<=scope.stop_by_boottime_ns,"cgroup_role_window");
