@@ -1124,8 +1124,13 @@ HEIM-49) to `POST /api/synthetic-journeys`. Exactly two steps run in one attempt
 proves the backend snapshot is observable, not that a given model is loaded, and it never grades
 model quality. Missing config or a rejected monitor key is a *runner* failure (`runner_outcome:"failed"`, outcome
 `unknown`, `runner-config`/`runner-auth`), distinct from a dependency failure; the script then exits
-non-zero so the broken runner is visible in systemd (Heimdall does not alert on `unknown`). The
-Heimdall URL must be https (plain http only for loopback) with the exact ingest path. Nothing from a response (model names, aliases, bodies) and no
+non-zero so the broken runner is visible in systemd (Heimdall does not alert on `unknown`). Both
+credential-bearing URLs follow one transport rule: https, or plain http only to a loopback host
+(`127.0.0.1`, `localhost`, `[::1]`), and no userinfo. A plain-http remote `GATEWAY_READINESS_URL` is a
+`runner-config` failure before any request, so the monitor key never travels in cleartext. The key
+is sent only to `/models/residency`; public `/healthz` is called without it. Response bodies are read
+with a hard 64 KiB bound that stops the stream rather than buffering it. The
+Heimdall URL must also use the exact ingest path. Nothing from a response (model names, aliases, bodies) and no
 key is copied into the outcome. Delivery retries re-send the identical attempt (idempotent in
 Heimdall); the script also exits non-zero when delivery fails.
 

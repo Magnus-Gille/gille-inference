@@ -10,6 +10,9 @@ User=magnus
 # HEIMDALL_SYNTHETIC_JOURNEYS_URL and HEIMDALL_GATEWAY_JOURNEY_TOKEN. Never committed.
 EnvironmentFile=/etc/gille-inference/readiness-journey.env
 WorkingDirectory=/home/magnus/home-server-eval
+# ProtectHome=read-only makes ~/.npm read-only; point npm's cache/logs at the private /tmp and
+# turn off the update notifier so npx does not warn on log writes (INFER-517; confirm at install).
+Environment=npm_config_cache=/tmp/npm-cache npm_config_update_notifier=false
 ExecStart=/usr/bin/npx --no-install tsx scripts/post-readiness-journey.ts
 TimeoutStartSec=60
 NoNewPrivileges=true

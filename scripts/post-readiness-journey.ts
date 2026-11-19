@@ -4,7 +4,7 @@
  * the closed synthetic-journey-outcome v1 document to Heimdall (INFER-250 / HEIM-49).
  *
  * Configuration comes only from the environment (host-owned private file, never argv):
- *   GATEWAY_READINESS_URL                gateway origin, e.g. http://127.0.0.1:<port>
+ *   GATEWAY_READINESS_URL                gateway origin: https, or http only to loopback, e.g. http://127.0.0.1:<port>
  *   GATEWAY_READINESS_MONITOR_KEY        read-only monitor-scope key
  *   HEIMDALL_SYNTHETIC_JOURNEYS_URL      https://<heimdall>/api/synthetic-journeys
  *   HEIMDALL_GATEWAY_JOURNEY_TOKEN       dedicated gateway journey credential
