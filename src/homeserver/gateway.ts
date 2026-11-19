@@ -62,7 +62,7 @@ import { describeCreditBalance } from "./account-balance.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
-import { AdmissionCancelled, AdmissionController, AdmissionRejected, type Lane } from "./admission.js";
+import { AdmissionCancelled, AdmissionController, AdmissionRejected, type AdmissionState, type Lane } from "./admission.js";
 import { acquireGpuLease } from "./gpu-lease.js";
 import {
   ExclusiveMaintenanceWindow,
@@ -646,14 +646,34 @@ interface ModelResidencyResponseRow {
   state: string;
   ttl: number | null;
   classification: ModelResidencyDiagnostic["classification"];
+  /** Active / idle / unknown, separate from residency: `ready` never means generating. */
+  activity: ModelResidencyDiagnostic["activity"];
   lastUse:
     | Pick<LatestSuccessfulModelUse, "ts" | "route" | "outcome"> & { alias?: string | null }
     | null;
 }
 
 type ModelResidencyResponse =
-  | { models: ModelResidencyResponseRow[]; hostMemory: HostMemoryResponse; resourceEvidence: ResourceEvidence; status?: never }
+  | { models: ModelResidencyResponseRow[]; hostMemory: HostMemoryResponse; resourceEvidence: ResourceEvidence; activityEvidence: ActivityEvidence; status?: never }
   | { status: "unavailable"; resourceEvidence: ResourceEvidence; models?: never };
+
+/**
+ * Activity provenance for /models/residency (INFER-376). Gateway admission counters are
+ * aggregate (not per model) and cover only gateway-admitted traffic, so they can show that
+ * the gateway is busy but never that a model or the backend is idle. No backend activity
+ * probe is wired yet: per-model activity is therefore `unknown` / `not_probed`.
+ */
+interface ActivityEvidence {
+  gateway: {
+    coverage: "gateway_admitted_only";
+    perModel: false;
+    inflight: number;
+    ownerQueued: number;
+    maintenance: "off" | "guest" | "exclusive";
+    observedAt: string;
+  };
+  backend: { status: "not_probed" };
+}
 
 interface ResourceEvidence {
   admissionMode: HostMemoryAdmissionMode;
@@ -735,6 +755,7 @@ async function readModelResidency(
   readMemory: () => Promise<HostMemoryReadResult>,
   admissionMode: HostMemoryAdmissionMode,
   readOom: () => Promise<number | null>,
+  readAdmission: () => AdmissionState,
 ): Promise<ModelResidencyResponse> {
   const resourceEvidence = await readResourceEvidence(admissionMode, readOom);
   let running: Awaited<ReturnType<typeof getRunningSnapshot>>;
@@ -771,6 +792,7 @@ async function readModelResidency(
       state: diagnostic.state,
       ttl: diagnostic.ttlSeconds,
       classification: diagnostic.classification,
+      activity: diagnostic.activity,
       lastUse:
         use === undefined || use === null
           ? null
@@ -780,7 +802,19 @@ async function readModelResidency(
     };
   });
   const hostMemory = await readHostMemoryForResidency(readMemory);
-  return { models: modelsOutput, hostMemory, resourceEvidence };
+  const admission = readAdmission();
+  const activityEvidence: ActivityEvidence = {
+    gateway: {
+      coverage: "gateway_admitted_only",
+      perModel: false,
+      inflight: admission.inflight,
+      ownerQueued: admission.ownerQueued,
+      maintenance: admission.maintenanceMode === true ? (admission.maintenanceScope ?? "guest") : "off",
+      observedAt: new Date().toISOString(),
+    },
+    backend: { status: "not_probed" },
+  };
+  return { models: modelsOutput, hostMemory, resourceEvidence, activityEvidence };
 }
 
 // ─── Portal HTML (self-service invite → key page) ──────────────────────────────────
@@ -5927,6 +5961,7 @@ export async function handleRequest(
         hostMemoryDeps.readMemory ?? readHostMemory,
         cfg.hostMemoryAdmission.mode,
         hostMemoryDeps.readOomKillCount ?? readOomKillCount,
+        () => controller.snapshot(),
       );
       const status = residency.status === "unavailable" ? 503 : 200;
       sendJson(res, status, residency);

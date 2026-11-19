@@ -201,12 +201,17 @@ describe("GET /models/residency", () => {
         admissionMode: "off",
         oom: { status: "available", oomKillCount: 17, observedAt: expect.any(String) },
       },
+      activityEvidence: {
+        gateway: { coverage: "gateway_admitted_only", perModel: false, inflight: 0, ownerQueued: 0, maintenance: "off", observedAt: expect.any(String) },
+        backend: { status: "not_probed" },
+      },
       models: [
         {
           model: "qwen-main",
           state: "ready",
           ttl: 60,
           classification: "unknown",
+          activity: { state: "unknown", reason: "not_probed", coverage: null, activeCount: null, observedAtMs: null },
           lastUse: {
             ts,
             alias: "residency-owner",
@@ -217,6 +222,7 @@ describe("GET /models/residency", () => {
       ],
     });
     expect(Object.keys(body.models[0] ?? {}).sort()).toEqual([
+      "activity",
       "classification",
       "lastUse",
       "model",
@@ -251,12 +257,17 @@ describe("GET /models/residency", () => {
         admissionMode: "off",
         oom: { status: "available", oomKillCount: 17, observedAt: expect.any(String) },
       },
+      activityEvidence: {
+        gateway: { coverage: "gateway_admitted_only", perModel: false, inflight: 0, ownerQueued: 0, maintenance: "off", observedAt: expect.any(String) },
+        backend: { status: "not_probed" },
+      },
       models: [
         {
           model: "qwen-main",
           state: "ready",
           ttl: 60,
           classification: "ttl_retained",
+          activity: { state: "unknown", reason: "not_probed", coverage: null, activeCount: null, observedAtMs: null },
           lastUse: {
             ts,
             route: "/v1/chat/completions",

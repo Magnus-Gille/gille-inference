@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  MODEL_ACTIVITY_MAX_AGE_MS,
+  classifyModelActivity,
   diagnoseModelResidency,
+  type ModelActivitySample,
   type ModelResidencyDiagnostic,
   type ModelResidencyFacts,
   type SanitizedRunningEntry,
@@ -49,6 +52,7 @@ describe("model residency diagnostics", () => {
         activeCount: 1,
         lastUseAtMs: null,
         expiresAtMs: null,
+        activity: { state: "unknown", reason: "not_probed", coverage: null, activeCount: null, observedAtMs: null },
       },
     ]);
   });
@@ -168,6 +172,7 @@ describe("model residency diagnostics", () => {
 
     expect(Object.keys(diagnostic ?? {}).sort()).toEqual([
       "activeCount",
+      "activity",
       "classification",
       "expiresAtMs",
       "lastUseAtMs",
@@ -214,5 +219,62 @@ describe("model residency diagnostics", () => {
         lastUseAtMsByModel: { "qwen-main": NOW_MS },
       })[0]
     ).toMatchObject({ ttlSeconds: null, classification: "unknown" });
+  });
+});
+
+describe("resident vs actively serving (INFER-376)", () => {
+  const backend = (activeCount: number, ageMs = 1_000): ModelActivitySample =>
+    ({ coverage: "all_backend_traffic", activeCount, observedAtMs: NOW_MS - ageMs });
+  const gateway = (activeCount: number, ageMs = 1_000): ModelActivitySample =>
+    ({ coverage: "gateway_admitted_only", activeCount, observedAtMs: NOW_MS - ageMs });
+
+  it("shows a ready model with observed zero backend activity as resident and idle, not busy", () => {
+    const [d] = diagnose([entry({ state: "ready" })], { activitySamplesByModel: { "qwen-main": [backend(0)] } });
+    expect(d?.state).toBe("ready");
+    expect(d?.activity).toEqual({ state: "idle", reason: null, coverage: "all_backend_traffic", activeCount: 0, observedAtMs: NOW_MS - 1_000 });
+    expect(d?.classification).not.toBe("serving");
+  });
+
+  it("shows a ready model with active work as active and serving", () => {
+    const [d] = diagnose([entry()], { activitySamplesByModel: { "qwen-main": [backend(2)] } });
+    expect(d?.activity).toMatchObject({ state: "active", activeCount: 2, coverage: "all_backend_traffic" });
+    expect(d?.classification).toBe("serving");
+  });
+
+  it("does not let a gateway-only zero hide direct backend activity", () => {
+    expect(classifyModelActivity([gateway(0), backend(1)], NOW_MS)).toMatchObject({ state: "active", coverage: "all_backend_traffic" });
+    // Gateway zero alone cannot see direct loopback consumers: unknown, never idle.
+    expect(classifyModelActivity([gateway(0)], NOW_MS)).toEqual(
+      { state: "unknown", reason: "partial_coverage", coverage: null, activeCount: null, observedAtMs: null });
+  });
+
+  it("accepts positive gateway evidence as active", () => {
+    expect(classifyModelActivity([gateway(1), backend(0)], NOW_MS)).toMatchObject({ state: "active", coverage: "gateway_admitted_only" });
+  });
+
+  it("returns unknown for missing, stale, future, or malformed probes instead of guessing", () => {
+    expect(classifyModelActivity(undefined, NOW_MS).reason).toBe("not_probed");
+    expect(classifyModelActivity([], NOW_MS).reason).toBe("not_probed");
+    expect(classifyModelActivity([backend(0, MODEL_ACTIVITY_MAX_AGE_MS + 1)], NOW_MS)).toMatchObject({ state: "unknown", reason: "stale" });
+    expect(classifyModelActivity([backend(3, MODEL_ACTIVITY_MAX_AGE_MS + 1)], NOW_MS)).toMatchObject({ state: "unknown", reason: "stale" });
+    expect(classifyModelActivity([backend(0, -1)], NOW_MS)).toMatchObject({ state: "unknown", reason: "future" });
+    for (const bad of [
+      { coverage: "all_backend_traffic", activeCount: -1, observedAtMs: NOW_MS },
+      { coverage: "all_backend_traffic", activeCount: 0.5, observedAtMs: NOW_MS },
+      { coverage: "somewhere", activeCount: 0, observedAtMs: NOW_MS },
+      { coverage: "all_backend_traffic", activeCount: 0, observedAtMs: Number.NaN },
+    ]) {
+      expect(classifyModelActivity([bad as ModelActivitySample], NOW_MS)).toMatchObject({ state: "unknown", reason: "invalid" });
+    }
+    expect(classifyModelActivity([backend(0)], Number.NaN)).toMatchObject({ state: "unknown", reason: "invalid" });
+  });
+
+  it("keeps the freshness boundary inclusive at exactly the maximum age", () => {
+    expect(classifyModelActivity([backend(0, MODEL_ACTIVITY_MAX_AGE_MS)], NOW_MS).state).toBe("idle");
+  });
+
+  it("defaults to unknown/not_probed when no activity samples are supplied", () => {
+    const [d] = diagnose([entry()]);
+    expect(d?.activity).toEqual({ state: "unknown", reason: "not_probed", coverage: null, activeCount: null, observedAtMs: null });
   });
 });
