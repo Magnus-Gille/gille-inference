@@ -64,6 +64,21 @@ CAP_S="${CAP_S:-600}"
 TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
 [ -n "$TIMEOUT_BIN" ] || { echo "error: need GNU 'timeout' (Linux) or 'gtimeout' (macOS: brew install coreutils) on PATH" >&2; exit 3; }
 OUT="${GATE_D_OUT:-$REPO_ROOT/data/gate-d-results.jsonl}"; mkdir -p "$(dirname "$OUT")"
+# Optional pi-only system-prompt variant (INFER-519). GATE_D_PI_APPEND_SYSTEM names a bare file under
+# gate-d/prompts/ so every variant is committed and reviewable; it is passed to pi via
+# --append-system-prompt and recorded (name + sha256) on every row, so variant runs never pool
+# silently with baseline runs. Unset = the unchanged baseline (promptVariant "none").
+PI_APPEND_FILE=""; PROMPT_VARIANT="none"; PROMPT_SHA=""
+if [ -n "${GATE_D_PI_APPEND_SYSTEM:-}" ]; then
+  [ "$ARM" = "pi" ] || { echo "error: GATE_D_PI_APPEND_SYSTEM is supported for the pi arm only" >&2; exit 3; }
+  case "$GATE_D_PI_APPEND_SYSTEM" in
+    */*|.*) echo "error: GATE_D_PI_APPEND_SYSTEM must be a bare file name under gate-d/prompts/" >&2; exit 3 ;;
+  esac
+  PI_APPEND_FILE="$ROOT/prompts/$GATE_D_PI_APPEND_SYSTEM"
+  [ -f "$PI_APPEND_FILE" ] || { echo "error: no such prompt variant: gate-d/prompts/$GATE_D_PI_APPEND_SYSTEM" >&2; exit 3; }
+  PROMPT_VARIANT="${GATE_D_PI_APPEND_SYSTEM%.md}"
+  PROMPT_SHA="sha256:$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$PI_APPEND_FILE")" || exit 3
+fi
 # Fixture-corruption guard (#172 belt-and-suspenders): gate-d/tasks/ must always be pristine and
 # gate-d/src/ must never exist. Checked once per task in run_one(), right after the arm runs — if
 # either is dirty, something still escaped its work dir; restore from HEAD and abort loudly rather
@@ -121,7 +136,7 @@ run_one() {
           && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \
           && export GIT_CEILING_DIRECTORIES="$WORKROOT" \
           && HS_API_KEY="$GW_KEY" "$TIMEOUT_BIN" "$CAP_S" pi --provider "${PI_PROVIDER:-inference-gille}" --model "$MODEL" \
-             --no-session --print --mode json "$instr" </dev/null 2>"$W/.arm.stderr.log" \
+             --no-session --print --mode json ${PI_APPEND_FILE:+--append-system-prompt "$PI_APPEND_FILE"} "$instr" </dev/null 2>"$W/.arm.stderr.log" \
              | "$REPO_ROOT/node_modules/.bin/tsx" "$REPO_ROOT/scripts/pi-benchmark-telemetry.ts" \
                  --log "$W/.arm.log" --summary "$W/.arm-telemetry.json" ) || status="arm-error"
       ;;
@@ -223,8 +238,8 @@ run_one() {
   GD_ARM="$ARM" GD_MODEL="$MODEL" GD_TASK="$id" GD_PASS="$pass" GD_EXIT="$exitclass" GD_WALL="$((t1-t0))" \
     GD_CORPUS_REVISION="$CORPUS_REVISION" GD_TASK_REVISION="$task_revision" GD_HOLDOUT="$holdout" \
     GD_TELEMETRY="$W/.arm-telemetry.json" \
-    GD_PEEK="$PEEK_JSON" \
-    python3 -c "import json,os; row={'arm':os.environ['GD_ARM'],'model':os.environ['GD_MODEL'],'task':os.environ['GD_TASK'],'corpusRevision':os.environ['GD_CORPUS_REVISION'],'taskRevision':os.environ['GD_TASK_REVISION'],'holdout':os.environ['GD_HOLDOUT']=='true','pass':os.environ['GD_PASS']=='true','exitClass':os.environ['GD_EXIT'],'wallS':int(os.environ['GD_WALL'])}; telemetry={'turns':None,'toolCalls':None,'promptTokens':None,'completionTokens':None,'modelTurnMs':None,'timedModelTurns':None,'assistantStreamMs':None,'timedAssistantMessages':None,'unparseableLines':None}; p=os.environ['GD_TELEMETRY']; telemetry.update(json.load(open(p)) if os.path.isfile(p) else {}); row.update(telemetry); peek=json.loads(os.environ.get('GD_PEEK') or '{}'); row.update({k:bool(v) for k,v in peek.items()}); print(json.dumps(row))" >>"$OUT"
+    GD_PEEK="$PEEK_JSON" GD_PROMPT_VARIANT="$PROMPT_VARIANT" GD_PROMPT_SHA="$PROMPT_SHA" \
+    python3 -c "import json,os; row={'arm':os.environ['GD_ARM'],'model':os.environ['GD_MODEL'],'task':os.environ['GD_TASK'],'corpusRevision':os.environ['GD_CORPUS_REVISION'],'taskRevision':os.environ['GD_TASK_REVISION'],'holdout':os.environ['GD_HOLDOUT']=='true','pass':os.environ['GD_PASS']=='true','exitClass':os.environ['GD_EXIT'],'wallS':int(os.environ['GD_WALL']),'promptVariant':os.environ['GD_PROMPT_VARIANT'],'promptSha256':os.environ['GD_PROMPT_SHA'] or None}; telemetry={'turns':None,'toolCalls':None,'promptTokens':None,'completionTokens':None,'modelTurnMs':None,'timedModelTurns':None,'assistantStreamMs':None,'timedAssistantMessages':None,'unparseableLines':None}; p=os.environ['GD_TELEMETRY']; telemetry.update(json.load(open(p)) if os.path.isfile(p) else {}); row.update(telemetry); peek=json.loads(os.environ.get('GD_PEEK') or '{}'); row.update({k:bool(v) for k,v in peek.items()}); print(json.dumps(row))" >>"$OUT"
   echo "[$ARM/$MODEL/$CORPUS_REVISION] $id → $exitclass (${pass}, $((t1-t0))s)"
   # KEEP_WORK=1 preserves the work dir (+ .arm logs, telemetry, .check.log, and the oracle-peek
   # transcript) for diagnosis.

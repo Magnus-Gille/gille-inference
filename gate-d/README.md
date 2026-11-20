@@ -63,6 +63,14 @@ GATE_D_INCLUDE_HOLDOUT=1 bash gate-d/run.sh pi all
 GATE_D_LOG=/tmp/gate-d-r2.log GATE_D_INCLUDE_HOLDOUT=1 bash gate-d/sweep.sh
 ```
 
+**pi system-prompt variants.** `GATE_D_PI_APPEND_SYSTEM=<file>` passes a committed file from
+`gate-d/prompts/` to pi with `--append-system-prompt`, for example
+`GATE_D_PI_APPEND_SYSTEM=verify-before-done.md bash gate-d/run.sh pi all`. Every row records
+`promptVariant` (`none` when unset) and `promptSha256`, so variant runs are never pooled with
+baseline runs. The variable must be a bare file name in that directory and is rejected on other
+arms. A variant run on tasks that earlier runs already scored is a diagnostic A/B, not a fresh
+holdout result.
+
 ## Status
 
 **All 14 tasks built + verified** — `verify-fixtures.sh` is **79/79** (14 tasks seed-RED → reference-GREEN, + 65 anti-cheat regressions), plus pinned-commit/tree, revision-enumeration, and work-dir-isolation checks. The append-only corpus history and holdout-consumption rules are in [`CORPUS.md`](./CORPUS.md):
