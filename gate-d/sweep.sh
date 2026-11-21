@@ -23,6 +23,7 @@
 # it — guaranteeing the next task starts on a clean model and bounding any window where a live user
 # could hit the degenerate model.
 set -u
+set -o pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$ROOT/.." && pwd)"
 cd "$REPO_ROOT" || exit 3
@@ -40,16 +41,32 @@ export CAP_S="${CAP_S:-600}"
 OUT="${GATE_D_OUT:-$REPO_ROOT/data/gate-d-results.jsonl}"; mkdir -p "$(dirname "$OUT")"
 export GATE_D_OUT="$OUT"
 LOG="${GATE_D_LOG:-$REPO_ROOT/data/gate-d-sweep.log}"
+# Prompt variant (INFER-519): resolve once, refuse non-pi arms up front, and pin the digest so every
+# run.sh invocation in this sweep fails closed if the committed prompt changes mid-sweep. Resume
+# counts and the summary key on (arm, model, task, promptVariant, promptSha256); legacy rows
+# without those fields count as the baseline ("none", no digest).
+. "$ROOT/prompt-identity.sh"
+if [ -n "${GATE_D_PI_APPEND_SYSTEM:-}" ]; then
+  for arm in $ARMS; do
+    [ "$arm" = "pi" ] || { echo "error: GATE_D_PI_APPEND_SYSTEM is supported for the pi arm only (ARMS=\"$ARMS\")" >&2; exit 3; }
+  done
+fi
+resolve_prompt_variant "$REPO_ROOT" || exit 3
+if [ -n "$PROMPT_SHA" ]; then export GATE_D_EXPECT_PROMPT_SHA="$PROMPT_SHA"; else unset GATE_D_EXPECT_PROMPT_SHA; fi
 
 count_rows() {
   [ -f "$OUT" ] || { echo 0; return; }
-  GD_A="$1" GD_M="$2" GD_T="$3" GD_R="$CORPUS_REVISION" GD_OUT="$OUT" python3 -c "import json,os
+  GD_A="$1" GD_M="$2" GD_T="$3" GD_R="$CORPUS_REVISION" GD_OUT="$OUT" \
+    GD_V="$PROMPT_VARIANT" GD_S="$PROMPT_SHA" python3 -c "import json,os
 a=os.environ['GD_A'];m=os.environ['GD_M'];t=os.environ['GD_T'];rev=os.environ['GD_R'];n=0
+want=(os.environ['GD_V'], os.environ['GD_S'] or None)
 for l in open(os.environ['GD_OUT']):
     try: r=json.loads(l)
     except: continue
+    if not isinstance(r,dict): continue
     rowrev=r.get('corpusRevision','gate-d-r1')
-    if rowrev==rev and r.get('arm')==a and r.get('model')==m and r.get('task')==t: n+=1
+    variant=(r.get('promptVariant','none'), r.get('promptSha256'))
+    if rowrev==rev and r.get('arm')==a and r.get('model')==m and r.get('task')==t and variant==want: n+=1
 print(n)"
 }
 last_exit() { [ -f "$OUT" ] && tail -1 "$OUT" | python3 -c "import json,sys
@@ -71,6 +88,10 @@ for arm in $ARMS; do
     for i in $(seq 1 "$need"); do
       echo "[run ] $arm/$MODEL/$t (seed $((have+i))/$SEEDS) $(date +%T)" | tee -a "$LOG"
       bash "$ROOT/run.sh" "$arm" "$t" 2>&1 | tee -a "$LOG"
+      rc="${PIPESTATUS[0]}"
+      # A failed runner wrote no row for this invocation, so the last row belongs to an earlier run:
+      # stop before consulting it rather than acting on stale state.
+      if [ "$rc" -ne 0 ]; then echo "=== SWEEP aborted: run.sh exited $rc on $arm/$MODEL/$t ===" | tee -a "$LOG"; exit "$rc"; fi
       [ "$(last_exit)" = "arm-error" ] && reset_model
     done
   done
@@ -83,6 +104,10 @@ for l in open(os.environ['GD_OUT']):
     try: r=json.loads(l)
     except: continue
     if r.get('corpusRevision','gate-d-r1') != rev or r.get('task') not in allowed: continue
-    k=(r.get('arm'),r.get('model'))
+    digest=r.get('promptSha256') or ''
+    k=(r.get('arm') or '',r.get('model') or '',r.get('promptVariant','none') or 'none',digest)
     c[k]+=1; p[k]+= 1 if r.get('pass') else 0
-for arm,model in sorted(c): print(f'{rev} {arm}/{model}: {p[(arm,model)]}/{c[(arm,model)]} pass')" | tee -a "$LOG"
+for k in sorted(c):
+    arm,model,variant,digest=k
+    label=variant if not digest else f'{variant}@{digest.split(\":\")[-1][:12]}'
+    print(f'{rev} {arm}/{model} [prompt={label}]: {p[k]}/{c[k]} pass')" | tee -a "$LOG"

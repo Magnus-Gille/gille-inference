@@ -13,8 +13,13 @@
 # dummy). Optional: MODEL (default qwen3-coder-next-80b), CAP_S (wall-clock cap, default 600).
 set -u
 set -o pipefail
+# Never let an inherited Git override aim this runner's git calls (fixture guard, prompt lookup) at
+# another repository; the work dirs get their own git roots below.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+      GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$ROOT/.." && pwd)"
+. "$ROOT/prompt-identity.sh"   # gd_git (isolated runner-owned Git) and the prompt resolver
 
 # ── Work-dir isolation (#172) ────────────────────────────────────────────────────────────────
 # Work dirs used to live under gate-d/.work/ — INSIDE this checkout. A nested `git init` there
@@ -64,14 +69,35 @@ CAP_S="${CAP_S:-600}"
 TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
 [ -n "$TIMEOUT_BIN" ] || { echo "error: need GNU 'timeout' (Linux) or 'gtimeout' (macOS: brew install coreutils) on PATH" >&2; exit 3; }
 OUT="${GATE_D_OUT:-$REPO_ROOT/data/gate-d-results.jsonl}"; mkdir -p "$(dirname "$OUT")"
+# Optional pi-only system-prompt variant (INFER-519). GATE_D_PI_APPEND_SYSTEM names a committed file
+# under gate-d/prompts/; see prompt-identity.sh. Its blob is snapshotted once from HEAD into a
+# private runner-owned file, which pi reads by absolute path (pi treats the flag's value as text OR
+# an existing file name, so a path is the only unambiguous form). Every row records the name and the
+# sha256 of exactly those bytes, and the snapshot is re-verified after each arm run, so variant runs
+# never pool silently with baseline runs. Unset = the baseline (promptVariant "none").
+if [ -n "${GATE_D_PI_APPEND_SYSTEM:-}" ] && [ "$ARM" != "pi" ]; then
+  echo "error: GATE_D_PI_APPEND_SYSTEM is supported for the pi arm only" >&2; exit 3
+fi
+resolve_prompt_variant "$REPO_ROOT" || exit 3
+PROMPT_FILE=""; PROMPT_DIR=""
+if [ -n "$PROMPT_BLOB" ]; then
+  # Absolute, physical parent: pi runs from the task dir, and pi treats a missing relative path
+  # as literal prompt text.
+  PROMPT_PARENT="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P)" \
+    || { echo "error: cannot resolve the temp directory ${TMPDIR:-/tmp}" >&2; exit 3; }
+  PROMPT_DIR="$(mktemp -d "$PROMPT_PARENT/gd-prompt.XXXXXXXX")" || exit 3
+  case "$PROMPT_DIR" in /*) ;; *) echo "error: prompt snapshot dir is not absolute: $PROMPT_DIR" >&2; exit 3 ;; esac
+  trap 'rm -rf "$PROMPT_DIR"' EXIT
+  snapshot_prompt_variant "$REPO_ROOT" "$PROMPT_DIR" || exit 3
+fi
 # Fixture-corruption guard (#172 belt-and-suspenders): gate-d/tasks/ must always be pristine and
 # gate-d/src/ must never exist. Checked once per task in run_one(), right after the arm runs — if
 # either is dirty, something still escaped its work dir; restore from HEAD and abort loudly rather
 # than let corruption silently persist. Skipped outside a git checkout (nothing to escape to — the
 # box runtime dir is an rsync target, not a checkout, per the incident writeup above).
 IN_GIT_CHECKOUT=0
-git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 && IN_GIT_CHECKOUT=1
-fixture_dirty(){ git -C "$REPO_ROOT" status --porcelain -- gate-d/tasks gate-d/src 2>/dev/null || true; }
+gd_git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 && IN_GIT_CHECKOUT=1
+fixture_dirty(){ gd_git -C "$REPO_ROOT" status --porcelain -- gate-d/tasks gate-d/src 2>/dev/null || true; }
 metaget(){ python3 -c "import json;v=json.load(open('$1')).get('$2','');print(str(v).lower() if isinstance(v,bool) else v)"; }
 metalist(){ python3 -c "import json;print(' '.join(json.load(open('$1')).get('$2',[])))"; }
 
@@ -104,9 +130,9 @@ run_one() {
   # Make the work dir its OWN git root, so aider/opencode/pi's git-based root-detection sees $W —
   # not this checkout — as the repo. Gives aider the committed HEAD baseline it diffs against
   # (--no-auto-commit leaves the arm's net edit in the working tree for check.sh's diff-vs-seed).
-  git init -q "$W"
-  git -C "$W" add -A
-  git -C "$W" -c user.email=gate-d@local -c user.name=gate-d commit -q -m seed >/dev/null 2>&1
+  gd_git init -q "$W"
+  gd_git -C "$W" add -A
+  gd_git -C "$W" -c user.email=gate-d@local -c user.name=gate-d commit -q -m seed >/dev/null 2>&1
   local t0 t1 status="ran"
   t0=$(date +%s)
   case "$ARM" in
@@ -121,7 +147,7 @@ run_one() {
           && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \
           && export GIT_CEILING_DIRECTORIES="$WORKROOT" \
           && HS_API_KEY="$GW_KEY" "$TIMEOUT_BIN" "$CAP_S" pi --provider "${PI_PROVIDER:-inference-gille}" --model "$MODEL" \
-             --no-session --print --mode json "$instr" </dev/null 2>"$W/.arm.stderr.log" \
+             --no-session --print --mode json ${PROMPT_FILE:+--append-system-prompt "$PROMPT_FILE"} "$instr" </dev/null 2>"$W/.arm.stderr.log" \
              | "$REPO_ROOT/node_modules/.bin/tsx" "$REPO_ROOT/scripts/pi-benchmark-telemetry.ts" \
                  --log "$W/.arm.log" --summary "$W/.arm-telemetry.json" ) || status="arm-error"
       ;;
@@ -165,13 +191,17 @@ run_one() {
     if [ -n "$dirty" ]; then
       echo "FATAL[$ARM/$id]: gate-d/tasks or gate-d/src changed on disk during this run:" >&2
       echo "$dirty" >&2
-      git -C "$REPO_ROOT" checkout -q -- gate-d/tasks 2>/dev/null
-      git -C "$REPO_ROOT" clean -fdq -- gate-d/tasks gate-d/src 2>/dev/null
+      gd_git -C "$REPO_ROOT" checkout -q -- gate-d/tasks 2>/dev/null
+      gd_git -C "$REPO_ROOT" clean -fdq -- gate-d/tasks gate-d/src 2>/dev/null
       echo "Restored gate-d/ fixtures from HEAD and aborting (#172) — corruption must never silently persist." >&2
       echo "(If you're mid-edit of a fixture yourself, commit first and re-run.)" >&2
       rm -rf "$W"
       exit 9
     fi
+  fi
+  if ! verify_prompt_snapshot; then
+    echo "FATAL[$ARM/$id]: the prompt snapshot changed during the run; no row written" >&2
+    rm -rf "$W"; exit 3
   fi
   t1=$(date +%s)
   # Oracle-peek transcript + detection (pure observation — never affects pass/fail or any
@@ -222,10 +252,31 @@ run_one() {
   # form injected the bash bareword `true`/`false` as a Python name → NameError, dropping the row.
   GD_ARM="$ARM" GD_MODEL="$MODEL" GD_TASK="$id" GD_PASS="$pass" GD_EXIT="$exitclass" GD_WALL="$((t1-t0))" \
     GD_CORPUS_REVISION="$CORPUS_REVISION" GD_TASK_REVISION="$task_revision" GD_HOLDOUT="$holdout" \
-    GD_TELEMETRY="$W/.arm-telemetry.json" \
-    GD_PEEK="$PEEK_JSON" \
-    python3 -c "import json,os; row={'arm':os.environ['GD_ARM'],'model':os.environ['GD_MODEL'],'task':os.environ['GD_TASK'],'corpusRevision':os.environ['GD_CORPUS_REVISION'],'taskRevision':os.environ['GD_TASK_REVISION'],'holdout':os.environ['GD_HOLDOUT']=='true','pass':os.environ['GD_PASS']=='true','exitClass':os.environ['GD_EXIT'],'wallS':int(os.environ['GD_WALL'])}; telemetry={'turns':None,'toolCalls':None,'promptTokens':None,'completionTokens':None,'modelTurnMs':None,'timedModelTurns':None,'assistantStreamMs':None,'timedAssistantMessages':None,'unparseableLines':None}; p=os.environ['GD_TELEMETRY']; telemetry.update(json.load(open(p)) if os.path.isfile(p) else {}); row.update(telemetry); peek=json.loads(os.environ.get('GD_PEEK') or '{}'); row.update({k:bool(v) for k,v in peek.items()}); print(json.dumps(row))" >>"$OUT"
-  echo "[$ARM/$MODEL/$CORPUS_REVISION] $id → $exitclass (${pass}, $((t1-t0))s)"
+    GD_TELEMETRY="$([ "$ARM" = pi ] && printf %s "$W/.arm-telemetry.json")" \
+    GD_PEEK="$PEEK_JSON" GD_PROMPT_VARIANT="$PROMPT_VARIANT" GD_PROMPT_SHA="$PROMPT_SHA" \
+    python3 -c "import json,os
+row={'arm':os.environ['GD_ARM'],'model':os.environ['GD_MODEL'],'task':os.environ['GD_TASK'],'corpusRevision':os.environ['GD_CORPUS_REVISION'],'taskRevision':os.environ['GD_TASK_REVISION'],'holdout':os.environ['GD_HOLDOUT']=='true','pass':os.environ['GD_PASS']=='true','exitClass':os.environ['GD_EXIT'],'wallS':int(os.environ['GD_WALL'])}
+keys=('turns','toolCalls','promptTokens','completionTokens','modelTurnMs','timedModelTurns','assistantStreamMs','timedAssistantMessages','unparseableLines')
+telemetry={k:None for k in keys}
+p=os.environ.get('GD_TELEMETRY','')
+if p and os.path.isfile(p) and not os.path.islink(p):
+    try: raw=json.load(open(p))
+    except Exception: raw={}
+    if isinstance(raw,dict):
+        for k in keys:
+            v=raw.get(k)
+            if isinstance(v,(int,float)) and not isinstance(v,bool): telemetry[k]=v
+row.update(telemetry)
+peek=json.loads(os.environ.get('GD_PEEK') or '{}')
+row.update({k:bool(v) for k,v in peek.items() if k not in row})
+row['promptVariant']=os.environ['GD_PROMPT_VARIANT']; row['promptSha256']=os.environ['GD_PROMPT_SHA'] or None
+print(json.dumps(row))" >>"$OUT"
+  local row_status=$?
+  if [ "$row_status" -eq 0 ]; then
+    echo "[$ARM/$MODEL/$CORPUS_REVISION] $id → $exitclass (${pass}, $((t1-t0))s)"
+  else
+    echo "FATAL[$ARM/$id]: could not append the result row to $OUT (status $row_status)" >&2
+  fi
   # KEEP_WORK=1 preserves the work dir (+ .arm logs, telemetry, .check.log, and the oracle-peek
   # transcript) for diagnosis.
   if [ -n "${KEEP_WORK:-}" ]; then
@@ -234,6 +285,8 @@ run_one() {
     rm -rf "$W"
     [ -n "$TRANSCRIPT" ] && rm -f "$TRANSCRIPT"
   fi
+  # A lost row must never look like success: the sweep would otherwise read an older row.
+  [ "$row_status" -eq 0 ] || exit 4
 }
 
 if [ "$SEL" = "all" ]; then

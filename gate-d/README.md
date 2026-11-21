@@ -63,6 +63,24 @@ GATE_D_INCLUDE_HOLDOUT=1 bash gate-d/run.sh pi all
 GATE_D_LOG=/tmp/gate-d-r2.log GATE_D_INCLUDE_HOLDOUT=1 bash gate-d/sweep.sh
 ```
 
+**pi system-prompt variants.** `GATE_D_PI_APPEND_SYSTEM=<file>` passes a file committed at HEAD in
+`gate-d/prompts/` to pi with `--append-system-prompt`, for example
+`GATE_D_PI_APPEND_SYSTEM=verify-before-done.md bash gate-d/run.sh pi all`. Every row records
+`promptVariant` (`none` when unset) and `promptSha256`, so variant runs are never pooled with
+baseline runs; `sweep.sh` resumes and summarizes per variant and digest, and counts legacy rows
+without those fields as the baseline. The variable must be a bare file name of a regular file
+committed at HEAD whose working-tree copy is unchanged. The blob is resolved once from HEAD and
+copied into a private runner-owned file that pi reads by absolute path (pi treats the flag's value
+as text or as an existing file name, so a path is the only unambiguous form). The digest covers
+exactly that file's bytes, which must be non-empty, valid UTF-8 and free of a byte-order mark,
+and the file is re-verified after every arm run. The snapshot lives under the absolute physical
+temp directory and is removed on exit. Runner Git calls ignore inherited `GIT_*` selectors, global
+and system config, and hooks. The variable is rejected on other arms, and a sweep fails closed if
+the committed prompt changes while it runs or if any run exits non-zero. The snapshot is protected
+from other users but not from a process running as the same OS user between the post-run checks;
+run sweeps from a dedicated account if that matters. A variant run on tasks that earlier runs
+already scored is a diagnostic A/B, not a fresh holdout result.
+
 ## Status
 
 **All 14 tasks built + verified** — `verify-fixtures.sh` is **79/79** (14 tasks seed-RED → reference-GREEN, + 65 anti-cheat regressions), plus pinned-commit/tree, revision-enumeration, and work-dir-isolation checks. The append-only corpus history and holdout-consumption rules are in [`CORPUS.md`](./CORPUS.md):
