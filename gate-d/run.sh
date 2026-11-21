@@ -163,52 +163,78 @@ run_one() {
   [ -n "$read" ] && readargs=$(printf -- '--read %s ' $read)
   # The expected seed: in a checkout, the committed task tree (path, mode and blob, so ignored or
   # stray files in the live directory are caught); in a plain deployment, the task's file list.
-  local seed_expected
+  # Records are compared NUL-delimited (ls-tree -z, find -print0), because Git quotes paths that
+  # contain quotes, backslashes or control characters even with core.quotePath=false (INFER-520).
+  # NUL cannot live in a shell variable, so the expected and actual lists go through files.
+  local seed_expected_f seed_actual_f
+  seed_expected_f="$(mktemp "${TMPDIR:-/tmp}/gd-seed-exp.XXXXXXXX")" || { echo "FATAL[$ARM/$id]: mktemp failed" >&2; exit 3; }
+  seed_actual_f="$(mktemp "${TMPDIR:-/tmp}/gd-seed-act.XXXXXXXX")" || { rm -f "$seed_expected_f"; echo "FATAL[$ARM/$id]: mktemp failed" >&2; exit 3; }
   if [ "$IN_GIT_CHECKOUT" = 1 ]; then
-    seed_expected="$(gd_git -C "$REPO_ROOT" -c core.quotePath=false ls-tree -r HEAD -- "gate-d/tasks/$id/repo/")" \
-      && [ -n "$seed_expected" ] \
-      && seed_expected="$(printf '%s\n' "$seed_expected" | sed "s|	gate-d/tasks/$id/repo/|	|" | LC_ALL=C sort)" \
-      || { echo "FATAL[$ARM/$id]: could not read the committed task tree; refusing to run the arm." >&2; exit 3; }
+    if ! gd_git -C "$REPO_ROOT" ls-tree -r -z HEAD -- "gate-d/tasks/$id/repo/" > "$seed_expected_f" \
+       || [ ! -s "$seed_expected_f" ] \
+       || ! LC_ALL=C sed -z "s|	gate-d/tasks/$id/repo/|	|" "$seed_expected_f" | LC_ALL=C sort -z > "$seed_actual_f" \
+       || ! mv "$seed_actual_f" "$seed_expected_f"; then
+      rm -f "$seed_expected_f" "$seed_actual_f"
+      echo "FATAL[$ARM/$id]: could not read the committed task tree; refusing to run the arm." >&2; exit 3
+    fi
   else
-    seed_expected="$(cd "$T/repo" && find . \( -type f -o -type l \) -print | sed 's|^\./||' | LC_ALL=C sort)" \
-      && [ -n "$seed_expected" ] \
-      || { echo "FATAL[$ARM/$id]: could not enumerate $T/repo; refusing to run the arm." >&2; exit 3; }
+    if ! (cd "$T/repo" && find . \( -type f -o -type l \) -print0) | LC_ALL=C sed -z 's|^\./||' | LC_ALL=C sort -z > "$seed_expected_f" \
+       || [ ! -s "$seed_expected_f" ]; then
+      rm -f "$seed_expected_f" "$seed_actual_f"
+      echo "FATAL[$ARM/$id]: could not enumerate $T/repo; refusing to run the arm." >&2; exit 3
+    fi
   fi
   local W
-  W=$(mktemp -d "$WORKROOT/${id}-${ARM}-XXXX") || { echo "FATAL[$ARM/$id]: mktemp failed" >&2; exit 3; }
-  if ! cp -r "$T/repo/." "$W/"; then
+  W=$(mktemp -d "$WORKROOT/${id}-${ARM}-XXXX") || { rm -f "$seed_expected_f" "$seed_actual_f"; echo "FATAL[$ARM/$id]: mktemp failed" >&2; exit 3; }
+  # -R, not -r: BSD cp (macOS) can dereference a symlink fixture under -r; -R keeps it a symlink.
+  if ! cp -R "$T/repo/." "$W/"; then
     echo "FATAL[$ARM/$id]: could not copy the task seed; refusing to run the arm." >&2
-    rm -rf "$W"; exit 3
+    rm -rf "$W" "$seed_expected_f" "$seed_actual_f"; exit 3
   fi
   # node_modules symlink: WORKROOT now lives OUTSIDE the repo (#172), so there's no ancestor dir
   # left for `npx --no-install` to climb into. Link the real node_modules in directly — check.sh's
   # tsc/tsx invocations keep resolving exactly as before, just via one hop instead of an upward walk.
   if ! ln -s "$REPO_ROOT/node_modules" "$W/node_modules"; then
     echo "FATAL[$ARM/$id]: could not link node_modules; refusing to run the arm." >&2
-    rm -rf "$W"; exit 3
+    rm -rf "$W" "$seed_expected_f" "$seed_actual_f"; exit 3
   fi
   # Make the work dir its OWN git root, so aider/opencode/pi's git-based root-detection sees $W —
   # not this checkout — as the repo. Gives aider the committed HEAD baseline it diffs against
   # (--no-auto-commit leaves the arm's net edit in the working tree for check.sh's diff-vs-seed).
   # Every seed step must succeed, and the seed commit must hold exactly the expected task files
   # (plus the node_modules link), or the arm would run without the baseline it is graded against.
-  local seed_tree seed_actual
+  # `add -f` for node_modules: a seed's own .gitignore may list it (INFER-520).
+  local seed_ok=1
   if ! gd_git init -q --template= "$W" \
      || ! gd_git -C "$W" add -A \
+     || ! gd_git -C "$W" add -f -- node_modules \
      || ! gd_git -C "$W" -c user.email=gate-d@local -c user.name=gate-d commit -q -m seed >/dev/null \
-     || ! seed_tree="$(gd_git -C "$W" -c core.quotePath=false ls-tree -r HEAD)" \
-     || ! printf '%s\n' "$seed_tree" | grep -qx "120000 blob [0-9a-f]*	node_modules"; then
-    seed_actual="<seed commit failed>"
-  elif [ "$IN_GIT_CHECKOUT" = 1 ]; then
-    seed_actual="$(printf '%s\n' "$seed_tree" | grep -vx "120000 blob [0-9a-f]*	node_modules" | LC_ALL=C sort)"
+     || ! gd_git -C "$W" ls-tree -r -z HEAD > "$seed_actual_f"; then
+    seed_ok=0
   else
-    seed_actual="$(printf '%s\n' "$seed_tree" | grep -vx "120000 blob [0-9a-f]*	node_modules" | cut -f2- | LC_ALL=C sort)"
+    # Drop the node_modules link record, then (outside a checkout) the mode/type/blob prefix.
+    if ! python3 - "$seed_actual_f" "$IN_GIT_CHECKOUT" <<'PY'
+import re, sys
+path, in_git = sys.argv[1], sys.argv[2] == "1"
+recs = open(path, "rb").read().split(b"\0")
+recs = [r for r in recs if r]
+link = [r for r in recs if re.fullmatch(rb"120000 blob [0-9a-f]+\tnode_modules", r)]
+if len(link) != 1:
+    sys.exit(1)
+recs = [r for r in recs if r is not link[0]]
+if not in_git:
+    recs = [r.split(b"\t", 1)[1] for r in recs]
+recs.sort()
+open(path, "wb").write(b"".join(r + b"\0" for r in recs))
+PY
+    then seed_ok=0; fi
   fi
-  if [ "$seed_actual" != "$seed_expected" ]; then
+  if [ "$seed_ok" != 1 ] || ! cmp -s "$seed_expected_f" "$seed_actual_f"; then
     echo "FATAL[$ARM/$id]: could not create the seed commit in $W; refusing to run the arm." >&2
-    rm -rf "$W"
+    rm -rf "$W" "$seed_expected_f" "$seed_actual_f"
     exit 3
   fi
+  rm -f "$seed_expected_f" "$seed_actual_f"
   local t0 t1 status="ran"
   t0=$(date +%s)
   case "$ARM" in

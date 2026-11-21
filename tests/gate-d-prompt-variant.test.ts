@@ -462,6 +462,39 @@ describe("gate-d/run.sh pi prompt variants (INFER-519)", { timeout: 120_000 }, (
     expect(rows(out)).toEqual([]);
   });
 
+  it("accepts a seed whose file names contain quotes and backslashes (INFER-520)", () => {
+    const repo = fixtureRepo();
+    const dir = join(repo, "gate-d", "tasks", TASK, "repo");
+    writeFileSync(join(dir, 'we"ird\\name.txt'), "1\n");
+    git(repo, "add", "-A");
+    git(repo, "commit", "-q", "-m", "odd names");
+    const { bin, log } = fakeBin();
+    const { res } = runGateD(repo, bin, {}, ["pi", TASK]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(calls(log).map((c) => c.seeded)).toEqual([true]);
+  });
+
+  it("accepts a seed whose own .gitignore lists node_modules (INFER-520)", () => {
+    const repo = fixtureRepo();
+    const dir = join(repo, "gate-d", "tasks", TASK, "repo");
+    writeFileSync(join(dir, ".gitignore"), "node_modules\n");
+    git(repo, "add", "-A");
+    git(repo, "commit", "-q", "-m", "seed gitignore");
+    const { bin, log } = fakeBin();
+    const { res } = runGateD(repo, bin, {}, ["pi", TASK]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(calls(log).map((c) => c.seeded)).toEqual([true]);
+  });
+
+  it("runs from a plain deployment with no .git (INFER-520)", () => {
+    const repo = fixtureRepo();
+    rmSync(join(repo, ".git"), { recursive: true, force: true });
+    const { bin, log } = fakeBin();
+    const { res } = runGateD(repo, bin, {}, ["pi", TASK]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(calls(log).map((c) => c.seeded)).toEqual([true]);
+  });
+
   it("refuses to run a task whose seed directory is missing", () => {
     const repo = fixtureRepo();
     git(repo, "rm", "-rq", `gate-d/tasks/${TASK}/repo`);
