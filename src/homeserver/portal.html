@@ -321,6 +321,12 @@
         <td>Fast explicit coding, reasoning and image work; still evaluation-only for routing</td>
         <td>~75<br><span style="font-size:11px;color:var(--muted)">served canary</span></td>
       </tr>
+      <tr>
+        <td><span class="badge mono">inkling-2-mini</span></td>
+        <td>Thinking Machines Inkling 2 Mini — 26B-A3.4B looped MoE, IQ4_NL, multimodal</td>
+        <td>General chat, coding and reasoning (per-request <span class="badge mono">reasoning_effort</span>); complex tool calls and images not yet qualified</td>
+        <td>~22<br><span style="font-size:11px;color:var(--muted)">served canary</span></td>
+      </tr>
     </table>
     </div>
     <h3 id="systemone-models-heading" style="margin-top:16px">System One decision models</h3>
@@ -414,8 +420,8 @@
       <span class="badge mono">gemma4</span>, <span class="badge mono">qwen36-a3b</span>,
       <span class="badge mono">qwen3-30b-instruct</span>, and
       <span class="badge mono">qwen3-coder-next-80b</span>; <span class="badge mono">vibethinker-3b</span>,
-      <span class="badge mono">gpt-oss-120b</span>, <span class="badge mono">qwen38-27b</span>, and
-      <span class="badge mono">ornith-1.5-35b</span> provide 65,536 per request;
+      <span class="badge mono">gpt-oss-120b</span>, <span class="badge mono">qwen38-27b</span>,
+      <span class="badge mono">ornith-1.5-35b</span>, and <span class="badge mono">inkling-2-mini</span> provide 65,536 per request;
       <span class="badge mono">qwen35-122b-a10b</span> provides 32,768. The
       <span class="badge mono">flint</span> configuration uses 262,144 tokens. Prompt and completion tokens share that window; the output limits documented below
       still apply. VibeThinker works best on
