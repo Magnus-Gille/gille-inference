@@ -63,13 +63,16 @@ GATE_D_INCLUDE_HOLDOUT=1 bash gate-d/run.sh pi all
 GATE_D_LOG=/tmp/gate-d-r2.log GATE_D_INCLUDE_HOLDOUT=1 bash gate-d/sweep.sh
 ```
 
-**pi system-prompt variants.** `GATE_D_PI_APPEND_SYSTEM=<file>` passes a committed file from
+**pi system-prompt variants.** `GATE_D_PI_APPEND_SYSTEM=<file>` passes a file committed at HEAD in
 `gate-d/prompts/` to pi with `--append-system-prompt`, for example
 `GATE_D_PI_APPEND_SYSTEM=verify-before-done.md bash gate-d/run.sh pi all`. Every row records
 `promptVariant` (`none` when unset) and `promptSha256`, so variant runs are never pooled with
-baseline runs. The variable must be a bare file name in that directory and is rejected on other
-arms. A variant run on tasks that earlier runs already scored is a diagnostic A/B, not a fresh
-holdout result.
+baseline runs; `sweep.sh` resumes and summarizes per variant and digest, and counts legacy rows
+without those fields as the baseline. The variable must be a bare file name of a regular file
+committed at HEAD whose working-tree copy is unchanged; the text is read once from the HEAD blob,
+and the digest covers exactly the bytes pi receives. It is rejected on other arms, and a sweep
+fails closed if the committed prompt changes while it runs. A variant run on tasks that earlier
+runs already scored is a diagnostic A/B, not a fresh holdout result.
 
 ## Status
 

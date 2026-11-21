@@ -338,8 +338,28 @@ async function boundedResponse(response: Response, maximumBytes: number, label: 
   if (!response.ok) throw new Error(`${label} request failed with HTTP ${response.status}`);
   const length = response.headers.get("content-length");
   if (length !== null && Number(length) > maximumBytes) throw new Error(`${label} exceeds byte limit`);
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  if (bytes.byteLength > maximumBytes) throw new Error(`${label} exceeds byte limit`);
+  // Count decoded bytes while streaming so an absent or understated Content-Length cannot make
+  // us buffer an oversized body before the cap applies; cancel the stream at the limit.
+  if (response.body === null) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maximumBytes) {
+      await reader.cancel().catch(() => undefined);
+      throw new Error(`${label} exceeds byte limit`);
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
   return new TextDecoder().decode(bytes);
 }
 
@@ -409,9 +429,14 @@ async function assertOnDefaultBranch(
   const seen = new Set<string>();
   while (pageUrl !== null) {
     if (seen.has(pageUrl)) throw new Error("commit-history pagination cycle detected");
-    if (seen.size >= MAX_COMMIT_PAGES) break;
+    if (seen.size >= MAX_COMMIT_PAGES) {
+      throw new Error(
+        `could not establish that pinned revision ${revision} is on the default branch within ${MAX_COMMIT_PAGES} history pages`
+      );
+    }
     seen.add(pageUrl);
-    const response = await fetchImpl(pageUrl, { headers: { accept: "application/json" } });
+    // A redirect would let a response from an unvalidated URL supply the approving commit id.
+    const response = await fetchImpl(pageUrl, { headers: { accept: "application/json" }, redirect: "error" });
     const commits = JSON.parse(await boundedResponse(response, MAX_COMMITS_BYTES, "commit history")) as unknown;
     if (!Array.isArray(commits)) throw new Error("commit history response must be an array");
     if (commits.some((commit) => (commit as { id?: unknown } | null)?.id === revision)) return;

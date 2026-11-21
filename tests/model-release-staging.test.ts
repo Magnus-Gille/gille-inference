@@ -239,6 +239,57 @@ describe("collectPublicStagePlan", () => {
     expect(plan.revision).toBe(REVISION);
   });
 
+  it("refuses redirects on commit-history requests", async () => {
+    const fetchImpl = historyFetch([{ ids: [REVISION] }]);
+    await collectPublicStagePlan("Qwen/Qwen3.8-27B", REVISION, fetchImpl as typeof fetch);
+    const historyCalls = fetchImpl.mock.calls.filter(([url]) => String(url).includes("/commits/main"));
+    expect(historyCalls.length).toBeGreaterThan(0);
+    for (const call of historyCalls) {
+      expect((call as unknown[])[1]).toMatchObject({ redirect: "error" });
+    }
+  });
+
+  it("reports an unresolved history budget distinctly from an absent pin", async () => {
+    const base = "https://huggingface.co/api/models/Qwen/Qwen3.8-27B/commits/main";
+    const pages = Array.from({ length: 50 }, (_, i) => ({ ids: ["a".repeat(40)], next: `${base}?p=${i + 1}` }));
+    const fetchImpl = historyFetch(pages);
+    await expect(
+      collectPublicStagePlan("Qwen/Qwen3.8-27B", REVISION, fetchImpl as typeof fetch)
+    ).rejects.toThrow(/could not establish .* within 50 history pages/);
+  });
+
+  it("cancels an oversized streamed history body without a Content-Length", async () => {
+    let cancelled = false;
+    let pulled = 0;
+    const chunk = new Uint8Array(1024 * 1024).fill(0x20);
+    const endless = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulled += 1;
+        if (pulled > 64) throw new Error("stream was not cancelled at the byte limit");
+        controller.enqueue(chunk);
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const fetchImpl = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith(`/api/models/Qwen/Qwen3.8-27B/revision/${REVISION}`)) {
+        return new Response(
+          JSON.stringify({ id: "Qwen/Qwen3.8-27B", sha: REVISION, private: false, gated: false }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/commits/main")) return new Response(endless, { status: 200 });
+      throw new Error(`unexpected URL: ${url}`);
+    });
+    await expect(
+      collectPublicStagePlan("Qwen/Qwen3.8-27B", REVISION, fetchImpl as typeof fetch)
+    ).rejects.toThrow(/commit history exceeds byte limit/);
+    expect(cancelled).toBe(true);
+    expect(pulled).toBeLessThanOrEqual(6);
+  });
+
   it("rejects an untrusted commit-history page URL", async () => {
     const fetchImpl = historyFetch([{ ids: ["a".repeat(40)], next: "https://evil.example/api/models/x/commits/main" }]);
     await expect(
