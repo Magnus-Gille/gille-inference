@@ -484,8 +484,15 @@ are `null` with `gttAccounting: "unknown"`; an unreadable host-memory snapshot r
 and `status: "unknown"`. The endpoint never returns prompts, responses, tokens, keys, key hashes,
 raw backend commands, backend addresses/IPs, or other content-bearing or credential-bearing fields.
 
-**Response 200:** `{ "models": ResidencyModel[], "hostMemory": HostMemory, "resourceEvidence": ResourceEvidence }` when the model
-snapshot is available. An unknown host-memory observation is returned inside `hostMemory` with
+**Response 200:** `{ "models": ResidencyModel[], "hostMemory": HostMemory, "resourceEvidence": ResourceEvidence, "activityEvidence": ActivityEvidence }` when the model
+snapshot is available. `state: "ready"` means resident and able to accept work, **not** actively
+generating. Activity is reported separately per model and is never inferred: `idle` requires a fresh
+zero from a sample that covers all backend traffic, and anything weaker is `unknown` with a reason.
+No backend activity probe is wired yet, so rows currently report `unknown`/`not_probed`. Gateway
+admission counters appear in `activityEvidence.gateway` as aggregate, gateway-admitted-only
+observations. They can show that the gateway is busy but never that a model or the backend is idle.
+None of these fields authorizes an experiment, unload, or admission change. See
+`src/homeserver/README.md` for the read-only "is it actually working?" check. An unknown host-memory observation is returned inside `hostMemory` with
 null values, without making model residency unavailable. The additive `resourceEvidence` object
 reports the configured host-memory admission mode and a best-effort host-wide cumulative
 `/proc/vmstat` `oom_kill` counter. `oomKillCount` is a cumulative count observed at `observedAt`,
@@ -504,6 +511,14 @@ interface ResidencyModel {
   state: string;
   ttl: number | null;
   classification: "serving" | "ttl_retained" | "unexpected" | "unknown";
+  activity: {
+    state: "active" | "idle" | "unknown";
+    // Null unless state is unknown.
+    reason: "not_probed" | "stale" | "future" | "invalid" | "partial_coverage" | null;
+    coverage: "all_backend_traffic" | "gateway_admitted_only" | null;
+    activeCount: number | null;
+    observedAtMs: number | null;
+  };
   lastUse: {
     ts: number;
     route: string;
@@ -532,7 +547,19 @@ interface ResourceEvidence {
   };
 }
 
-// Successful response: { models: ResidencyModel[], hostMemory: HostMemory, resourceEvidence: ResourceEvidence }
+interface ActivityEvidence {
+  gateway: {
+    coverage: "gateway_admitted_only";
+    perModel: false;
+    inflight: number;
+    ownerQueued: number;
+    maintenance: "off" | "guest" | "exclusive";
+    observedAt: string;
+  };
+  backend: { status: "not_probed" };
+}
+
+// Successful response: { models: ResidencyModel[], hostMemory: HostMemory, resourceEvidence: ResourceEvidence, activityEvidence: ActivityEvidence }
 ```
 
 ### GET `/v1/capabilities/learning-task`

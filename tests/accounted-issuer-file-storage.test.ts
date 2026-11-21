@@ -49,7 +49,9 @@ afterEach(async () => {
     await fs.rm(r.path,{recursive:true});
   }
 });
-describe("LOCAL physical-file issuer CAS backend", () => {
+const ROOT_SKIP = ownerUid === 0;
+if (ROOT_SKIP) console.warn("accounted-issuer-file-storage: skipped as root: these tests exercise owner-only file permissions, which root bypasses; run them as an unprivileged user (INFER-513)");
+describe.skipIf(ROOT_SKIP)("LOCAL physical-file issuer CAS backend", () => {
   it("persists CAS state and a new opaque version through close/reopen", async () => {
     const f=await seeded();const before=await f.backend.storage.read(f.signal);
     expect(before).toEqual({version:f.initial.version,state:{value:0}});

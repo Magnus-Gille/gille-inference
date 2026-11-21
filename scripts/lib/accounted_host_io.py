@@ -75,7 +75,7 @@ class ClockBridge:
         before = integer(boottime()); wall = integer(realtime()); after = integer(boottime())
         require(after >= before and after-before <= 2000, 'clock_sample_uncertain')
         require(self.previous_ns is None or before >= self.previous_ns, 'clock_regression')
-        # Both offset intervals must be within1us even in the worst case. Initial
+        # Both offset intervals must be within 1us even in the worst case. Initial
         # sampling uncertainty consumes this budget; it must never enlarge it.
         require(wall-after >= self.offset_ns+self.uncertainty_ns-1000
                 and wall-before <= self.offset_ns-self.uncertainty_ns+1000, 'clock_bridge_drift')
@@ -1451,7 +1451,7 @@ def _collect_v3_channel(config, *, kernel_charges):
         require(canonical(value['native_envelope']) == canonical(context['native_envelope'])
                 and canonical(value['role_cgroups']) == canonical(context['role_cgroups']), 'worker_v3_live_cgroup_drift')
         require(body['envelope']['allocated_from_boottime_ns'] <= value['observed_from_boottime_ns']
-                <= value['observed_until_boottime_ns'] <= body['envelope']['allocated_until_boottime_ns'], 'cgroup_v3_observation_lease')
+                <= value['observed_until_boottime_ns'] < body['envelope']['allocated_until_boottime_ns'], 'cgroup_v3_observation_lease')
         packet = {'version': 1, 'status': 'observed',
                   'channel': 'cgroup_kernel_charges_v1' if kernel_charges else 'cgroup_envelope_v1',
                   'brokkr_config_digest': config['io']['brokkr_config_digest'], 'value': value}

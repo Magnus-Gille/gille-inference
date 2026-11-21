@@ -17,6 +17,82 @@ export interface SanitizedRunningEntry {
 
 type NumericFact = number | null | undefined;
 
+/**
+ * Activity is a separate question from residency (INFER-376). A model can be resident and
+ * `ready` while nothing is generating. Each sample states which traffic it covers:
+ *  - `all_backend_traffic`: a backend-side observation (for example inference slots) that
+ *    includes direct loopback consumers that bypass the gateway.
+ *  - `gateway_admitted_only`: gateway admission counters. These see only requests that
+ *    entered through the gateway, so a zero here can never prove the backend is idle.
+ */
+export type ModelActivityCoverage = "all_backend_traffic" | "gateway_admitted_only";
+export type ModelActivityState = "active" | "idle" | "unknown";
+export type ModelActivityUnknownReason = "not_probed" | "stale" | "future" | "invalid" | "partial_coverage";
+
+export interface ModelActivitySample {
+  readonly coverage: ModelActivityCoverage;
+  /** Requests or processing slots observed active for this model at observedAtMs. */
+  readonly activeCount: number;
+  readonly observedAtMs: number;
+}
+
+export interface ModelActivity {
+  readonly state: ModelActivityState;
+  /** Why the state is unknown; null when it is active or idle. */
+  readonly reason: ModelActivityUnknownReason | null;
+  /** Provenance of the sample the state rests on; null when no sample supports it. */
+  readonly coverage: ModelActivityCoverage | null;
+  readonly activeCount: number | null;
+  readonly observedAtMs: number | null;
+}
+
+/** Default freshness bound for an activity sample. Older evidence says nothing about now. */
+export const MODEL_ACTIVITY_MAX_AGE_MS = 5_000;
+
+const COVERAGES: ReadonlySet<string> = new Set(["all_backend_traffic", "gateway_admitted_only"]);
+
+function validSample(sample: unknown): sample is ModelActivitySample {
+  if (!isRecord(sample)) return false;
+  const { coverage, activeCount, observedAtMs } = sample as Record<string, unknown>;
+  return typeof coverage === "string" && COVERAGES.has(coverage)
+    && typeof activeCount === "number" && Number.isSafeInteger(activeCount) && activeCount >= 0
+    && typeof observedAtMs === "number" && Number.isFinite(observedAtMs);
+}
+
+const unknownActivity = (reason: ModelActivityUnknownReason): ModelActivity =>
+  ({ state: "unknown", reason, coverage: null, activeCount: null, observedAtMs: null });
+
+/**
+ * Decide active / idle / unknown from explicit samples. Never infers idleness:
+ *  - any fresh sample with positive activity is `active` (positive evidence is sufficient
+ *    whatever its coverage);
+ *  - `idle` needs a fresh zero from a sample that covers all backend traffic;
+ *  - everything else is `unknown` with a reason. A fresh gateway-only zero is
+ *    `partial_coverage`, because direct backend consumers are invisible to it.
+ */
+export function classifyModelActivity(
+  samples: readonly ModelActivitySample[] | undefined,
+  nowMs: number,
+  maxAgeMs: number = MODEL_ACTIVITY_MAX_AGE_MS,
+): ModelActivity {
+  if (!Number.isFinite(nowMs) || !Number.isFinite(maxAgeMs) || maxAgeMs < 0) return unknownActivity("invalid");
+  if (samples === undefined || !Array.isArray(samples) || samples.length === 0) return unknownActivity("not_probed");
+  const valid = samples.filter(validSample);
+  if (valid.length === 0) return unknownActivity("invalid");
+  const fresh = valid.filter((s) => s.observedAtMs <= nowMs && nowMs - s.observedAtMs <= maxAgeMs);
+  const newest = (list: ModelActivitySample[]): ModelActivitySample =>
+    list.reduce((a, b) => (b.observedAtMs > a.observedAtMs ? b : a));
+  const supported = (state: "active" | "idle", s: ModelActivitySample): ModelActivity =>
+    ({ state, reason: null, coverage: s.coverage, activeCount: s.activeCount, observedAtMs: s.observedAtMs });
+  const positive = fresh.filter((s) => s.activeCount > 0);
+  if (positive.length > 0) return supported("active", newest(positive));
+  const completeZero = fresh.filter((s) => s.coverage === "all_backend_traffic");
+  if (completeZero.length > 0) return supported("idle", newest(completeZero));
+  if (fresh.length > 0) return unknownActivity("partial_coverage");
+  if (valid.some((s) => s.observedAtMs > nowMs)) return unknownActivity("future");
+  return unknownActivity("stale");
+}
+
 /** Separately supplied, content-blind facts keyed by the sanitized model name. */
 export interface ModelResidencyFacts {
   readonly lastUseAtMsByModel: Readonly<Record<string, NumericFact>>;
@@ -25,6 +101,8 @@ export interface ModelResidencyFacts {
   readonly activeCountByModel: Readonly<Record<string, NumericFact>>;
   /** An explicit backend expiry observation; absence never means expired. */
   readonly expiresAtMsByModel?: Readonly<Record<string, NumericFact>>;
+  /** Activity samples per model; absence means activity was not probed (unknown). */
+  readonly activitySamplesByModel?: Readonly<Record<string, readonly ModelActivitySample[] | undefined>>;
 }
 
 /** Persistable-friendly input seam for a future store or gateway integration. */
@@ -44,6 +122,8 @@ export interface ModelResidencyDiagnostic {
   readonly activeCount: number | null;
   readonly lastUseAtMs: number | null;
   readonly expiresAtMs: number | null;
+  /** Active / idle / unknown, separate from residency. `ready` never implies active. */
+  readonly activity: ModelActivity;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -118,8 +198,13 @@ export function classifyModelResidency(
   const expiresAtMs = mapValue(facts?.expiresAtMsByModel, safeEntry.model);
   const reliableNow = Number.isFinite(nowMs);
 
+  const samples = isRecord(facts?.activitySamplesByModel) && hasOwn(facts.activitySamplesByModel, safeEntry.model)
+    ? facts.activitySamplesByModel[safeEntry.model]
+    : undefined;
+  const activity = classifyModelActivity(samples, nowMs);
+
   let classification: ModelResidencyClassification = "unknown";
-  if (activeCount !== null && activeCount > 0) {
+  if ((activeCount !== null && activeCount > 0) || activity.state === "active") {
     classification = "serving";
   } else if (reliableNow && expiresAtMs !== null && nowMs >= expiresAtMs) {
     // Expiry is unexpected only because an explicit expiry fact says it elapsed.
@@ -143,6 +228,7 @@ export function classifyModelResidency(
     activeCount,
     lastUseAtMs,
     expiresAtMs,
+    activity,
   };
 }
 

@@ -63,7 +63,9 @@ function accepted(overrides: Record<string, unknown> = {}): any {
   return { ...intent, ...overrides };
 }
 
-for(const action of ["read","reserve-read","reserve-sync"] as const)it("closes both real directory FDs after concurrent "+action,async()=>{
+const ROOT_SKIP=process.geteuid!()===0;
+if(ROOT_SKIP)console.warn("accounted-allocation-close-v3: skipped as root: these tests exercise owner-only file permissions, which root bypasses; run them as an unprivileged user (INFER-513)");
+for(const action of ["read","reserve-read","reserve-sync"] as const)it.skipIf(ROOT_SKIP)("closes both real directory FDs after concurrent "+action,async()=>{
  const ownerUid=process.geteuid!();if(ownerUid===0)throw Error("nonroot only");
  const directory=await fs.mkdtemp(join(await fs.realpath("/tmp"), "allocation-close-"));
  await fs.chmod(directory,0o700);hooks.directory=directory;hooks.pauseAt=action==="reserve-sync"?"sync":"read";

@@ -126,6 +126,11 @@ export function digestAccountedOwnerEvidence(value: unknown): string {
 export function digestAccountedBaseline(value: unknown): string {
   return digest("gille-inference/accounted/accepted-baseline/v1\n", value);
 }
+/** Structural check of an owner context, so callers can refuse before handing any of its
+ * fields (for example `issuerId`) to an external verifier. It proves nothing about authority. */
+export function isStructurallyValidAccountedOwnerContext(value: unknown): boolean {
+  return contextSchema.safeParse(value).success;
+}
 export interface OwnerEvidenceExpectation {
   issuerId: string; requestDigest: string; phase: "admission" | "restoration";
 }

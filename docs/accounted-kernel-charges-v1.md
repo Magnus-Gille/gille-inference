@@ -17,7 +17,7 @@ operation neither reads nor requires the new files.
 Each scope additionally reads six fixed files through the same FD and paired
 file-identity checks: `cpu.stat`, `memory.stat`, `memory.current`,
 `memory.events.local`, `pids.current` and `pids.events.local`. Every read is bounded
-to65536 bytes; enumerations remain bounded to1024 entries, with two passes and
+to 65536 bytes; enumerations remain bounded to 1024 entries, with two passes and
 a maximum one-second observation window. Read refusal is not an arbitrary kernel
 I/O deadline guarantee. Missing/empty/drifted/symlink/writable/unsupported files
 refuse; no missing value becomes zero.
@@ -27,7 +27,7 @@ The inner canonical native packet has channel `cgroup_kernel_charges_v1`, kind
 window, plus exactly two `passes`. Each pass has its enclosing window and exactly
 four `scope_samples` in parent/worker/observer/recovery order. Each sample binds
 its actual device/inode and the six raw file strings. Total inner wire size is
-at most65536 bytes. The helper returns `{bytes:<canonical inner JSON>}` so raw
+at most 65536 bytes. The helper returns `{bytes:<canonical inner JSON>}` so raw
 kernel TAB/LF remains escaped inside printable JSON. Existing strict helper/native
 codecs are unchanged. The fixed bridge verifies the inner packet and preserves
 UNKNOWN on ambiguous transport; no automatic retry occurs.
@@ -36,7 +36,7 @@ The typed verifier selects CPU usage/user/system microseconds and the five fair
 controller counters; memory anon/file/kernel/sock bytes; six local memory event
 counts; the local PID limit event; and current charged-memory/task gauges.
 Selected fields are mandatory. Flat files reject duplicates, malformed or
-negative/nonintegral/oversized values and more than256 rows. Additional numeric
+negative/nonintegral/oversized values and more than 256 rows. Additional numeric
 keys are explicitly unclaimed metadata, with a sorted key profile that must stay
 unchanged. Their values never acquire an invented meaning or completeness label.
 

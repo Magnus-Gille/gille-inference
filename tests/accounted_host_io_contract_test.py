@@ -209,14 +209,14 @@ class BootstrapTests(unittest.TestCase):
         record = {'schemaVersion': 1, 'revision': '0', 'originVersion': None, 'parentVersion': None,
                   'state': state, 'stateDigest': hashlib.sha256(io_helper.canonical(state)).hexdigest()}
         raw = io_helper.canonical(record)
-        journal = {'mandate_id': '7d195545-ccb9-40c9-9d19-577150de149d', 'observer_instance_sha256': 'b'*64,
+        journal = {'mandate_id': '5a5a5a5a-5a5a-4a5a-8a5a-5a5a5a5a5a5a', 'observer_instance_sha256': 'b'*64,
                    'origin_version': hashlib.sha256(b'gille-inference/accounted/file-journal/v1\n'+raw).hexdigest(),
                    'bytes_sha256': hashlib.sha256(raw).hexdigest(), 'bytes': raw.decode()}
         return {'policy': {'mode': 'diagnostic'}, 'registry': {'journal': journal}, 'io': {'host_boot_id': boot}}
 
     def test_bootstrap_is_exact_empty_state_bound_to_origin_boot_and_observer(self):
         config = self.configuration(); path, raw, origin = io_helper.validate_journal_bootstrap(config)
-        self.assertEqual(path, '/var/lib/brokkr-accounted/issuer/7d195545-ccb9-40c9-9d19-577150de149d')
+        self.assertEqual(path, '/var/lib/brokkr-accounted/issuer/5a5a5a5a-5a5a-4a5a-8a5a-5a5a5a5a5a5a')
         self.assertEqual(raw.decode(), config['registry']['journal']['bytes'])
         self.assertEqual(origin, config['registry']['journal']['origin_version'])
         for field in ['host_boot_id', 'observer']:

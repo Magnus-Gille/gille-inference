@@ -13,6 +13,7 @@ const diagnostic = {
   activeCount: 3,
   lastUseAtMs: 123,
   expiresAtMs: 456,
+  activity: { state: "unknown" as const, reason: "not_probed" as const, coverage: null, activeCount: null, observedAtMs: null },
 };
 
 describe("residency CLI extraction and formatting", () => {
@@ -39,6 +40,7 @@ describe("residency CLI extraction and formatting", () => {
         state: "ready",
         ttl: 60,
         classification: "ttl_retained",
+        activity: "unknown:not_probed",
         lastUse: {
           ts: 123,
           route: "/v1/chat/completions",
@@ -47,6 +49,7 @@ describe("residency CLI extraction and formatting", () => {
       },
     ]);
     expect(Object.keys(rows[0] ?? {}).sort()).toEqual([
+      "activity",
       "classification",
       "lastUse",
       "model",
@@ -68,14 +71,26 @@ describe("residency CLI extraction and formatting", () => {
         state: "loading",
         ttl: null,
         classification: "unknown",
+        activity: "unknown:not_probed",
         lastUse: null,
       },
     ];
     const json = formatResidencyOutput(rows, true);
     expect(JSON.parse(json)).toEqual(rows);
     expect(formatResidencyOutput(rows)).toContain("MODEL\tSTATE\tTTL\tCLASSIFICATION");
-    expect(formatResidencyOutput(rows)).toContain("qwen-main\tloading\tnull\tunknown");
+    expect(formatResidencyOutput(rows)).toContain("qwen-main\tloading\tnull\tunknown\tunknown:not_probed");
+    expect(formatResidencyOutput(rows)).toContain("STATE ready means loaded, not generating");
     expect(formatResidencyOutput(rows)).not.toContain("LAST_USE_ALIAS");
     expect(formatResidencyOutput(rows)).not.toMatch(/id|hash|token|prompt|response|content|command|proxy|ip|secret/i);
+  });
+
+  it("renders activity as active, idle, or unknown with its reason (INFER-376)", () => {
+    const base = { ...diagnostic, activeCount: null };
+    const rows = extractResidencyOutput([
+      { ...base, model: "a", activity: { state: "active", reason: null, coverage: "all_backend_traffic", activeCount: 1, observedAtMs: 1 } },
+      { ...base, model: "b", activity: { state: "idle", reason: null, coverage: "all_backend_traffic", activeCount: 0, observedAtMs: 1 } },
+      { ...base, model: "c", activity: { state: "unknown", reason: "partial_coverage", coverage: null, activeCount: null, observedAtMs: null } },
+    ], {});
+    expect(rows.map((r) => r.activity)).toEqual(["active", "idle", "unknown:partial_coverage"]);
   });
 });

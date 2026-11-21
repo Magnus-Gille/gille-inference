@@ -6,7 +6,7 @@ import { types } from "node:util";
 import { z } from "zod";
 import {
   digestAccountedOwnerEvidence, digestAccountedRequest, evaluateAccountedHostPolicyAdapter,
-  type OwnerEvidenceVerifier, type ReplayCommit,
+  isStructurallyValidAccountedOwnerContext, type OwnerEvidenceVerifier, type ReplayCommit,
 } from "./accounted-host-policy-adapter.js";
 
 export const BROKKR_R3_MANIFEST = "af7e8d1cd41ad4fb5750b54bbcb6c25ec3394bc5ddde7e7a6a27e6326621f49d";
@@ -278,6 +278,8 @@ export async function issueAccountedHostAdmission(rawAccepted: unknown, provider
  */
 export function createAccountedIssuerV2(consumerManifestDigest: string): (rawAccepted: unknown, providers?: AccountedIssuerProviders) => Promise<AccountedIssuerResult> {
   const manifestDigest = hex.parse(consumerManifestDigest);
+  // The R3 manifest speaks the v1 wire; configuring it as a v2 consumer would mislabel admissions.
+  if (manifestDigest === BROKKR_R3_MANIFEST) throw new Error("R3 manifest is not a v2 consumer");
   return (rawAccepted, providers) => issueWithConsumer(rawAccepted, providers, {manifestDigest, admissionVersion: 2});
 }
 async function issueWithConsumer(rawAccepted: unknown, providers: AccountedIssuerProviders | undefined,
@@ -298,7 +300,7 @@ async function issueWithConsumer(rawAccepted: unknown, providers: AccountedIssue
     const request = copy(accepted.request) as Record<string, unknown>;
     need(digestAccountedRequest(request) === request.requestDigest && request.requestId === accepted.requestId
       && request.attemptId === accepted.policyAttemptId && request.actorUid === 1000, "request_binding");
-    // R3 cannot enforce tighter payload/stop/runtime windows than its fixed20/5/30 implementation.
+    // R3 cannot enforce tighter payload/stop/runtime windows than its fixed 20/5/30 implementation.
     need((request.workMaxSeconds as number) >= 20 && (request.stopMaxSeconds as number) >= 5
       && (request.totalMaxSeconds as number) >= 30, "unsupported_native_timing");
     const clock = (): {boot: bigint; utc: string} => { const c = copy(p.clock()) as IssuerClock; utcMicros(c.utc); return {boot: BigInt(ns.parse(c.boottimeNs)), utc: c.utc}; };
@@ -355,6 +357,8 @@ async function issueWithConsumer(rawAccepted: unknown, providers: AccountedIssue
         && c.boot + BigInt(host.wholeTaskMaxSeconds) * 1000000000n <= BigInt(host.expiresBoottimeNs)
         && utcMicros(c.utc) + BigInt(host.wholeTaskMaxSeconds) * 1000000n <= utcMicros(request.deadline)
         && utcMicros(c.utc) + BigInt(host.wholeTaskMaxSeconds) * 1000000n <= utcMicros(context.expiresAt), "whole_task_window_unproved");
+      // Validate the context before any of its fields reach the external owner verifier.
+      need(isStructurallyValidAccountedOwnerContext(context), "owner_context_invalid");
       const verifiedOwner = copy(p.verifyOwnerEvidence(host.ownerEnvelope, Object.freeze({issuerId: context.issuerId as string, requestDigest: expectation.requestDigest, phase: "admission"})));
       const decision = evaluateAccountedHostPolicyAdapter(request, host.ownerEnvelope, context, () => verifiedOwner);
       need(decision.compatible && decision.replayCommit, "policy_refused");

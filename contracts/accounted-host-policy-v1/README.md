@@ -114,6 +114,17 @@ positive result means only that the supplied values are structurally and
 policy-compatible for this offline check. It does not prove that a service is
 installed, available, running, isolated, or safe to restart.
 
+## Restoration limitation in v1
+
+v1 applies the admission clock rules to the restoration `baseline` as well: the
+baseline must be no older than `observationMaxAgeMs`, not in the future, and not
+past the deadline. A real baseline is captured before the run, so once the run
+has taken longer than `observationMaxAgeMs` restoration refuses it as
+`observation_stale`. **v1 restoration is therefore not usable for real runs.**
+The suite pins this refusal so it cannot change silently. Defining separate
+baseline time rules (for example, baseline before first work and within the
+deadline) is a v2 contract change.
+
 ## Proposed flat-core projection
 
 The plan and observation retain nested `bindings` for this contract. The pure
@@ -147,7 +158,9 @@ authentication, host-adapter, launcher, or cleanup proofs.
 ## Synthetic examples
 
 `examples/` contains content-free fixture inputs and results, including a
-positive admission, a negative admission, and manifest digests. Fixture host
+positive admission, a negative admission, and manifest digests. Each result is
+the admission decision at the synthetic clock `2030-01-01T00:00:00.000Z`, and the
+suite deep-equals every committed result and recomputes the manifest digests. Fixture host
 and service identifiers are deliberately synthetic and do not describe a
 real inventory or allocation.
 

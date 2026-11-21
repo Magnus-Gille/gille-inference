@@ -138,7 +138,7 @@ class CgroupBindingTests(unittest.TestCase):
             self.assert_refusal(lambda candidate=candidate: accounted_host_io.validate_brokkr_v3_configuration(candidate))
 
     def test_read_rules_reject_secrets_duplicates_and_wrong_tree(self):
-        secret = dict(self.body, read_files=[*self.body["read_files"], {"path": "/home/magnus/.env", "sha256": "9" * 64}])
+        secret = dict(self.body, read_files=[*self.body["read_files"], {"path": "/home/fixture-owner/.env", "sha256": "9" * 64}])
         self.assert_refusal(lambda: accounted_host_io.validate_brokkr_v3_configuration(secret))
         duplicate = dict(self.body, read_files=[*self.body["read_files"], dict(self.body["read_files"][0])])
         self.assert_refusal(lambda: accounted_host_io.validate_brokkr_v3_configuration(duplicate))

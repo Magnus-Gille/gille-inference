@@ -5,12 +5,12 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import {
-  JOURNEY_ID, STEP_IDS, deliverOutcome, runReadinessAttempt, validateOutcome,
+  JOURNEY_ID, STEP_IDS, boundedJson, deliverOutcome, runReadinessAttempt, safeGatewayOrigin, validateOutcome,
   type JourneyOutcome,
 } from "../src/homeserver/readiness-journey.js";
 
 const KEY = "monitor-key-SECRET-123";
-const BASE = { gatewayUrl: "http://gateway.test:8080", monitorKey: KEY, version: "gille-inference@1.2.3" };
+const BASE = { gatewayUrl: "https://gateway.test:8443", monitorKey: KEY, version: "gille-inference@1.2.3" };
 
 function res(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -139,15 +139,86 @@ describe("runReadinessAttempt", () => {
     ]);
   });
 
-  it("sends the monitor key only as a Bearer header to the two read-only routes", async () => {
+  it("sends the monitor key only as a Bearer header to /models/residency, never to public /healthz", async () => {
     const fetchFn = router(healthy) as unknown as ReturnType<typeof vi.fn>;
     await runReadinessAttempt({ ...BASE, now: clock(), fetchFn: fetchFn as unknown as typeof fetch });
     const calls = fetchFn.mock.calls as [string, RequestInit][];
     expect(calls.map(([u]) => new URL(String(u)).pathname)).toEqual(["/healthz", "/models/residency"]);
-    for (const [, init] of calls) {
-      expect(init.method).toBe("GET");
-      expect((init.headers as Record<string, string>)["Authorization"]).toBe(`Bearer ${KEY}`);
+    for (const [, init] of calls) expect(init.method).toBe("GET");
+    expect((calls[0]![1].headers as Record<string, string>)["Authorization"]).toBeUndefined();
+    expect((calls[1]![1].headers as Record<string, string>)["Authorization"]).toBe(`Bearer ${KEY}`);
+  });
+
+  it("refuses a plain-http non-loopback or userinfo gateway URL before sending the key (INFER-517)", async () => {
+    for (const gatewayUrl of [
+      "http://gateway.test:8080",
+      "http://10.0.0.5:8080",
+      "http://127.0.0.1.example:8080",
+      "https://user:pass@gateway.test",
+    ]) {
+      const fetchFn = vi.fn() as unknown as typeof fetch;
+      const o = await runReadinessAttempt({ ...BASE, gatewayUrl, now: clock(), fetchFn });
+      expect(o.runner_outcome).toBe("failed");
+      expect(o.error_class).toBe("runner-config");
+      expect(fetchFn).not.toHaveBeenCalled();
+      expect(validateOutcome(o)).toEqual([]);
     }
+  });
+
+  it("allows plain http only to a loopback gateway", async () => {
+    expect(safeGatewayOrigin("http://127.0.0.1:8080")).toBe("http://127.0.0.1:8080");
+    expect(safeGatewayOrigin("http://localhost:8080/ignored")).toBe("http://localhost:8080");
+    expect(safeGatewayOrigin("http://[::1]:8080")).toBe("http://[::1]:8080");
+    expect(safeGatewayOrigin("https://gateway.test")).toBe("https://gateway.test");
+    expect(safeGatewayOrigin("http://gateway.test")).toBeNull();
+    expect(safeGatewayOrigin(undefined)).toBeNull();
+    const o = await runReadinessAttempt({ ...BASE, gatewayUrl: "http://127.0.0.1:8080", now: clock(), fetchFn: router(healthy) });
+    expect(o.outcome).toBe("pass");
+  });
+
+  it("classifies an oversized residency body as invalid-response", async () => {
+    const big = JSON.stringify({ models: [], pad: "x".repeat(70 * 1024) });
+    const o = await runReadinessAttempt({
+      ...BASE, now: clock(),
+      fetchFn: router({ ...healthy, "/models/residency": () => new Response(big, { status: 200 }) }),
+    });
+    expect(o.outcome).toBe("fail");
+    expect(o.error_class).toBe("invalid-response");
+  });
+});
+
+describe("boundedJson", () => {
+  function streamOf(chunks: number, chunkBytes: number, onPull: () => void): ReadableStream<Uint8Array> {
+    let sent = 0;
+    return new ReadableStream<Uint8Array>({
+      pull(controller) {
+        onPull();
+        if (sent >= chunks) { controller.close(); return; }
+        sent += 1;
+        controller.enqueue(new Uint8Array(chunkBytes).fill(0x20));
+      },
+    });
+  }
+
+  it("stops reading once the stream passes the bound instead of buffering the whole body", async () => {
+    let pulls = 0;
+    const body = streamOf(1000, 16 * 1024, () => { pulls += 1; });
+    await expect(boundedJson(new Response(body), 64 * 1024)).rejects.toMatchObject({ name: "ResponseTooLarge" });
+    expect(pulls).toBeLessThan(10);
+  });
+
+  it("refuses a declared Content-Length over the bound without reading the body", async () => {
+    let pulls = 0;
+    const body = streamOf(1, 10, () => { pulls += 1; });
+    const r = new Response(body, { headers: { "content-length": String(1024 * 1024) } });
+    await expect(boundedJson(r, 64 * 1024)).rejects.toMatchObject({ name: "ResponseTooLarge" });
+    expect(pulls).toBeLessThanOrEqual(1);
+  });
+
+  it("parses a body within the bound and returns null for non-JSON", async () => {
+    expect(await boundedJson(new Response(JSON.stringify({ ok: true })))).toEqual({ ok: true });
+    expect(await boundedJson(new Response("not json"))).toBeNull();
+    expect(await boundedJson(new Response(null))).toBeNull();
   });
 });
 

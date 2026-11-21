@@ -1,7 +1,7 @@
 import {describe,expect,it} from "vitest";
 import {createHash} from "node:crypto";
 import {accountedIssuerJournalDirectory,planAccountedIssuerJournalBootstrap} from "../src/homeserver/accounted-issuer-bootstrap.js";
-const input={mandateId:"7d195545-ccb9-40c9-9d19-577150de149d",hostBootId:"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",observerInstanceSha256:"b".repeat(64)};
+const input={mandateId:"5a5a5a5a-5a5a-4a5a-8a5a-5a5a5a5a5a5a",hostBootId:"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",observerInstanceSha256:"b".repeat(64)};
 describe("create-only journal artifact; no host effects",()=>{
   it("plans one exact root-owned empty replay journal bound to boot and observer",()=>{
     const plan=planAccountedIssuerJournalBootstrap(input),record=JSON.parse(plan.journal.bytes);

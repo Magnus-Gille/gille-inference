@@ -106,6 +106,16 @@ it("refuses a cgroup read taking more than the fixed one-second observation boun
   expectRefusal(() => validateCgroupChannelV1(rawChannel(challenge, 100n, 1_000_000_101n), expected));
 });
 
+it("treats the lease as half-open: an observation ending exactly at allocated_until is refused (INFER-513)", () => {
+  const {challenge} = fixture();
+  challenge.native_role_scopes.forEach(role => { role.stop_by_boottime_ns = 10_000n; });
+  const challengeJson = canonicalNative(challenge);
+  const binding = JSON.parse(runBinding(challengeJson, challenge));
+  const expected = {challengeJson, runBindingJson: canonicalNative(binding), allocation: allocation(), nowNs: 2_000n, maximumAgeNs: 5_000_000_000n};
+  expect(() => validateCgroupChannelV1(rawChannel(challenge, 900n, 999n), expected)).not.toThrow();
+  expectRefusal(() => validateCgroupChannelV1(rawChannel(challenge, 900n, 1000n), expected));
+});
+
 describe("cgroup channel closed payload", () => {
   it("accepts the exact observed payload and exposes no authority flags", () => {
     const {challenge, expected} = fixture();

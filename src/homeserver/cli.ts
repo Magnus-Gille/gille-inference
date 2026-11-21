@@ -367,6 +367,8 @@ export interface ResidencyOutputRow {
   state: string;
   ttl: number | null;
   classification: ModelResidencyDiagnostic["classification"];
+  /** `active`, `idle`, or `unknown:<reason>` (INFER-376). Separate from STATE: ready ≠ busy. */
+  activity: string;
   lastUse: Pick<LatestSuccessfulModelUse, "ts" | "route" | "outcome"> | null;
 }
 
@@ -382,6 +384,11 @@ export function extractResidencyOutput(
       state: diagnostic.state,
       ttl: diagnostic.ttlSeconds,
       classification: diagnostic.classification,
+      activity: diagnostic.activity === undefined
+        ? "unknown:not_probed"
+        : diagnostic.activity.state === "unknown"
+          ? `unknown:${diagnostic.activity.reason ?? "invalid"}`
+          : diagnostic.activity.state,
       lastUse:
         use === undefined || use === null
           ? null
@@ -395,7 +402,7 @@ export function formatResidencyOutput(rows: readonly ResidencyOutputRow[], json 
   if (json) return JSON.stringify(rows, null, 2);
   if (rows.length === 0) return "No running models.";
 
-  const header = "MODEL\tSTATE\tTTL\tCLASSIFICATION\tLAST_USE_TS\tLAST_USE_ROUTE\tLAST_USE_OUTCOME";
+  const header = "MODEL\tSTATE\tTTL\tCLASSIFICATION\tACTIVITY\tLAST_USE_TS\tLAST_USE_ROUTE\tLAST_USE_OUTCOME";
   const lines = rows.map((row) => {
     const lastUse = row.lastUse;
     return [
@@ -403,12 +410,14 @@ export function formatResidencyOutput(rows: readonly ResidencyOutputRow[], json 
       row.state,
       row.ttl === null ? "null" : String(row.ttl),
       row.classification,
+      row.activity,
       lastUse === null ? "null" : String(lastUse.ts),
       lastUse === null ? "null" : lastUse.route,
       lastUse === null ? "null" : lastUse.outcome,
     ].join("\t");
   });
-  return [header, ...lines].join("\n");
+  const note = "Note: STATE ready means loaded, not generating. ACTIVITY is observed separately; unknown never means free.";
+  return [header, ...lines, "", note].join("\n");
 }
 
 async function cmdResidency(args: ParsedArgs): Promise<void> {

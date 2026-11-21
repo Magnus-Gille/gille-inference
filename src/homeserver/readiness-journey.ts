@@ -6,7 +6,7 @@
  * `POST /api/synthetic-journeys` (contract owned by heimdall/src/synthetic-journeys.js, HEIM-49).
  *
  * Steps (exactly the two declared ones, bound to one attempt):
- *   - `gateway-readiness`: GET /healthz answers 200 `{ok:true}`.
+ *   - `gateway-readiness`: GET /healthz (public; sent without the key) answers 200 `{ok:true}`.
  *   - `model-readiness`:   GET /models/residency answers 200 with a `models` array, i.e. the
  *                          inference backend's running snapshot is observable. A 503
  *                          `{status:"unavailable"}` is a dependency failure. An idle backend (empty
@@ -100,7 +100,7 @@ export function validateOutcome(value: JourneyOutcome): string[] {
 }
 
 export interface ReadinessOptions {
-  /** Gateway origin, e.g. http://127.0.0.1:8080. */
+  /** Gateway origin: https, or plain http only to loopback (e.g. http://127.0.0.1:8080). */
   gatewayUrl: string | undefined;
   /** Read-only monitor-scope key (never logged, never in the outcome). */
   monitorKey: string | undefined;
@@ -124,13 +124,38 @@ function classifyError(err: unknown): string {
   return "dependency-network";
 }
 
-async function boundedJson(res: Response): Promise<unknown> {
-  const text = await res.text();
-  if (Buffer.byteLength(text, "utf8") > MAX_BODY_BYTES) {
-    const e = new Error("too large");
-    e.name = "ResponseTooLarge";
-    throw e;
+function tooLarge(): Error {
+  const e = new Error("too large");
+  e.name = "ResponseTooLarge";
+  return e;
+}
+
+/**
+ * Read at most MAX_BODY_BYTES of the body, then parse it as JSON (null when unparseable). A
+ * declared or streamed length over the bound cancels the body instead of buffering it, so a
+ * hostile or broken upstream cannot make the runner hold more than the bound in memory.
+ */
+export async function boundedJson(res: Response, maxBytes = MAX_BODY_BYTES): Promise<unknown> {
+  const declared = Number(res.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await res.body?.cancel().catch(() => undefined);
+    throw tooLarge();
   }
+  if (!res.body) return null;
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => undefined);
+      throw tooLarge();
+    }
+    chunks.push(value);
+  }
+  const text = Buffer.concat(chunks, total).toString("utf8");
   try { return JSON.parse(text); } catch { return null; }
 }
 
@@ -138,7 +163,7 @@ interface Observation { ok: boolean; errorClass: string | null; latencyMs: numbe
 
 async function observe(
   url: string,
-  key: string,
+  key: string | null,
   fetchFn: typeof fetch,
   timeoutMs: number,
   now: () => number,
@@ -149,7 +174,7 @@ async function observe(
     const res = await fetchFn(url, {
       method: "GET",
       redirect: "error",
-      headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
+      headers: key === null ? { Accept: "application/json" } : { Authorization: `Bearer ${key}`, Accept: "application/json" },
       signal: AbortSignal.timeout(timeoutMs),
     });
     const latencyMs = Math.min(MAX_LATENCY_MS, Math.max(0, Math.round(now() - t0)));
@@ -202,21 +227,17 @@ export async function runReadinessAttempt(opts: ReadinessOptions): Promise<Journ
     steps: STEP_IDS.map((id) => step(id, "skipped", null, "runner-unavailable")),
   });
 
-  let origin: string;
-  try {
-    const parsed = new URL(opts.gatewayUrl ?? "");
-    if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("protocol");
-    origin = parsed.origin;
-  } catch {
-    return runnerFailure("runner-config");
-  }
+  const origin = safeGatewayOrigin(opts.gatewayUrl);
+  if (origin === null) return runnerFailure("runner-config");
   if (!opts.monitorKey) return runnerFailure("runner-config");
 
   const fetchFn = opts.fetchFn ?? fetch;
   const timeoutMs = opts.timeoutMs ?? 5000;
-  // The monitor key is the runner's own credential, and /healthz is unauthenticated, so a
-  // rejected key surfaces on either route. That is a runner failure, not gateway/model failure.
-  const gateway = await observe(`${origin}/healthz`, opts.monitorKey, fetchFn, timeoutMs, now, acceptHealthz);
+  // GET /healthz is a public liveness route, so the monitor key is not sent there. The key is
+  // presented only to /models/residency, where the gateway checks it. A 401/403 on either route
+  // (for /healthz that would be an authenticating proxy in front of the gateway) means the runner
+  // cannot authenticate: a runner failure, not a gateway or model failure.
+  const gateway = await observe(`${origin}/healthz`, null, fetchFn, timeoutMs, now, acceptHealthz);
   const steps: JourneyStep[] = [];
   let errorClass: string | null = null;
   if (gateway.errorClass === "auth-denied") return runnerFailure("runner-auth");
@@ -267,14 +288,33 @@ export interface DeliveryResult {
   error?: string;
 }
 
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+/**
+ * Shared transport rule for every URL that carries a credential: https, or plain http only to a
+ * loopback host, and never userinfo in the URL. A misconfigured plain-http remote host would
+ * otherwise send the bearer key in cleartext.
+ */
+function credentialSafeUrl(u: URL): boolean {
+  const transportOk = u.protocol === "https:" || (u.protocol === "http:" && LOOPBACK_HOSTS.has(u.hostname));
+  return transportOk && u.username === "" && u.password === "";
+}
+
+/** Gateway origin for the monitor key, or null when the URL is unusable or unsafe. */
+export function safeGatewayOrigin(raw: string | undefined): string | null {
+  try {
+    const u = new URL(raw ?? "");
+    return credentialSafeUrl(u) ? u.origin : null;
+  } catch {
+    return null;
+  }
+}
+
 /** https only (plain http solely for loopback), exact ingest path, no userinfo/query/fragment. */
 function safeDeliveryUrl(raw: string): boolean {
   try {
     const u = new URL(raw);
-    const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(u.hostname);
-    return (u.protocol === "https:" || (u.protocol === "http:" && loopback)) &&
-      u.pathname === "/api/synthetic-journeys" && u.username === "" && u.password === "" &&
-      u.search === "" && u.hash === "";
+    return credentialSafeUrl(u) && u.pathname === "/api/synthetic-journeys" && u.search === "" && u.hash === "";
   } catch {
     return false;
   }

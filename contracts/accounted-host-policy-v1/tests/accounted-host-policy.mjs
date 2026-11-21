@@ -424,3 +424,42 @@ test('malformed JSON activity objects fail closed without numeric coercion', () 
     }
   }
 });
+
+// INFER-513: the committed examples are a contract, so pin them to the implementation.
+// Evaluation clock for every example: the same synthetic NOW as this suite.
+test('committed examples evaluate to their committed results and manifest hashes', async () => {
+  const { readFileSync } = await import('node:fs');
+  const read = (name) => JSON.parse(readFileSync(new URL(`../examples/${name}`, import.meta.url), 'utf8'));
+  for (const kind of ['positive', 'negative']) {
+    assert.deepEqual(evaluateAdmission(read(`${kind}-input.json`), NOW), read(`${kind}-result.json`), kind);
+  }
+  const positive = read('positive-input.json');
+  const hashes = read('manifest-hashes.json');
+  const strip = ({ digest: _digest, ...body }) => body;
+  assert.equal(digestProtectedManifest(strip(positive.protectedManifest)), hashes.protectedManifestDigest);
+  assert.equal(digestOwnerAllocation(strip(positive.plan.ownerAllocation)), hashes.ownerAllocationDigest);
+  assert.equal(digestControlPlaneAccounting(strip(positive.plan.controlPlaneAccounting)), hashes.controlPlaneAccountingDigest);
+});
+
+// INFER-513: v1 applies admission freshness and deadline rules to the restoration baseline.
+// A real pre-run baseline is older than observationMaxAgeMs by the time restoration runs, so
+// v1 restoration cannot admit it. This pins the documented limitation until v2 defines
+// baseline time rules; it must not silently start admitting stale baselines.
+test('v1 restoration refuses a baseline older than observationMaxAgeMs (documented limitation)', () => {
+  const input = makeInput();
+  input.baseline = structuredClone(input.observation);
+  input.baseline.observedAt = '2029-12-31T23:59:50.000000Z';
+  const result = evaluateRestoration(input, NOW);
+  assert.equal(result.admit, false);
+  assert.ok(result.reasons.includes('observation_stale'));
+  assert.equal(result.executionAuthorized, false);
+});
+
+test('the typed module surface exports every runtime export', async () => {
+  const { readFileSync } = await import('node:fs');
+  const mod = await import('../accounted-host-policy.mjs');
+  const dts = readFileSync(new URL('../accounted-host-policy.d.mts', import.meta.url), 'utf8');
+  for (const name of Object.keys(mod)) {
+    assert.match(dts, new RegExp(`export (?:declare )?(?:function|const) ${name}\\b`), name);
+  }
+});

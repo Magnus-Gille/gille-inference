@@ -191,7 +191,7 @@ NODE_OPTIONS=--no-deprecation tsx src/homeserver/cli.ts \
 | `POST /delegate` | **owner-admin** | Orchestrated evidence-writing path: `{prompt, taskType?, systemPrompt?, maxTokens?, modelId?, temperature?, topP?, topK?, minP?, frontierModelId?, delegatorModelId?, premiumBaselineModelId?, verifier?, responseFormat?, learningTaskStamp?}`. A stamp opts the real Hugin inference lane into v1, requires explicit matching `taskType`, and returns `learningTaskGatewayEcho`; unstamped traffic remains legacy/ineligible. Sampling controls are validated and threaded to the local call. `modelId`/`frontierModelId` pin the local model + optional frontier fallback; `verifier` grades output so the ledger learns; `responseFormat` optionally grammar-constrains decode. Agent/guest → `403 route_not_allowed`. See `docs/gateway-api-contract.md`. |
 | `POST /admin/task-exposures/lookup` | **minted owner-admin** | Content-blind batch freshness lookup for the automatic evaluation factory. Accepts 1–100 exact `trim-utf8-sha256-v1` task fingerprints and returns seen/unknown plus first/last time, lane/model/harness metadata, and an explicit coverage window. Never returns raw task text. Agent, guest, monitor, and identity-less static admins → `403`; `Cache-Control: no-store`. See `docs/task-exposure-contract.md`. |
 | `GET /models` | user | Models on disk + loaded. Decision and embedding models appear only when enabled and explicitly granted to guest keys. |
-| `GET /models/residency` | **admin or monitor** | Read-only, content-blind model-residency diagnostics. Admin output may include the safe `lastUse.alias`; monitor output omits `alias`. Snapshot failure returns HTTP `503 {status:"unavailable",resourceEvidence:{...}}` with no `models` array. Only safe model/state/TTL/classification/last-use fields are returned — never content, tokens, keys, hashes, raw backend commands, or backend addresses/IPs. |
+| `GET /models/residency` | **admin or monitor** | Read-only, content-blind model-residency diagnostics. Admin output may include the safe `lastUse.alias`; monitor output omits `alias`. Snapshot failure returns HTTP `503 {status:"unavailable",resourceEvidence:{...}}` with no `models` array. Only safe model/state/TTL/classification/activity/last-use fields and aggregate gateway counters are returned — never content, tokens, keys, hashes, raw backend commands, or backend addresses/IPs. |
 | `GET /ops/summary` | **admin or monitor** | Small, durable M5 activity summary for Heimdall: current in-flight count, last-use time, trailing-24-hour and seven-day request/time totals, plus seven UTC-calendar days newest-first. Counts only admitted M5 compute rows and excludes the outer `/mcp` transport row, so one MCP ask is never counted twice. Includes the content-blind `filterEpoch` (`m5-admitted-compute-v2`) so pre-epoch route-only history is treated as a historical break. No aliases, keys, tokens, content, or per-model dimensions. |
 | `GET /ops/incidents?from=EPOCH_MS&to=EPOCH_MS&limit=N` | **minted owner-admin** | Read-only, content-blind retained request metadata for a window up to 24 hours and 500 rows. Other scopes, static-admin, and implicit legacy admin callers are denied. Responses explicitly report retained-row coverage and do not establish causality. See the [reliability diagnostics guide](../../docs/reliability-diagnostics.md). |
 | `scripts/export-m5-adoption-evidence.ts` | local operator | Read-only JSON evidence bundle for an exact full-UTC-day `[from, throughExclusive)` window. Uses the shared `m5-admitted-compute-v2` predicate, UTC-day/tier/route/node/model and exclusion reconciliation, closed adoption dimensions, a bounded current M5 task×model×verifier×source×outcome matrix, exclusive delegation state counts, current/stale/missing judge-policy coverage, cost/attribution/calibration coverage, finite privacy buckets, evidence-only maturity labels, explicit threshold states, promotion readiness, and a deterministic next action. Refuses active WAL/live snapshots and missing schema; writes only to stdout. |
@@ -224,9 +224,9 @@ exposed through the configured per-model API contract. This does not qualify run
 context, or decision quality; unknown model IDs retain the legacy 26-option API maximum.
 
 
-`GET /models/residency` returns `200 {models:[...],hostMemory:{...},resourceEvidence:{...}}` when the backend snapshot is
+`GET /models/residency` returns `200 {models:[...],hostMemory:{...},resourceEvidence:{...},activityEvidence:{...}}` when the backend snapshot is
 available. Each model row contains only `model`, `state`, `ttl`, `classification` (`serving`,
-`ttl_retained`, `unexpected`, or `unknown`), and `lastUse` (`ts`, `route`, `outcome`, or `null`).
+`ttl_retained`, `unexpected`, or `unknown`), `activity` (see below), and `lastUse` (`ts`, `route`, `outcome`, or `null`).
 Admin output may also contain `lastUse.alias`; monitor output deliberately omits it. The content-blind
 `hostMemory` object reports total RAM, `MemAvailable`, free CMA, and best-effort DRM GTT used/total
 bytes. GTT counters are device-wide and always marked `unattributed` when present; they cannot say
@@ -241,6 +241,40 @@ configured host-memory `admissionMode` and a best-effort host-wide cumulative `/
 inference-readiness signal. Missing, malformed, or unreadable OOM evidence is explicit
 `status:"unknown"` with null count and timestamp. During a model-snapshot outage, the 503 response still includes `resourceEvidence` but no `models` array; the counter does not identify the outage's cause. `shadow` mode reports observations but does not
 enforce admission decisions.
+
+**Resident is not active (INFER-376).** Four questions are kept apart, and each has its own
+evidence:
+
+1. **Resident / loaded**: `state` (for example `ready`) and `ttl` from the backend's running
+   snapshot. `ready` means the model occupies memory and can accept work. It does **not** mean
+   anything is generating.
+2. **Active inference**: each row's `activity` is `active`, `idle`, or `unknown` with a `reason`
+   (`not_probed`, `stale`, `future`, `invalid`, `partial_coverage`), plus the `coverage`,
+   `activeCount` and `observedAtMs` of the sample it rests on. `idle` requires a fresh (≤5 s) zero
+   from a sample covering **all backend traffic**, including direct loopback consumers that bypass
+   the gateway. Any fresh positive sample is `active`. Everything else is `unknown`, never a
+   guessed idle or busy.
+3. **Activity unknown**: no backend activity probe is wired yet, so every row currently reports
+   `unknown`/`not_probed`. The top-level `activityEvidence.gateway` shows the gateway's aggregate
+   `inflight`, `ownerQueued` and maintenance state with `coverage:"gateway_admitted_only"` and
+   `perModel:false`. A non-zero count shows that the gateway is busy. A zero count does **not**
+   show that a model or the backend is idle, because direct backend traffic is invisible to it.
+4. **Experiment readiness**: prior residency, the GPU lease, maintenance and host-memory admission
+   can still refuse an experiment while nothing is active. Residency and activity never authorize
+   starting work, unloading, or relaxing those safeguards.
+
+A TTL-retained model (`classification:"ttl_retained"`) stays loaded until its TTL elapses after
+the last use. That is retention, not work in progress.
+
+Minimal "is it actually working?" check, all read-only (no inference, warmup, unload or
+maintenance change):
+
+1. `GET /models/residency`: `state` says what is loaded, and `activity` says whether it is
+   observed working. Treat `unknown` as unknown.
+2. `GET /admin/maintenance` (admin): `inflight` and `ownerQueued` cover gateway-admitted work only.
+3. For a definitive idle answer before an experiment, an operator on the host reads the backend's
+   own slot or processing state (for example llama-server `/slots` `is_processing`) for each resident
+   model and records the observation time. Do not probe through a route that can load a model.
 
 **Credits vs. daily budget.** `creditLimit` is a **lifetime, non-resetting** total-token cap
 (0 = unlimited) — when `creditsUsed >= creditLimit` the key is refused with `402
@@ -1124,8 +1158,13 @@ HEIM-49) to `POST /api/synthetic-journeys`. Exactly two steps run in one attempt
 proves the backend snapshot is observable, not that a given model is loaded, and it never grades
 model quality. Missing config or a rejected monitor key is a *runner* failure (`runner_outcome:"failed"`, outcome
 `unknown`, `runner-config`/`runner-auth`), distinct from a dependency failure; the script then exits
-non-zero so the broken runner is visible in systemd (Heimdall does not alert on `unknown`). The
-Heimdall URL must be https (plain http only for loopback) with the exact ingest path. Nothing from a response (model names, aliases, bodies) and no
+non-zero so the broken runner is visible in systemd (Heimdall does not alert on `unknown`). Both
+credential-bearing URLs follow one transport rule: https, or plain http only to a loopback host
+(`127.0.0.1`, `localhost`, `[::1]`), and no userinfo. A plain-http remote `GATEWAY_READINESS_URL` is a
+`runner-config` failure before any request, so the monitor key never travels in cleartext. The key
+is sent only to `/models/residency`; public `/healthz` is called without it. Response bodies are read
+with a hard 64 KiB bound that stops the stream rather than buffering it. The
+Heimdall URL must also use the exact ingest path. Nothing from a response (model names, aliases, bodies) and no
 key is copied into the outcome. Delivery retries re-send the identical attempt (idempotent in
 Heimdall); the script also exits non-zero when delivery fails.
 

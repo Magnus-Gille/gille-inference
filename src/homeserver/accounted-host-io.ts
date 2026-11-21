@@ -22,21 +22,24 @@ export class AccountedHostIoError extends Error {
     super(code, {cause}); this.name = "AccountedHostIoError";
   }
 }
-function need(value: unknown, code: string): asserts value {
-  if (!value) throw new AccountedHostIoError(code, "refused", "configuration");
+/** Local validation is a refusal labelled with the operation that ran it. Checks inside a
+ * write or consumed-read path keep the default label on purpose: the surrounding catch then
+ * re-wraps them as `unknown` for that operation instead of letting a `refused` escape. */
+function need(value: unknown, code: string, operation: string = "configuration"): asserts value {
+  if (!value) throw new AccountedHostIoError(code, "refused", operation);
 }
-function object(value: unknown): Record<string,unknown> {
-  need(value !== null && typeof value === "object" && !Array.isArray(value), "helper_result_shape");
+function object(value: unknown, operation?: string): Record<string,unknown> {
+  need(value !== null && typeof value === "object" && !Array.isArray(value), "helper_result_shape", operation);
   return value as Record<string,unknown>;
 }
-function exact(value: Record<string,unknown>, keys: string[]): void {
-  need(Object.keys(value).sort().join(",") === [...keys].sort().join(","), "helper_result_shape");
+function exact(value: Record<string,unknown>, keys: string[], operation?: string): void {
+  need(Object.keys(value).sort().join(",") === [...keys].sort().join(","), "helper_result_shape", operation);
 }
-function clockValue(value: unknown): IssuerClock {
-  const c = object(value); exact(c, ["boottimeNs","utc"]);
+function clockValue(value: unknown, operation?: string): IssuerClock {
+  const c = object(value, operation); exact(c, ["boottimeNs","utc"], operation);
   need(typeof c.boottimeNs === "string" && /^(0|[1-9][0-9]{0,18})$(?![\s\S])/.test(c.boottimeNs)
     && BigInt(c.boottimeNs) < 2n**63n && typeof c.utc === "string"
-    && /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$(?![\s\S])/.test(c.utc), "helper_clock");
+    && /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$(?![\s\S])/.test(c.utc), "helper_clock", operation);
   return {boottimeNs:c.boottimeNs,utc:c.utc};
 }
 
@@ -109,7 +112,7 @@ export function createAccountedHostIoBridge(binding: Readonly<AccountedIoBinding
       return parsed;
     },
     initializeClock(): IssuerClock {return writeAcknowledgement("initialize-clock", () => clockValue(invoke("initialize-clock")));},
-    clock(): IssuerClock {return clockValue(invoke("clock"));},
+    clock(): IssuerClock {return clockValue(invoke("clock"), "clock");},
     context(): unknown {return invoke("context");},
     collectCgroupEnvelopeV1(signal: AbortSignal): string {
       signal.throwIfAborted();
@@ -141,7 +144,7 @@ export function createAccountedHostIoBridge(binding: Readonly<AccountedIoBinding
     async initializeJournal(originVersion:string,bytesSha256:string,signal:AbortSignal):Promise<void> {
       signal.throwIfAborted();
       need(typeof originVersion === "string" && /^[0-9a-f]{64}$(?![\s\S])/.test(originVersion)
-        && typeof bytesSha256 === "string" && /^[0-9a-f]{64}$(?![\s\S])/.test(bytesSha256),"journal_bootstrap_expectation");
+        && typeof bytesSha256 === "string" && /^[0-9a-f]{64}$(?![\s\S])/.test(bytesSha256),"journal_bootstrap_expectation","initialize-journal");
       writeAcknowledgement("initialize-journal",()=>{
         const result=object(invoke("initialize-journal"));exact(result,["status","originVersion","sha256"]);
         need(result.status === "initialized" && result.originVersion === originVersion && result.sha256 === bytesSha256,
@@ -151,14 +154,14 @@ export function createAccountedHostIoBridge(binding: Readonly<AccountedIoBinding
     },
     challenge(signal: AbortSignal): Promise<string> {
       signal.throwIfAborted();
-      const result = object(invoke("challenge")); exact(result,["bytes"]);
-      need(typeof result.bytes === "string" && result.bytes.length <= 16384, "challenge_bound");
+      const result = object(invoke("challenge"), "challenge"); exact(result,["bytes"],"challenge");
+      need(typeof result.bytes === "string" && result.bytes.length <= 16384, "challenge_bound", "challenge");
       signal.throwIfAborted(); return Promise.resolve(result.bytes);
     },
     async publish(bytes: string, deadline: string, signal: AbortSignal): Promise<void> {
       signal.throwIfAborted();
       need(typeof bytes === "string" && Buffer.byteLength(bytes) > 0 && Buffer.byteLength(bytes) <= 65536
-        && typeof deadline === "string" && /^[1-9][0-9]{0,18}$(?![\s\S])/.test(deadline) && BigInt(deadline) < 2n**63n, "publication_input");
+        && typeof deadline === "string" && /^[1-9][0-9]{0,18}$(?![\s\S])/.test(deadline) && BigInt(deadline) < 2n**63n, "publication_input", "publish");
       writeAcknowledgement("publish", () => {
         const result = object(invoke("publish",canonicalNative({bytes,deadline_boottime_ns:BigInt(deadline)})));
         exact(result,["sha256","status"]);
