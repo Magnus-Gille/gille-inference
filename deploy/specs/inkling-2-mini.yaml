@@ -1,4 +1,4 @@
-# REVIEWED CANDIDATE for Thinking Machines Inkling 2 Mini (released 2026-11-20); not yet live.
+# Thinking Machines Inkling 2 Mini (released 2026-11-20). Promoted live 2026-11-21 15:42 UTC.
 # Model: thinkingmachines/Inkling-2-Mini — 26.4B total / 3.4B active looped MoE (layers 6-17 run
 # three times), hybrid local/global attention, image input.
 # Artifact: ggml-org/Inkling-2-Mini-GGUF revision db61c5b492a6a034d986328d28274af0a439aa6c
@@ -16,8 +16,9 @@
 #   and image captions are unqualified until a runtime containing #32268 replaces this pin.
 # Serving: 64K context, one slot, Q8 KV, Flash Attention, no draft model (the separate DSpark draft
 #   GGUF is not qualified). Reasoning depth is per request via `reasoning_effort`.
-# Memory estimate (not measured): ~20-22 GiB at 64K, dominated by weights; only 8 of 48 attention
-#   applications are global, the rest use a 1024-token sliding window.
+# Measured at promotion (2026-11-21): ~25 GiB GTT while loaded (peak host use 32.9 GiB), cold load
+#   ~14 s with weights partly in page cache, decode ~22 tok/s on short prompts. One simple tool call
+#   and one small image test passed; complex tool/vision cases remain unqualified without #32268.
 # /operator-resolve/ paths must be replaced with stable non-scratch operator paths kept in the
 # private operations tracker.
 key: inkling-2-mini
