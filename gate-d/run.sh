@@ -19,6 +19,7 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
       GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$ROOT/.." && pwd)"
+. "$ROOT/prompt-identity.sh"   # gd_git (isolated runner-owned Git) and the prompt resolver
 
 # ── Work-dir isolation (#172) ────────────────────────────────────────────────────────────────
 # Work dirs used to live under gate-d/.work/ — INSIDE this checkout. A nested `git init` there
@@ -74,14 +75,18 @@ OUT="${GATE_D_OUT:-$REPO_ROOT/data/gate-d-results.jsonl}"; mkdir -p "$(dirname "
 # an existing file name, so a path is the only unambiguous form). Every row records the name and the
 # sha256 of exactly those bytes, and the snapshot is re-verified after each arm run, so variant runs
 # never pool silently with baseline runs. Unset = the baseline (promptVariant "none").
-. "$ROOT/prompt-identity.sh"
 if [ -n "${GATE_D_PI_APPEND_SYSTEM:-}" ] && [ "$ARM" != "pi" ]; then
   echo "error: GATE_D_PI_APPEND_SYSTEM is supported for the pi arm only" >&2; exit 3
 fi
 resolve_prompt_variant "$REPO_ROOT" || exit 3
 PROMPT_FILE=""; PROMPT_DIR=""
 if [ -n "$PROMPT_BLOB" ]; then
-  PROMPT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gd-prompt.XXXXXXXX")" || exit 3
+  # Absolute, physical parent: pi runs from the task dir, and pi treats a missing relative path
+  # as literal prompt text.
+  PROMPT_PARENT="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P)" \
+    || { echo "error: cannot resolve the temp directory ${TMPDIR:-/tmp}" >&2; exit 3; }
+  PROMPT_DIR="$(mktemp -d "$PROMPT_PARENT/gd-prompt.XXXXXXXX")" || exit 3
+  case "$PROMPT_DIR" in /*) ;; *) echo "error: prompt snapshot dir is not absolute: $PROMPT_DIR" >&2; exit 3 ;; esac
   trap 'rm -rf "$PROMPT_DIR"' EXIT
   snapshot_prompt_variant "$REPO_ROOT" "$PROMPT_DIR" || exit 3
 fi
@@ -91,8 +96,8 @@ fi
 # than let corruption silently persist. Skipped outside a git checkout (nothing to escape to — the
 # box runtime dir is an rsync target, not a checkout, per the incident writeup above).
 IN_GIT_CHECKOUT=0
-git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 && IN_GIT_CHECKOUT=1
-fixture_dirty(){ git -C "$REPO_ROOT" status --porcelain -- gate-d/tasks gate-d/src 2>/dev/null || true; }
+gd_git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 && IN_GIT_CHECKOUT=1
+fixture_dirty(){ gd_git -C "$REPO_ROOT" status --porcelain -- gate-d/tasks gate-d/src 2>/dev/null || true; }
 metaget(){ python3 -c "import json;v=json.load(open('$1')).get('$2','');print(str(v).lower() if isinstance(v,bool) else v)"; }
 metalist(){ python3 -c "import json;print(' '.join(json.load(open('$1')).get('$2',[])))"; }
 
@@ -125,9 +130,9 @@ run_one() {
   # Make the work dir its OWN git root, so aider/opencode/pi's git-based root-detection sees $W —
   # not this checkout — as the repo. Gives aider the committed HEAD baseline it diffs against
   # (--no-auto-commit leaves the arm's net edit in the working tree for check.sh's diff-vs-seed).
-  git init -q "$W"
-  git -C "$W" add -A
-  git -C "$W" -c user.email=gate-d@local -c user.name=gate-d commit -q -m seed >/dev/null 2>&1
+  gd_git init -q "$W"
+  gd_git -C "$W" add -A
+  gd_git -C "$W" -c user.email=gate-d@local -c user.name=gate-d commit -q -m seed >/dev/null 2>&1
   local t0 t1 status="ran"
   t0=$(date +%s)
   case "$ARM" in
@@ -186,8 +191,8 @@ run_one() {
     if [ -n "$dirty" ]; then
       echo "FATAL[$ARM/$id]: gate-d/tasks or gate-d/src changed on disk during this run:" >&2
       echo "$dirty" >&2
-      git -C "$REPO_ROOT" checkout -q -- gate-d/tasks 2>/dev/null
-      git -C "$REPO_ROOT" clean -fdq -- gate-d/tasks gate-d/src 2>/dev/null
+      gd_git -C "$REPO_ROOT" checkout -q -- gate-d/tasks 2>/dev/null
+      gd_git -C "$REPO_ROOT" clean -fdq -- gate-d/tasks gate-d/src 2>/dev/null
       echo "Restored gate-d/ fixtures from HEAD and aborting (#172) — corruption must never silently persist." >&2
       echo "(If you're mid-edit of a fixture yourself, commit first and re-run.)" >&2
       rm -rf "$W"

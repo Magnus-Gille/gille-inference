@@ -8,6 +8,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -36,8 +37,12 @@ function tmp(prefix: string): string {
 /** The caller's environment minus every Git override, so fixture Git can only touch the fixture. */
 function cleanEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
-  for (const [k, v] of Object.entries(process.env)) if (!k.startsWith("GIT_")) env[k] = v;
-  return { ...env, ...extra };
+  for (const [k, v] of Object.entries(process.env)) {
+    if (k.startsWith("GIT_") || k.startsWith("GATE_D_") || k === "KEEP_WORK") continue;
+    env[k] = v;
+  }
+  // No user or system Git configuration (hooks, identities, rewrites) in fixture Git.
+  return { ...env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", ...extra };
 }
 
 function git(cwd: string, ...args: string[]): string {
@@ -104,6 +109,7 @@ function runGateD(repo: string, bin: string, env: Record<string, string>, args: 
       GW_KEY: "test-key",
       GW: "http://127.0.0.1:9/v1",
       TMPDIR: work,
+      GATE_D_WORKROOT: join(work, "gate-d-work"),
       GATE_D_OUT: out,
       GATE_D_LOG: join(work, "sweep.log"),
       PATH: `${bin}:${process.env.PATH}`,
@@ -228,13 +234,15 @@ describe("gate-d/run.sh pi prompt variants (INFER-519)", { timeout: 120_000 }, (
 
   it("fails closed without a row when the snapshot is modified during the run", () => {
     const repo = fixtureRepo();
-    const { bin } = fakeBin(
+    const { bin, log } = fakeBin(
       `if (i >= 0) { fs.chmodSync(args[i + 1], 0o600); fs.writeFileSync(args[i + 1], "swapped\\n"); }`,
     );
     const { res, out } = runGateD(repo, bin, { GATE_D_PI_APPEND_SYSTEM: VARIANT }, ["pi", TASK]);
     expect(res.status).toBe(3);
     expect(res.stderr).toContain("prompt snapshot");
     expect(rows(out)).toEqual([]);
+    const value = calls(log).find((c) => c.name === "pi")!.args.find((a) => a.includes("gd-prompt."))!;
+    expect(existsSync(value)).toBe(false);
   });
 
   it("refuses a prompt whose digest differs from the one a sweep pinned", () => {
@@ -282,6 +290,67 @@ describe("gate-d/run.sh pi prompt variants (INFER-519)", { timeout: 120_000 }, (
     const { res } = runGateD(repo, bin, { GATE_D_OUT: "/dev/full" }, ["pi", TASK]);
     expect(res.status).toBe(4);
     expect(res.stderr).toContain("could not append the result row");
+  });
+
+  it("hands pi an absolute snapshot path even with a relative TMPDIR, and removes the snapshot afterwards", () => {
+    const repo = fixtureRepo();
+    const { bin, log } = fakeBin();
+    const work = tmp("gd-rel-");
+    const out = join(work, "rows.jsonl");
+    mkdirSync(join(repo, "reltmp"));
+    const res = spawnSync("bash", [join(repo, "gate-d", "run.sh"), "pi", TASK], {
+      cwd: repo,
+      encoding: "utf8",
+      env: cleanEnv({
+        GW_KEY: "test-key",
+        TMPDIR: "reltmp",
+        GATE_D_WORKROOT: join(work, "gate-d-work"),
+        GATE_D_OUT: out,
+        GATE_D_PI_APPEND_SYSTEM: VARIANT,
+        PATH: `${bin}:${process.env.PATH}`,
+      }),
+      timeout: 120_000,
+    });
+    expect(res.status, res.stderr).toBe(0);
+    const pi = calls(log).find((c) => c.name === "pi")!;
+    const value = pi.args[pi.args.indexOf("--append-system-prompt") + 1]!;
+    expect(value.startsWith("/")).toBe(true);
+    expect(pi.prompt).toBe(readFileSync(join(repo, "gate-d", "prompts", VARIANT), "utf8"));
+    expect(existsSync(value)).toBe(false);
+    expect(readdirSync(join(repo, "reltmp")).filter((n) => n.startsWith("gd-prompt."))).toEqual([]);
+  });
+
+  it.each([
+    ["a byte-order mark", Buffer.from([0xef, 0xbb, 0xbf, 0x78]), "byte-order mark"],
+    ["malformed UTF-8", Buffer.from([0x78, 0xff, 0x78]), "valid UTF-8"],
+  ])("rejects a committed prompt with %s", (_label, bytes, message) => {
+    const repo = fixtureRepo();
+    writeFileSync(join(repo, "gate-d", "prompts", "odd.md"), bytes);
+    git(repo, "add", "-A");
+    git(repo, "commit", "-q", "-m", "odd prompt");
+    const { bin, log } = fakeBin();
+    const { res } = runGateD(repo, bin, { GATE_D_PI_APPEND_SYSTEM: "odd.md" }, ["pi", TASK]);
+    expect(res.status).toBe(3);
+    expect(res.stderr).toContain(message);
+    expect(calls(log)).toEqual([]);
+  });
+
+  it("ignores environment-supplied Git configuration and hooks for runner-owned commits", () => {
+    const repo = fixtureRepo();
+    const hooks = tmp("gd-hooks-");
+    const marker = join(hooks, "fired");
+    writeFileSync(join(hooks, "pre-commit"), `#!/bin/sh\ntouch ${JSON.stringify(marker)}\nexit 1\n`);
+    chmodSync(join(hooks, "pre-commit"), 0o755);
+    const { bin } = fakeBin();
+    const { res, out } = runGateD(
+      repo,
+      bin,
+      { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.hooksPath", GIT_CONFIG_VALUE_0: hooks },
+      ["pi", TASK],
+    );
+    expect(res.status, res.stderr).toBe(0);
+    expect(existsSync(marker)).toBe(false);
+    expect(rows(out).pop()!.exitClass).toBe("G2-no-edit");
   });
 
   it("labels baseline rows promptVariant none and passes no prompt flag", () => {

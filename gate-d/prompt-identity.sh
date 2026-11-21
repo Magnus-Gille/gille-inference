@@ -13,18 +13,37 @@
 #   Writes the blob to a private file, verifies its digest, and sets PROMPT_FILE (absolute path).
 # Both return 3 with a message on stderr on any failure.
 
+# Runner-owned Git: no inherited repository/index selectors, no environment- or user-supplied
+# configuration (GIT_CONFIG_*, system and global config files), and no hooks. Only the checkout's
+# own .git/config still applies.
 gd_git() {
   ( unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
-          GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_CEILING_DIRECTORIES
-    git "$@" )
+          GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_CEILING_DIRECTORIES \
+          GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS
+    export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+    git -c core.hooksPath=/dev/null "$@" )
 }
 
 gd_sha256_stdin() {
   python3 -c 'import hashlib,sys;print("sha256:"+hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
 }
 
+# Reads a prompt blob on stdin, requires exactly <expected-size> bytes of strict UTF-8 without a
+# byte-order mark (pi decodes the file as UTF-8 and strips a BOM, so anything else would make the
+# raw-byte digest describe different text than pi uses), and prints its sha256.
+gd_prompt_digest() {
+  python3 -c '
+import hashlib, sys
+data = sys.stdin.buffer.read()
+if len(data) != int(sys.argv[1]): sys.exit("error: prompt blob read was incomplete")
+if data.startswith(b"\xef\xbb\xbf"): sys.exit("error: prompt variant must not start with a UTF-8 byte-order mark")
+try: data.decode("utf-8", errors="strict")
+except UnicodeDecodeError: sys.exit("error: prompt variant must be valid UTF-8")
+print("sha256:" + hashlib.sha256(data).hexdigest())' "$1"
+}
+
 resolve_prompt_variant() {
-  local root="$1" name="${GATE_D_PI_APPEND_SYSTEM:-}" rel top commit entry mode type blob
+  local root="$1" name="${GATE_D_PI_APPEND_SYSTEM:-}" rel top commit entry mode type blob size
   PROMPT_VARIANT="none"; PROMPT_SHA=""; PROMPT_BLOB=""
   [ -n "$name" ] || return 0
   case "$name" in
@@ -46,10 +65,12 @@ resolve_prompt_variant() {
   if [ -L "$root/$rel" ] || ! gd_git -C "$root" diff --quiet "$commit" -- "$rel" 2>/dev/null; then
     echo "error: $rel differs from HEAD in the working tree; commit or restore it first" >&2; return 3
   fi
-  [ "$(gd_git -C "$root" cat-file -s "$blob" 2>/dev/null)" -gt 0 ] 2>/dev/null \
+  size="$(gd_git -C "$root" cat-file -s "$blob" 2>/dev/null)"
+  [ -n "$size" ] && [ "$size" -gt 0 ] 2>/dev/null \
     || { echo "error: prompt variant $rel is empty or unreadable" >&2; return 3; }
-  PROMPT_SHA="$(gd_git -C "$root" cat-file blob "$blob" | gd_sha256_stdin)" \
-    || { echo "error: could not read $rel from HEAD" >&2; return 3; }
+  # pipefail inside the substitution: a failed blob read must fail here, not hash empty input.
+  PROMPT_SHA="$(set -o pipefail; gd_git -C "$root" cat-file blob "$blob" | gd_prompt_digest "$size")" \
+    || { echo "error: could not validate $rel at HEAD" >&2; return 3; }
   PROMPT_VARIANT="${name%.md}"
   PROMPT_BLOB="$blob"
   if [ -n "${GATE_D_EXPECT_PROMPT_SHA:-}" ] && [ "$GATE_D_EXPECT_PROMPT_SHA" != "$PROMPT_SHA" ]; then
@@ -59,6 +80,9 @@ resolve_prompt_variant() {
   return 0
 }
 
+# Limitation: the arm runs as the same OS user as the runner, so it could change the snapshot and
+# restore it between the two checks. The row's digest attests to the committed blob the runner
+# resolved and handed over, not to a kernel-enforced read-only boundary.
 snapshot_prompt_variant() {
   local root="$1" dir="$2"
   PROMPT_FILE=""

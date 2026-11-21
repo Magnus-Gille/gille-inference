@@ -23,6 +23,7 @@
 # it — guaranteeing the next task starts on a clean model and bounding any window where a live user
 # could hit the degenerate model.
 set -u
+set -o pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$ROOT/.." && pwd)"
 cd "$REPO_ROOT" || exit 3

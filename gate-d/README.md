@@ -72,9 +72,14 @@ without those fields as the baseline. The variable must be a bare file name of a
 committed at HEAD whose working-tree copy is unchanged. The blob is resolved once from HEAD and
 copied into a private runner-owned file that pi reads by absolute path (pi treats the flag's value
 as text or as an existing file name, so a path is the only unambiguous form). The digest covers
-exactly that file's bytes, and the file is re-verified after every arm run. The variable is
-rejected on other arms, and a sweep fails closed if the committed prompt changes while it runs. A variant run on tasks that earlier
-runs already scored is a diagnostic A/B, not a fresh holdout result.
+exactly that file's bytes, which must be non-empty, valid UTF-8 and free of a byte-order mark,
+and the file is re-verified after every arm run. The snapshot lives under the absolute physical
+temp directory and is removed on exit. Runner Git calls ignore inherited `GIT_*` selectors, global
+and system config, and hooks. The variable is rejected on other arms, and a sweep fails closed if
+the committed prompt changes while it runs or if any run exits non-zero. The snapshot is protected
+from other users but not from a process running as the same OS user between the post-run checks;
+run sweeps from a dedicated account if that matters. A variant run on tasks that earlier runs
+already scored is a diagnostic A/B, not a fresh holdout result.
 
 ## Status
 
