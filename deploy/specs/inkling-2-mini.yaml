@@ -1,9 +1,14 @@
 # REVIEWED CANDIDATE for Thinking Machines Inkling 2 Mini (released 2026-11-20); not yet live.
 # Model: thinkingmachines/Inkling-2-Mini — 26.4B total / 3.4B active looped MoE (layers 6-17 run
 # three times), hybrid local/global attention, image input.
-# Artifact: unsloth/Inkling-2-Mini-GGUF revision 29eac40c55957e3b76db6b7028e549cb244745de
-#   Inkling-2-Mini-UD-Q4_K_XL.gguf sha256 e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15
-#   mmproj-BF16.gguf               sha256 2c165c78790e78a3f45a2d1e9e931083e52ee69d45ff2a0dc9c281fdf1a666e7
+# Artifact: ggml-org/Inkling-2-Mini-GGUF revision db61c5b492a6a034d986328d28274af0a439aa6c
+#   Inkling-2-Mini-IQ4_NL.gguf       sha256 cbdf3fa9dc50a4124977980f37da4f1fa764b0cfe800d275cd43d26ce2a81af4
+#   mmproj-Inkling-2-Mini-BF16.gguf  sha256 e914997fe07fb2066bfdce855ec7275c15bc2b624e5423149f1027839593d9cb
+#   (arch inkling2_loop, 24 physical blocks, loop 6..18 x3). Unsloth's root GGUFs are NOT usable:
+#   they use Unsloth's own `inkling2` looped layout (block_count=48 over 24 physical blocks), which
+#   mainline fails to load (`blk.24.attn_q.weight` not found); their Mainline_Support files need
+#   llama.cpp #32704 (merged after this pin) for NVFP4 per-expert scales. IQ4_NL is requantized
+#   from BF16 and does not depend on #32704.
 # Runtime: upstream llama.cpp master 29b52d398b294509746ec0a3f28948a3107c0213 (Vulkan, production
 #   flags). No earlier pinned runtime contains the inkling2 architecture. Upstream PR
 #   ggml-org/llama.cpp#32268 (chat-template/tool-call parser, vision preprocessing and embedding-norm
@@ -17,8 +22,8 @@
 # private operations tracker.
 key: inkling-2-mini
 api: chat
-gguf: /operator-resolve/models/inkling-2-mini/Inkling-2-Mini-UD-Q4_K_XL.gguf
-mmproj: /operator-resolve/models/inkling-2-mini/mmproj-BF16.gguf
+gguf: /operator-resolve/models/inkling-2-mini/Inkling-2-Mini-IQ4_NL.gguf
+mmproj: /operator-resolve/models/inkling-2-mini/mmproj-Inkling-2-Mini-BF16.gguf
 runtime_bin: /operator-resolve/llama-runtime/releases/29b52d398b294509746ec0a3f28948a3107c0213/bin/llama-server
 ctx: 65536
 ngl: 999

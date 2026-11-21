@@ -210,7 +210,7 @@ describe("manual-promotion spec contract (#217)", () => {
       np: 1,
       ctk: "q8_0",
       ctv: "q8_0",
-      mmproj: "/operator-resolve/models/inkling-2-mini/mmproj-BF16.gguf",
+      mmproj: "/operator-resolve/models/inkling-2-mini/mmproj-Inkling-2-Mini-BF16.gguf",
       specType: null,
       lora: null,
     });
