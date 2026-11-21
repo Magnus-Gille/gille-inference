@@ -13,6 +13,10 @@
 # dummy). Optional: MODEL (default qwen3-coder-next-80b), CAP_S (wall-clock cap, default 600).
 set -u
 set -o pipefail
+# Never let an inherited Git override aim this runner's git calls (fixture guard, prompt lookup) at
+# another repository; the work dirs get their own git roots below.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+      GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$ROOT/.." && pwd)"
 
@@ -65,14 +69,22 @@ TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
 [ -n "$TIMEOUT_BIN" ] || { echo "error: need GNU 'timeout' (Linux) or 'gtimeout' (macOS: brew install coreutils) on PATH" >&2; exit 3; }
 OUT="${GATE_D_OUT:-$REPO_ROOT/data/gate-d-results.jsonl}"; mkdir -p "$(dirname "$OUT")"
 # Optional pi-only system-prompt variant (INFER-519). GATE_D_PI_APPEND_SYSTEM names a committed file
-# under gate-d/prompts/; see prompt-identity.sh. Its text is snapshotted once from HEAD, passed to pi
-# with --append-system-prompt, and recorded (name + sha256 of exactly those bytes) on every row, so
-# variant runs never pool silently with baseline runs. Unset = the baseline (promptVariant "none").
+# under gate-d/prompts/; see prompt-identity.sh. Its blob is snapshotted once from HEAD into a
+# private runner-owned file, which pi reads by absolute path (pi treats the flag's value as text OR
+# an existing file name, so a path is the only unambiguous form). Every row records the name and the
+# sha256 of exactly those bytes, and the snapshot is re-verified after each arm run, so variant runs
+# never pool silently with baseline runs. Unset = the baseline (promptVariant "none").
 . "$ROOT/prompt-identity.sh"
 if [ -n "${GATE_D_PI_APPEND_SYSTEM:-}" ] && [ "$ARM" != "pi" ]; then
   echo "error: GATE_D_PI_APPEND_SYSTEM is supported for the pi arm only" >&2; exit 3
 fi
 resolve_prompt_variant "$REPO_ROOT" || exit 3
+PROMPT_FILE=""; PROMPT_DIR=""
+if [ -n "$PROMPT_BLOB" ]; then
+  PROMPT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gd-prompt.XXXXXXXX")" || exit 3
+  trap 'rm -rf "$PROMPT_DIR"' EXIT
+  snapshot_prompt_variant "$REPO_ROOT" "$PROMPT_DIR" || exit 3
+fi
 # Fixture-corruption guard (#172 belt-and-suspenders): gate-d/tasks/ must always be pristine and
 # gate-d/src/ must never exist. Checked once per task in run_one(), right after the arm runs — if
 # either is dirty, something still escaped its work dir; restore from HEAD and abort loudly rather
@@ -130,7 +142,7 @@ run_one() {
           && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \
           && export GIT_CEILING_DIRECTORIES="$WORKROOT" \
           && HS_API_KEY="$GW_KEY" "$TIMEOUT_BIN" "$CAP_S" pi --provider "${PI_PROVIDER:-inference-gille}" --model "$MODEL" \
-             --no-session --print --mode json ${PROMPT_TEXT:+--append-system-prompt "$PROMPT_TEXT"} "$instr" </dev/null 2>"$W/.arm.stderr.log" \
+             --no-session --print --mode json ${PROMPT_FILE:+--append-system-prompt "$PROMPT_FILE"} "$instr" </dev/null 2>"$W/.arm.stderr.log" \
              | "$REPO_ROOT/node_modules/.bin/tsx" "$REPO_ROOT/scripts/pi-benchmark-telemetry.ts" \
                  --log "$W/.arm.log" --summary "$W/.arm-telemetry.json" ) || status="arm-error"
       ;;
@@ -181,6 +193,10 @@ run_one() {
       rm -rf "$W"
       exit 9
     fi
+  fi
+  if ! verify_prompt_snapshot; then
+    echo "FATAL[$ARM/$id]: the prompt snapshot changed during the run; no row written" >&2
+    rm -rf "$W"; exit 3
   fi
   t1=$(date +%s)
   # Oracle-peek transcript + detection (pure observation — never affects pass/fail or any
@@ -250,7 +266,12 @@ peek=json.loads(os.environ.get('GD_PEEK') or '{}')
 row.update({k:bool(v) for k,v in peek.items() if k not in row})
 row['promptVariant']=os.environ['GD_PROMPT_VARIANT']; row['promptSha256']=os.environ['GD_PROMPT_SHA'] or None
 print(json.dumps(row))" >>"$OUT"
-  echo "[$ARM/$MODEL/$CORPUS_REVISION] $id → $exitclass (${pass}, $((t1-t0))s)"
+  local row_status=$?
+  if [ "$row_status" -eq 0 ]; then
+    echo "[$ARM/$MODEL/$CORPUS_REVISION] $id → $exitclass (${pass}, $((t1-t0))s)"
+  else
+    echo "FATAL[$ARM/$id]: could not append the result row to $OUT (status $row_status)" >&2
+  fi
   # KEEP_WORK=1 preserves the work dir (+ .arm logs, telemetry, .check.log, and the oracle-peek
   # transcript) for diagnosis.
   if [ -n "${KEEP_WORK:-}" ]; then
@@ -259,6 +280,8 @@ print(json.dumps(row))" >>"$OUT"
     rm -rf "$W"
     [ -n "$TRANSCRIPT" ] && rm -f "$TRANSCRIPT"
   fi
+  # A lost row must never look like success: the sweep would otherwise read an older row.
+  [ "$row_status" -eq 0 ] || exit 4
 }
 
 if [ "$SEL" = "all" ]; then

@@ -69,9 +69,11 @@ GATE_D_LOG=/tmp/gate-d-r2.log GATE_D_INCLUDE_HOLDOUT=1 bash gate-d/sweep.sh
 `promptVariant` (`none` when unset) and `promptSha256`, so variant runs are never pooled with
 baseline runs; `sweep.sh` resumes and summarizes per variant and digest, and counts legacy rows
 without those fields as the baseline. The variable must be a bare file name of a regular file
-committed at HEAD whose working-tree copy is unchanged; the text is read once from the HEAD blob,
-and the digest covers exactly the bytes pi receives. It is rejected on other arms, and a sweep
-fails closed if the committed prompt changes while it runs. A variant run on tasks that earlier
+committed at HEAD whose working-tree copy is unchanged. The blob is resolved once from HEAD and
+copied into a private runner-owned file that pi reads by absolute path (pi treats the flag's value
+as text or as an existing file name, so a path is the only unambiguous form). The digest covers
+exactly that file's bytes, and the file is re-verified after every arm run. The variable is
+rejected on other arms, and a sweep fails closed if the committed prompt changes while it runs. A variant run on tasks that earlier
 runs already scored is a diagnostic A/B, not a fresh holdout result.
 
 ## Status
