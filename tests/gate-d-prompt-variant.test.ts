@@ -11,12 +11,13 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, sep } from "node:path";
+import { dirname, join } from "node:path";
 
 // Every case runs against a disposable git checkout of gate-d/, never the developer's checkout:
 // run.sh restores fixtures with `git checkout`/`git clean` when it detects drift, and that must only
@@ -28,10 +29,18 @@ afterEach(() => {
   for (const dir of cleanup.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-// Fixtures are created under the test process's temp dir; refuse one inside this checkout.
+// Fixtures are created under the test process's temp dir; refuse one inside this checkout. Compare
+// directory identities while walking up, so a case alias on a case-insensitive volume is caught.
+function isInside(path: string, root: string): boolean {
+  const target = statSync(root);
+  for (let p = path; ; p = dirname(p)) {
+    const st = statSync(p);
+    if (st.dev === target.dev && st.ino === target.ino) return true;
+    if (dirname(p) === p) return false;
+  }
+}
 const TMP_PARENT = realpathSync(tmpdir());
-const REAL_ROOT_PHYSICAL = realpathSync(REAL_ROOT);
-if (TMP_PARENT === REAL_ROOT_PHYSICAL || TMP_PARENT.startsWith(REAL_ROOT_PHYSICAL + sep)) {
+if (isInside(TMP_PARENT, REAL_ROOT)) {
   throw new Error(`the test temp dir ${TMP_PARENT} is inside this checkout; set TMPDIR elsewhere`);
 }
 
@@ -48,12 +57,13 @@ function cleanEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     if (k.startsWith("GIT_") || k.startsWith("GATE_D_") || k === "KEEP_WORK") continue;
     env[k] = v;
   }
-  // No user or system Git configuration (hooks, identities, rewrites) in fixture Git.
-  return { ...env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", ...extra };
+  // No user or system Git configuration (hooks, identities, rewrites, attributes) in fixture Git.
+  return { ...env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_ATTR_NOSYSTEM: "1", ...extra };
 }
 
 function git(cwd: string, ...args: string[]): string {
-  const res = spawnSync("git", ["-c", "user.email=t@local", "-c", "user.name=t", ...args], {
+  const isolation = ["-c", "core.attributesFile=/dev/null", "-c", "core.excludesFile=/dev/null", "-c", "core.hooksPath=/dev/null"];
+  const res = spawnSync("git", [...isolation, "-c", "user.email=t@local", "-c", "user.name=t", ...args], {
     cwd,
     encoding: "utf8",
     env: cleanEnv(),
@@ -71,7 +81,7 @@ function fixtureRepo(): string {
   // The real package.json declares ESM; without it tsx would load the telemetry collector as CJS.
   cpSync(join(REAL_ROOT, "package.json"), join(repo, "package.json"));
   writeFileSync(join(repo, ".gitignore"), "node_modules\ndata/\n");
-  git(repo, "init", "-q");
+  git(repo, "init", "-q", "--template=");
   const top = realpathSync(git(repo, "rev-parse", "--show-toplevel").trim());
   if (top !== repo) throw new Error(`fixture git top level escaped to ${top}`);
   git(repo, "add", "-A");
@@ -424,6 +434,63 @@ describe("gate-d/run.sh pi prompt variants (INFER-519)", { timeout: 120_000 }, (
     });
     expect(inside.status).toBe(3);
     expect(inside.stderr).toContain("INSIDE the repo");
+  });
+
+  it("aborts on a dangling .git symlink instead of treating the checkout as a plain directory", () => {
+    const repo = fixtureRepo();
+    rmSync(join(repo, ".git"), { recursive: true, force: true });
+    symlinkSync("/nonexistent/gate-d-test-git", join(repo, ".git"));
+    const { bin, log } = fakeBin();
+    const { res, out } = runGateD(repo, bin, {}, ["aider", TASK]);
+    expect(res.status).toBe(3);
+    expect(res.stderr).toContain("Git cannot read it");
+    expect(calls(log)).toEqual([]);
+    expect(rows(out)).toEqual([]);
+  });
+
+  it("refuses a seed that differs from the committed task tree, such as an ignored leftover file", () => {
+    const repo = fixtureRepo();
+    writeFileSync(join(repo, ".gitignore"), "node_modules\ndata/\ndist/\n");
+    git(repo, "commit", "-q", "-am", "ignore dist");
+    mkdirSync(join(repo, "gate-d", "tasks", TASK, "repo", "dist"));
+    writeFileSync(join(repo, "gate-d", "tasks", TASK, "repo", "dist", "leftover.js"), "1\n");
+    const { bin, log } = fakeBin();
+    const { res, out } = runGateD(repo, bin, {}, ["pi", TASK]);
+    expect(res.status).toBe(3);
+    expect(res.stderr).toContain("could not create the seed commit");
+    expect(calls(log)).toEqual([]);
+    expect(rows(out)).toEqual([]);
+  });
+
+  it("refuses to run a task whose seed directory is missing", () => {
+    const repo = fixtureRepo();
+    git(repo, "rm", "-rq", `gate-d/tasks/${TASK}/repo`);
+    git(repo, "commit", "-q", "-m", "drop seed");
+    const { bin, log } = fakeBin();
+    const { res, out } = runGateD(repo, bin, {}, ["pi", TASK]);
+    expect(res.status).toBe(3);
+    expect(res.stderr).toContain("could not read the committed task tree");
+    expect(calls(log)).toEqual([]);
+    expect(rows(out)).toEqual([]);
+  });
+
+  it("refuses a work root that names the checkout through a case alias, where the volume allows one", () => {
+    const repo = fixtureRepo();
+    const alias = join(dirname(repo), repo.slice(dirname(repo).length + 1).toUpperCase());
+    let sameDir = false;
+    try {
+      const a = statSync(alias);
+      const b = statSync(repo);
+      sameDir = a.dev === b.dev && a.ino === b.ino;
+    } catch {
+      sameDir = false;
+    }
+    if (!sameDir) return; // case-sensitive volume: no alias exists to test
+    const { bin, log } = fakeBin();
+    const { res } = runGateD(repo, bin, { GATE_D_WORKROOT: join(alias, "work") }, ["pi", TASK]);
+    expect(res.status).toBe(3);
+    expect(res.stderr).toContain("INSIDE the repo");
+    expect(calls(log)).toEqual([]);
   });
 
   it("labels baseline rows promptVariant none and passes no prompt flag", () => {

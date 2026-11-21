@@ -40,13 +40,28 @@ WORKROOT="${GATE_D_WORKROOT:-${TMPDIR:-/tmp}/gate-d-work}"
 # inside-the-repo check below.
 WORKROOT="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$WORKROOT")" || exit 3
 if [ "${1:-}" = "--print-workroot" ]; then echo "$WORKROOT"; exit 0; fi
-case "$WORKROOT" in
-  "$REPO_ROOT"|"$REPO_ROOT"/*)
-    echo "error: WORKROOT ($WORKROOT) resolves INSIDE the repo ($REPO_ROOT) — refusing to run (#172)." >&2
-    echo "       set TMPDIR or GATE_D_WORKROOT to a path outside the checkout." >&2
-    exit 3
-    ;;
-esac
+# Compare directory identities, not spellings: on a case-insensitive volume a differently
+# capitalized path can name a directory inside the checkout. Walk from the nearest existing
+# ancestor of WORKROOT up to / and refuse if any of them is the checkout itself.
+if ! python3 - "$WORKROOT" "$REPO_ROOT" <<'PY'
+import os, sys
+path, repo = sys.argv[1], os.stat(sys.argv[2])
+while not os.path.exists(path):
+    path = os.path.dirname(path)
+while True:
+    st = os.stat(path)
+    if (st.st_dev, st.st_ino) == (repo.st_dev, repo.st_ino):
+        sys.exit(1)
+    parent = os.path.dirname(path)
+    if parent == path:
+        sys.exit(0)
+    path = parent
+PY
+then
+  echo "error: WORKROOT ($WORKROOT) resolves INSIDE the repo ($REPO_ROOT) — refusing to run (#172)." >&2
+  echo "       set TMPDIR or GATE_D_WORKROOT to a path outside the checkout." >&2
+  exit 3
+fi
 mkdir -p "$WORKROOT"
 
 CORPUS_TOOL="$ROOT/gate_d_corpus.py"
@@ -103,17 +118,21 @@ fi
 # relied on a safe.directory entry in the now-ignored global config), abort instead of silently
 # skipping the guard.
 IN_GIT_CHECKOUT=0
-if [ -e "$REPO_ROOT/.git" ]; then
-  if ! probe_err="$(gd_git -C "$REPO_ROOT" rev-parse --is-inside-work-tree 2>&1 >/dev/null)"; then
+if [ -e "$REPO_ROOT/.git" ] || [ -L "$REPO_ROOT/.git" ]; then
+  probe_out=""
+  if ! probe_out="$(gd_git -C "$REPO_ROOT" rev-parse --is-inside-work-tree 2>&1)" \
+     || [ "$probe_out" != "true" ] \
+     || ! probe_out="$(gd_git -C "$REPO_ROOT" status --porcelain -- gate-d/tasks 2>&1 >/dev/null)"; then
     echo "error: $REPO_ROOT has a .git entry but Git cannot read it, so the fixture-corruption guard cannot run:" >&2
-    echo "$probe_err" >&2
+    echo "$probe_out" >&2
     exit 3
   fi
   IN_GIT_CHECKOUT=1
 elif gd_git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   IN_GIT_CHECKOUT=1
 fi
-fixture_dirty(){ gd_git -C "$REPO_ROOT" status --porcelain -- gate-d/tasks gate-d/src 2>/dev/null || true; }
+# Prints the porcelain status of the fixtures; returns non-zero if Git cannot produce it.
+fixture_dirty(){ gd_git -C "$REPO_ROOT" status --porcelain -- gate-d/tasks gate-d/src; }
 metaget(){ python3 -c "import json;v=json.load(open('$1')).get('$2','');print(str(v).lower() if isinstance(v,bool) else v)"; }
 metalist(){ python3 -c "import json;print(' '.join(json.load(open('$1')).get('$2',[])))"; }
 
@@ -122,7 +141,11 @@ run_one() {
   task_revision="$(metaget "$T/meta.json" corpusRevision)"; task_revision="${task_revision:-gate-d-r1}"
   holdout="$(metaget "$T/meta.json" holdout)"; holdout="${holdout:-false}"
   if [ "$IN_GIT_CHECKOUT" = 1 ]; then
-    local dirty_before; dirty_before="$(fixture_dirty)"
+    local dirty_before
+    if ! dirty_before="$(fixture_dirty)"; then
+      echo "FATAL[$ARM/$id]: git status failed, so the fixture-corruption guard cannot run" >&2
+      exit 9
+    fi
     if [ -n "$dirty_before" ]; then
       echo "FATAL[$ARM/$id]: gate-d/tasks or gate-d/src was already dirty before this run:" >&2
       echo "$dirty_before" >&2
@@ -138,23 +161,50 @@ run_one() {
   local fileargs="" readargs=""
   [ -n "$edit" ] && fileargs=$(printf -- '--file %s ' $edit)
   [ -n "$read" ] && readargs=$(printf -- '--read %s ' $read)
-  local W; W=$(mktemp -d "$WORKROOT/${id}-${ARM}-XXXX"); cp -r "$T/repo/." "$W/"
+  # The expected seed: in a checkout, the committed task tree (path, mode and blob, so ignored or
+  # stray files in the live directory are caught); in a plain deployment, the task's file list.
+  local seed_expected
+  if [ "$IN_GIT_CHECKOUT" = 1 ]; then
+    seed_expected="$(gd_git -C "$REPO_ROOT" -c core.quotePath=false ls-tree -r HEAD -- "gate-d/tasks/$id/repo/")" \
+      && [ -n "$seed_expected" ] \
+      && seed_expected="$(printf '%s\n' "$seed_expected" | sed "s|	gate-d/tasks/$id/repo/|	|" | LC_ALL=C sort)" \
+      || { echo "FATAL[$ARM/$id]: could not read the committed task tree; refusing to run the arm." >&2; exit 3; }
+  else
+    seed_expected="$(cd "$T/repo" && find . \( -type f -o -type l \) -print | sed 's|^\./||' | LC_ALL=C sort)" \
+      && [ -n "$seed_expected" ] \
+      || { echo "FATAL[$ARM/$id]: could not enumerate $T/repo; refusing to run the arm." >&2; exit 3; }
+  fi
+  local W
+  W=$(mktemp -d "$WORKROOT/${id}-${ARM}-XXXX") || { echo "FATAL[$ARM/$id]: mktemp failed" >&2; exit 3; }
+  if ! cp -r "$T/repo/." "$W/"; then
+    echo "FATAL[$ARM/$id]: could not copy the task seed; refusing to run the arm." >&2
+    rm -rf "$W"; exit 3
+  fi
   # node_modules symlink: WORKROOT now lives OUTSIDE the repo (#172), so there's no ancestor dir
   # left for `npx --no-install` to climb into. Link the real node_modules in directly — check.sh's
   # tsc/tsx invocations keep resolving exactly as before, just via one hop instead of an upward walk.
-  ln -s "$REPO_ROOT/node_modules" "$W/node_modules"
+  if ! ln -s "$REPO_ROOT/node_modules" "$W/node_modules"; then
+    echo "FATAL[$ARM/$id]: could not link node_modules; refusing to run the arm." >&2
+    rm -rf "$W"; exit 3
+  fi
   # Make the work dir its OWN git root, so aider/opencode/pi's git-based root-detection sees $W —
   # not this checkout — as the repo. Gives aider the committed HEAD baseline it diffs against
   # (--no-auto-commit leaves the arm's net edit in the working tree for check.sh's diff-vs-seed).
-  # Every seed step must succeed, and the seed commit must hold exactly the task's files plus the
-  # node_modules link, or the arm would run without the baseline check.sh and the harnesses expect.
-  local seed_expected seed_actual
-  seed_expected="$( (cd "$T/repo" && find . \( -type f -o -type l \) -print | sed 's|^\./||'; echo node_modules) | LC_ALL=C sort)"
+  # Every seed step must succeed, and the seed commit must hold exactly the expected task files
+  # (plus the node_modules link), or the arm would run without the baseline it is graded against.
+  local seed_tree seed_actual
   if ! gd_git init -q --template= "$W" \
      || ! gd_git -C "$W" add -A \
      || ! gd_git -C "$W" -c user.email=gate-d@local -c user.name=gate-d commit -q -m seed >/dev/null \
-     || ! seed_actual="$(gd_git -C "$W" -c core.quotePath=false ls-tree -r --name-only HEAD | LC_ALL=C sort)" \
-     || [ "$seed_actual" != "$seed_expected" ]; then
+     || ! seed_tree="$(gd_git -C "$W" -c core.quotePath=false ls-tree -r HEAD)" \
+     || ! printf '%s\n' "$seed_tree" | grep -qx "120000 blob [0-9a-f]*	node_modules"; then
+    seed_actual="<seed commit failed>"
+  elif [ "$IN_GIT_CHECKOUT" = 1 ]; then
+    seed_actual="$(printf '%s\n' "$seed_tree" | grep -vx "120000 blob [0-9a-f]*	node_modules" | LC_ALL=C sort)"
+  else
+    seed_actual="$(printf '%s\n' "$seed_tree" | grep -vx "120000 blob [0-9a-f]*	node_modules" | cut -f2- | LC_ALL=C sort)"
+  fi
+  if [ "$seed_actual" != "$seed_expected" ]; then
     echo "FATAL[$ARM/$id]: could not create the seed commit in $W; refusing to run the arm." >&2
     rm -rf "$W"
     exit 3
@@ -213,7 +263,12 @@ run_one() {
   esac
   # Fixture-corruption guard (#172 belt-and-suspenders) — see IN_GIT_CHECKOUT comment above.
   if [ "$IN_GIT_CHECKOUT" = 1 ]; then
-    local dirty; dirty="$(fixture_dirty)"
+    local dirty
+    if ! dirty="$(fixture_dirty)"; then
+      echo "FATAL[$ARM/$id]: git status failed after the run, so fixture corruption cannot be ruled out; no row written" >&2
+      rm -rf "$W"
+      exit 9
+    fi
     if [ -n "$dirty" ]; then
       echo "FATAL[$ARM/$id]: gate-d/tasks or gate-d/src changed on disk during this run:" >&2
       echo "$dirty" >&2
