@@ -17,8 +17,9 @@ set -o pipefail
 # another repository; the work dirs get their own git roots below.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
       GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE
-ROOT="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$ROOT/.." && pwd)"
+unset CDPATH   # a relative CDPATH makes `cd` print, corrupting $(cd ... && pwd)
+ROOT="$(cd "$(dirname "$0")" && pwd -P)"
+REPO_ROOT="$(cd "$ROOT/.." && pwd -P)"
 . "$ROOT/prompt-identity.sh"   # gd_git (isolated runner-owned Git) and the prompt resolver
 
 # ── Work-dir isolation (#172) ────────────────────────────────────────────────────────────────
@@ -35,6 +36,9 @@ REPO_ROOT="$(cd "$ROOT/.." && pwd)"
 # WORKROOT-outside-the-repo case check below is a hard assertion of that property, not just a
 # default (a misconfigured GATE_D_WORKROOT/TMPDIR pointing back inside the repo refuses to run).
 WORKROOT="${GATE_D_WORKROOT:-${TMPDIR:-/tmp}/gate-d-work}"
+# Absolute and physical, so a relative TMPDIR/GATE_D_WORKROOT or a symlink cannot slip past the
+# inside-the-repo check below.
+WORKROOT="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$WORKROOT")" || exit 3
 if [ "${1:-}" = "--print-workroot" ]; then echo "$WORKROOT"; exit 0; fi
 case "$WORKROOT" in
   "$REPO_ROOT"|"$REPO_ROOT"/*)
@@ -95,8 +99,20 @@ fi
 # either is dirty, something still escaped its work dir; restore from HEAD and abort loudly rather
 # than let corruption silently persist. Skipped outside a git checkout (nothing to escape to — the
 # box runtime dir is an rsync target, not a checkout, per the incident writeup above).
+# A .git entry means this IS a checkout: if Git cannot read it (for example a shared checkout that
+# relied on a safe.directory entry in the now-ignored global config), abort instead of silently
+# skipping the guard.
 IN_GIT_CHECKOUT=0
-gd_git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 && IN_GIT_CHECKOUT=1
+if [ -e "$REPO_ROOT/.git" ]; then
+  if ! probe_err="$(gd_git -C "$REPO_ROOT" rev-parse --is-inside-work-tree 2>&1 >/dev/null)"; then
+    echo "error: $REPO_ROOT has a .git entry but Git cannot read it, so the fixture-corruption guard cannot run:" >&2
+    echo "$probe_err" >&2
+    exit 3
+  fi
+  IN_GIT_CHECKOUT=1
+elif gd_git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  IN_GIT_CHECKOUT=1
+fi
 fixture_dirty(){ gd_git -C "$REPO_ROOT" status --porcelain -- gate-d/tasks gate-d/src 2>/dev/null || true; }
 metaget(){ python3 -c "import json;v=json.load(open('$1')).get('$2','');print(str(v).lower() if isinstance(v,bool) else v)"; }
 metalist(){ python3 -c "import json;print(' '.join(json.load(open('$1')).get('$2',[])))"; }
@@ -130,9 +146,19 @@ run_one() {
   # Make the work dir its OWN git root, so aider/opencode/pi's git-based root-detection sees $W —
   # not this checkout — as the repo. Gives aider the committed HEAD baseline it diffs against
   # (--no-auto-commit leaves the arm's net edit in the working tree for check.sh's diff-vs-seed).
-  gd_git init -q "$W"
-  gd_git -C "$W" add -A
-  gd_git -C "$W" -c user.email=gate-d@local -c user.name=gate-d commit -q -m seed >/dev/null 2>&1
+  # Every seed step must succeed, and the seed commit must hold exactly the task's files plus the
+  # node_modules link, or the arm would run without the baseline check.sh and the harnesses expect.
+  local seed_expected seed_actual
+  seed_expected="$( (cd "$T/repo" && find . \( -type f -o -type l \) -print | sed 's|^\./||'; echo node_modules) | LC_ALL=C sort)"
+  if ! gd_git init -q --template= "$W" \
+     || ! gd_git -C "$W" add -A \
+     || ! gd_git -C "$W" -c user.email=gate-d@local -c user.name=gate-d commit -q -m seed >/dev/null \
+     || ! seed_actual="$(gd_git -C "$W" -c core.quotePath=false ls-tree -r --name-only HEAD | LC_ALL=C sort)" \
+     || [ "$seed_actual" != "$seed_expected" ]; then
+    echo "FATAL[$ARM/$id]: could not create the seed commit in $W; refusing to run the arm." >&2
+    rm -rf "$W"
+    exit 3
+  fi
   local t0 t1 status="ran"
   t0=$(date +%s)
   case "$ARM" in

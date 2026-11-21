@@ -24,8 +24,9 @@
 # could hit the degenerate model.
 set -u
 set -o pipefail
-ROOT="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$ROOT/.." && pwd)"
+unset CDPATH   # a relative CDPATH makes `cd` print, corrupting $(cd ... && pwd)
+ROOT="$(cd "$(dirname "$0")" && pwd -P)"
+REPO_ROOT="$(cd "$ROOT/.." && pwd -P)"
 cd "$REPO_ROOT" || exit 3
 CORPUS_TOOL="$ROOT/gate_d_corpus.py"
 if [ "${1:-}" = "--list-tasks" ]; then python3 "$CORPUS_TOOL" tasks; exit $?; fi

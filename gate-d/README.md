@@ -75,7 +75,10 @@ as text or as an existing file name, so a path is the only unambiguous form). Th
 exactly that file's bytes, which must be non-empty, valid UTF-8 and free of a byte-order mark,
 and the file is re-verified after every arm run. The snapshot lives under the absolute physical
 temp directory and is removed on exit. Runner Git calls ignore inherited `GIT_*` selectors, global
-and system config, and hooks. The variable is rejected on other arms, and a sweep fails closed if
+and system config, init templates, per-user attributes and excludes, and hooks. The runner aborts
+before the arm if the seed commit fails or does not hold exactly the task's files, and aborts if
+the checkout has a `.git` entry that Git cannot read (such as a shared checkout that relied on a
+global `safe.directory`). The variable is rejected on other arms, and a sweep fails closed if
 the committed prompt changes while it runs or if any run exits non-zero. The snapshot is protected
 from other users but not from a process running as the same OS user between the post-run checks;
 run sweeps from a dedicated account if that matters. A variant run on tasks that earlier runs

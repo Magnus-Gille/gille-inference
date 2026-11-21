@@ -14,14 +14,15 @@
 # Both return 3 with a message on stderr on any failure.
 
 # Runner-owned Git: no inherited repository/index selectors, no environment- or user-supplied
-# configuration (GIT_CONFIG_*, system and global config files), and no hooks. Only the checkout's
-# own .git/config still applies.
+# configuration (GIT_CONFIG_*, system and global config files), no init templates, no hooks, and
+# no per-user attributes or excludes. Only the checkout's own .git/config still applies.
 gd_git() {
   ( unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
           GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_CEILING_DIRECTORIES \
-          GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS
+          GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_TEMPLATE_DIR
     export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
-    git -c core.hooksPath=/dev/null "$@" )
+    git -c core.hooksPath=/dev/null -c core.attributesFile=/dev/null -c core.excludesFile=/dev/null \
+        "$@" )
 }
 
 gd_sha256_stdin() {

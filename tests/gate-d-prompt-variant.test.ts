@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 
 // Every case runs against a disposable git checkout of gate-d/, never the developer's checkout:
 // run.sh restores fixtures with `git checkout`/`git clean` when it detects drift, and that must only
@@ -28,8 +28,15 @@ afterEach(() => {
   for (const dir of cleanup.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
+// Fixtures are created under the test process's temp dir; refuse one inside this checkout.
+const TMP_PARENT = realpathSync(tmpdir());
+const REAL_ROOT_PHYSICAL = realpathSync(REAL_ROOT);
+if (TMP_PARENT === REAL_ROOT_PHYSICAL || TMP_PARENT.startsWith(REAL_ROOT_PHYSICAL + sep)) {
+  throw new Error(`the test temp dir ${TMP_PARENT} is inside this checkout; set TMPDIR elsewhere`);
+}
+
 function tmp(prefix: string): string {
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+  const dir = realpathSync(mkdtempSync(join(TMP_PARENT, prefix)));
   cleanup.push(dir);
   return dir;
 }
@@ -85,7 +92,8 @@ const args = process.argv.slice(2);
 const i = args.indexOf("--append-system-prompt");
 let prompt = null;
 if (i >= 0) { try { prompt = fs.readFileSync(args[i + 1], "utf8"); } catch (e) { prompt = null; } }
-fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ name: ${JSON.stringify(name)}, args, prompt }) + "\\n");
+const seeded = require("child_process").spawnSync("git", ["rev-parse", "--verify", "--quiet", "HEAD"]).status === 0;
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ name: ${JSON.stringify(name)}, args, prompt, seeded }) + "\\n");
 ${script}
 `,
     );
@@ -94,7 +102,7 @@ ${script}
   return { bin, log };
 }
 
-function calls(log: string): Array<{ name: string; args: string[]; prompt: string | null }> {
+function calls(log: string): Array<{ name: string; args: string[]; prompt: string | null; seeded: boolean }> {
   if (!existsSync(log)) return [];
   return readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
 }
@@ -304,6 +312,7 @@ describe("gate-d/run.sh pi prompt variants (INFER-519)", { timeout: 120_000 }, (
       env: cleanEnv({
         GW_KEY: "test-key",
         TMPDIR: "reltmp",
+        CDPATH: ".",
         GATE_D_WORKROOT: join(work, "gate-d-work"),
         GATE_D_OUT: out,
         GATE_D_PI_APPEND_SYSTEM: VARIANT,
@@ -341,7 +350,7 @@ describe("gate-d/run.sh pi prompt variants (INFER-519)", { timeout: 120_000 }, (
     const marker = join(hooks, "fired");
     writeFileSync(join(hooks, "pre-commit"), `#!/bin/sh\ntouch ${JSON.stringify(marker)}\nexit 1\n`);
     chmodSync(join(hooks, "pre-commit"), 0o755);
-    const { bin } = fakeBin();
+    const { bin, log } = fakeBin();
     const { res, out } = runGateD(
       repo,
       bin,
@@ -350,7 +359,71 @@ describe("gate-d/run.sh pi prompt variants (INFER-519)", { timeout: 120_000 }, (
     );
     expect(res.status, res.stderr).toBe(0);
     expect(existsSync(marker)).toBe(false);
+    expect(calls(log).map((c) => c.seeded)).toEqual([true]);
     expect(rows(out).pop()!.exitClass).toBe("G2-no-edit");
+  });
+
+  it("ignores an inherited Git template that would exclude fixture files from the seed commit", () => {
+    const repo = fixtureRepo();
+    const template = tmp("gd-template-");
+    mkdirSync(join(template, "info"));
+    writeFileSync(join(template, "info", "exclude"), "*.ts\n*.json\n");
+    const { bin, log } = fakeBin();
+    const { res, out } = runGateD(repo, bin, { GIT_TEMPLATE_DIR: template }, ["pi", TASK]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(calls(log).map((c) => c.seeded)).toEqual([true]);
+    expect(rows(out).pop()!.exitClass).toBe("G2-no-edit");
+  });
+
+  it("refuses to run the arm when the seed commit fails", () => {
+    const repo = fixtureRepo();
+    const { bin, log } = fakeBin();
+    const realGit = spawnSync("bash", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
+    writeFileSync(
+      join(bin, "git"),
+      `#!/usr/bin/env bash\nfor a in "$@"; do [ "$a" = seed ] && exit 1; done\nexec ${JSON.stringify(realGit)} "$@"\n`,
+    );
+    chmodSync(join(bin, "git"), 0o755);
+    const { res, out } = runGateD(repo, bin, {}, ["pi", TASK]);
+    expect(res.status).toBe(3);
+    expect(res.stderr).toContain("could not create the seed commit");
+    expect(calls(log)).toEqual([]);
+    expect(rows(out)).toEqual([]);
+  });
+
+  it("aborts when the checkout has a .git entry that Git cannot read", () => {
+    const repo = fixtureRepo();
+    rmSync(join(repo, ".git"), { recursive: true, force: true });
+    writeFileSync(join(repo, ".git"), "gitdir: /nonexistent/gate-d-test\n");
+    const { bin, log } = fakeBin();
+    const { res, out } = runGateD(repo, bin, {}, ["aider", TASK]);
+    expect(res.status).toBe(3);
+    expect(res.stderr).toContain("Git cannot read it");
+    expect(calls(log)).toEqual([]);
+    expect(rows(out)).toEqual([]);
+  });
+
+  it("resolves the default work root from a relative TMPDIR and refuses one inside the checkout", () => {
+    const repo = fixtureRepo();
+    const outside = tmp("gd-cwd-");
+    mkdirSync(join(outside, "reltmp"));
+    mkdirSync(join(repo, "reltmp"));
+    const run = (cwd: string) =>
+      spawnSync("bash", [join(repo, "gate-d", "run.sh"), "--print-workroot"], {
+        cwd,
+        encoding: "utf8",
+        env: cleanEnv({ TMPDIR: "reltmp", CDPATH: "." }),
+      });
+    const ok = run(outside);
+    expect(ok.status, ok.stderr).toBe(0);
+    expect(ok.stdout.trim()).toBe(join(outside, "reltmp", "gate-d-work"));
+    const inside = spawnSync("bash", [join(repo, "gate-d", "run.sh"), "pi", TASK], {
+      cwd: repo,
+      encoding: "utf8",
+      env: cleanEnv({ TMPDIR: "reltmp", GW_KEY: "test-key" }),
+    });
+    expect(inside.status).toBe(3);
+    expect(inside.stderr).toContain("INSIDE the repo");
   });
 
   it("labels baseline rows promptVariant none and passes no prompt flag", () => {
