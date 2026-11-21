@@ -1,0 +1,34 @@
+# REVIEWED CANDIDATE for Thinking Machines Inkling 2 Mini (released 2026-11-20); not yet live.
+# Model: thinkingmachines/Inkling-2-Mini — 26.4B total / 3.4B active looped MoE (layers 6-17 run
+# three times), hybrid local/global attention, image input.
+# Artifact: unsloth/Inkling-2-Mini-GGUF revision 29eac40c55957e3b76db6b7028e549cb244745de
+#   Inkling-2-Mini-UD-Q4_K_XL.gguf sha256 e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15
+#   mmproj-BF16.gguf               sha256 2c165c78790e78a3f45a2d1e9e931083e52ee69d45ff2a0dc9c281fdf1a666e7
+# Runtime: upstream llama.cpp master 29b52d398b294509746ec0a3f28948a3107c0213 (Vulkan, production
+#   flags). No earlier pinned runtime contains the inkling2 architecture. Upstream PR
+#   ggml-org/llama.cpp#32268 (chat-template/tool-call parser, vision preprocessing and embedding-norm
+#   fixes) was still an unmerged draft at this pin: text chat is the supported surface; tool calls
+#   and image captions are unqualified until a runtime containing #32268 replaces this pin.
+# Serving: 64K context, one slot, Q8 KV, Flash Attention, no draft model (the separate DSpark draft
+#   GGUF is not qualified). Reasoning depth is per request via `reasoning_effort`.
+# Memory estimate (not measured): ~20-22 GiB at 64K, dominated by weights; only 8 of 48 attention
+#   applications are global, the rest use a 1024-token sliding window.
+# /operator-resolve/ paths must be replaced with stable non-scratch operator paths kept in the
+# private operations tracker.
+key: inkling-2-mini
+api: chat
+gguf: /operator-resolve/models/inkling-2-mini/Inkling-2-Mini-UD-Q4_K_XL.gguf
+mmproj: /operator-resolve/models/inkling-2-mini/mmproj-BF16.gguf
+runtime_bin: /operator-resolve/llama-runtime/releases/29b52d398b294509746ec0a3f28948a3107c0213/bin/llama-server
+ctx: 65536
+ngl: 999
+ubatch: 512
+np: 1
+jinja: true
+fa: on
+reasoning_format: auto
+reasoning: auto
+cache_ram_mib: 2048
+ctk: q8_0
+ctv: q8_0
+ttl: 1800

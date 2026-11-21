@@ -200,6 +200,26 @@ describe("manual-promotion spec contract (#217)", () => {
     expect(manualWarmupRequest(spec, spec.key).path).toBe("/v1/chat/completions");
   });
 
+  it("keeps the Inkling 2 Mini candidate on its pinned inkling2 runtime with no draft model", () => {
+    const fixture = readFileSync(new URL("../deploy/specs/inkling-2-mini.yaml", import.meta.url), "utf8");
+    const spec = parseManualSpec(fixture);
+    expect(spec).toMatchObject({
+      key: "inkling-2-mini",
+      api: "chat",
+      ctx: 65536,
+      np: 1,
+      ctk: "q8_0",
+      ctv: "q8_0",
+      mmproj: "/operator-resolve/models/inkling-2-mini/mmproj-BF16.gguf",
+      specType: null,
+      lora: null,
+    });
+    const entry = renderManualEntry(spec);
+    expect(entry).toContain("/releases/29b52d398b294509746ec0a3f28948a3107c0213/bin/llama-server");
+    expect(entry).not.toContain("--lora");
+    expect(manualWarmupRequest(spec, spec.key).path).toBe("/v1/chat/completions");
+  });
+
   it("keeps the pi-adapted Qwen3.8 evaluation placeholder text-only, thinking-off and LoRA-bound", () => {
     const fixture = readFileSync(new URL("../deploy/specs/qwen38-27b-pi.yaml", import.meta.url), "utf8");
     const spec = parseManualSpec(fixture);
