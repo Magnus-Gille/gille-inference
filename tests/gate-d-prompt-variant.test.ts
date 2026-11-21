@@ -495,6 +495,24 @@ describe("gate-d/run.sh pi prompt variants (INFER-519)", { timeout: 120_000 }, (
     expect(calls(log).map((c) => c.seeded)).toEqual([true]);
   });
 
+  it.each([["checkout", false], ["plain deployment", true]])(
+    "seed check works with a BSD-style sed that rejects -z, %s (INFER-520)",
+    (_label, plain) => {
+      const repo = fixtureRepo();
+      if (plain) rmSync(join(repo, ".git"), { recursive: true, force: true });
+      const { bin, log } = fakeBin();
+      const realSed = spawnSync("bash", ["-c", "command -v sed"], { encoding: "utf8" }).stdout.trim();
+      writeFileSync(
+        join(bin, "sed"),
+        `#!/usr/bin/env bash\nfor a in "$@"; do case "$a" in -z|-*z*) echo "sed: illegal option -- z" >&2; exit 1;; esac; done\nexec ${JSON.stringify(realSed)} "$@"\n`,
+      );
+      chmodSync(join(bin, "sed"), 0o755);
+      const { res } = runGateD(repo, bin, {}, ["pi", TASK]);
+      expect(res.status, res.stderr).toBe(0);
+      expect(calls(log).map((c) => c.seeded)).toEqual([true]);
+    },
+  );
+
   it("refuses to run a task whose seed directory is missing", () => {
     const repo = fixtureRepo();
     git(repo, "rm", "-rq", `gate-d/tasks/${TASK}/repo`);

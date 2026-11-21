@@ -169,18 +169,26 @@ run_one() {
   local seed_expected_f seed_actual_f
   seed_expected_f="$(mktemp "${TMPDIR:-/tmp}/gd-seed-exp.XXXXXXXX")" || { echo "FATAL[$ARM/$id]: mktemp failed" >&2; exit 3; }
   seed_actual_f="$(mktemp "${TMPDIR:-/tmp}/gd-seed-act.XXXXXXXX")" || { rm -f "$seed_expected_f"; echo "FATAL[$ARM/$id]: mktemp failed" >&2; exit 3; }
+  # No sed -z (BSD sed lacks it): the checkout branch lists the task tree relative to itself, and
+  # the plain branch strips "./" with python3.
+  trap 'rm -f "$seed_expected_f" "$seed_actual_f"; exit 130' INT TERM
   if [ "$IN_GIT_CHECKOUT" = 1 ]; then
-    if ! gd_git -C "$REPO_ROOT" ls-tree -r -z HEAD -- "gate-d/tasks/$id/repo/" > "$seed_expected_f" \
-       || [ ! -s "$seed_expected_f" ] \
-       || ! LC_ALL=C sed -z "s|	gate-d/tasks/$id/repo/|	|" "$seed_expected_f" | LC_ALL=C sort -z > "$seed_actual_f" \
-       || ! mv "$seed_actual_f" "$seed_expected_f"; then
-      rm -f "$seed_expected_f" "$seed_actual_f"
+    if ! gd_git -C "$REPO_ROOT" ls-tree -r -z "HEAD:gate-d/tasks/$id/repo" > "$seed_actual_f" \
+       || [ ! -s "$seed_actual_f" ] \
+       || ! LC_ALL=C sort -z "$seed_actual_f" > "$seed_expected_f"; then
+      rm -f "$seed_expected_f" "$seed_actual_f"; trap - INT TERM
       echo "FATAL[$ARM/$id]: could not read the committed task tree; refusing to run the arm." >&2; exit 3
     fi
   else
-    if ! (cd "$T/repo" && find . \( -type f -o -type l \) -print0) | LC_ALL=C sed -z 's|^\./||' | LC_ALL=C sort -z > "$seed_expected_f" \
+    if ! (cd "$T/repo" && find . \( -type f -o -type l \) -print0) > "$seed_actual_f" \
+       || ! python3 -c '
+import sys
+recs = [r[2:] if r.startswith(b"./") else r for r in open(sys.argv[1], "rb").read().split(b"\0") if r]
+recs.sort()
+open(sys.argv[2], "wb").write(b"".join(r + b"\0" for r in recs))
+' "$seed_actual_f" "$seed_expected_f" \
        || [ ! -s "$seed_expected_f" ]; then
-      rm -f "$seed_expected_f" "$seed_actual_f"
+      rm -f "$seed_expected_f" "$seed_actual_f"; trap - INT TERM
       echo "FATAL[$ARM/$id]: could not enumerate $T/repo; refusing to run the arm." >&2; exit 3
     fi
   fi
@@ -189,14 +197,14 @@ run_one() {
   # -R, not -r: BSD cp (macOS) can dereference a symlink fixture under -r; -R keeps it a symlink.
   if ! cp -R "$T/repo/." "$W/"; then
     echo "FATAL[$ARM/$id]: could not copy the task seed; refusing to run the arm." >&2
-    rm -rf "$W" "$seed_expected_f" "$seed_actual_f"; exit 3
+    rm -rf "$W" "$seed_expected_f" "$seed_actual_f"; trap - INT TERM; exit 3
   fi
   # node_modules symlink: WORKROOT now lives OUTSIDE the repo (#172), so there's no ancestor dir
   # left for `npx --no-install` to climb into. Link the real node_modules in directly — check.sh's
   # tsc/tsx invocations keep resolving exactly as before, just via one hop instead of an upward walk.
   if ! ln -s "$REPO_ROOT/node_modules" "$W/node_modules"; then
     echo "FATAL[$ARM/$id]: could not link node_modules; refusing to run the arm." >&2
-    rm -rf "$W" "$seed_expected_f" "$seed_actual_f"; exit 3
+    rm -rf "$W" "$seed_expected_f" "$seed_actual_f"; trap - INT TERM; exit 3
   fi
   # Make the work dir its OWN git root, so aider/opencode/pi's git-based root-detection sees $W —
   # not this checkout — as the repo. Gives aider the committed HEAD baseline it diffs against
@@ -231,10 +239,10 @@ PY
   fi
   if [ "$seed_ok" != 1 ] || ! cmp -s "$seed_expected_f" "$seed_actual_f"; then
     echo "FATAL[$ARM/$id]: could not create the seed commit in $W; refusing to run the arm." >&2
-    rm -rf "$W" "$seed_expected_f" "$seed_actual_f"
+    rm -rf "$W" "$seed_expected_f" "$seed_actual_f"; trap - INT TERM
     exit 3
   fi
-  rm -f "$seed_expected_f" "$seed_actual_f"
+  rm -f "$seed_expected_f" "$seed_actual_f"; trap - INT TERM
   local t0 t1 status="ran"
   t0=$(date +%s)
   case "$ARM" in
