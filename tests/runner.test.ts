@@ -165,6 +165,10 @@ describe('Batch runner', () => {
         error_message     TEXT,
         created_at        TEXT NOT NULL,
         completed_at      TEXT,
+        requested_temperature REAL,
+        effective_temperature REAL,
+        seed INTEGER,
+        sampling_json TEXT,
         UNIQUE(batch_id, task_id, model_id)
       )
     `);
@@ -230,6 +234,10 @@ describe('Batch runner', () => {
         error_message     TEXT,
         created_at        TEXT NOT NULL,
         completed_at      TEXT,
+        requested_temperature REAL,
+        effective_temperature REAL,
+        seed INTEGER,
+        sampling_json TEXT,
         UNIQUE(batch_id, task_id, model_id)
       )
     `);
@@ -299,6 +307,10 @@ describe('Batch runner', () => {
         error_message     TEXT,
         created_at        TEXT NOT NULL,
         completed_at      TEXT,
+        requested_temperature REAL,
+        effective_temperature REAL,
+        seed INTEGER,
+        sampling_json TEXT,
         UNIQUE(batch_id, task_id, model_id)
       )
     `);
@@ -399,7 +411,11 @@ describe('Batch runner', () => {
         provider TEXT,
         error_message TEXT,
         created_at TEXT NOT NULL,
-        completed_at TEXT,
+        completed_at      TEXT,
+        requested_temperature REAL,
+        effective_temperature REAL,
+        seed INTEGER,
+        sampling_json TEXT,
         ttft_ms INTEGER,
         tokens_per_second REAL,
         UNIQUE(batch_id, task_id, model_id)

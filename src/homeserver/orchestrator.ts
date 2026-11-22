@@ -81,6 +81,12 @@ export interface DelegationTask {
   topK?: number;
   /** Min-p override; llama.cpp uses 0 to disable the filter. */
   minP?: number;
+  /**
+   * Explicit sampling seed for the local call. Omitted = no seed sent (backend samples randomly),
+   * which the #164 format retry relies on. When set, the one format retry uses seed + 1 so it is
+   * still a different sample, and the ledger row records the seed that produced its result.
+   */
+  seed?: number;
   /** How to grade the local output. Omit for passthrough (recorded "unverified"). */
   verifier?: Verifier;
   /** Label stored in the ledger's verifier column. */
@@ -925,6 +931,9 @@ async function delegateImpl(
               systemPrompt: task.systemPrompt,
               maxTokens,
               ...sampling,
+              // An explicit seed would make the #164 retry an identical request; offset it so the
+              // retry is still a fresh sample. The effective seed is returned in r.sampling.
+              ...(sampling.seed !== undefined ? { seed: sampling.seed + retryOrdinal } : {}),
               responseFormat,
               signal: controller.signal,
             });
@@ -989,6 +998,7 @@ async function delegateImpl(
       source: task.source,
       keyAlias: task.keyAlias,
       notes: [failNote, retryNote].filter(Boolean).join(" | "),
+      effectiveSampling: result.sampling ?? null,
       evidenceIdentity,
       learningTaskAdmissionId: task.learningTaskAdmissionId,
       learningTaskStamp: task.learningTaskStamp,
@@ -1107,6 +1117,7 @@ async function delegateImpl(
     gateScore: gate?.score ?? null,
     gateWouldEscalate: gate?.wouldEscalate ?? null,
     gateError: gate?.secondaryError ?? null,
+    effectiveSampling: result.sampling ?? null,
     evidenceIdentity,
     learningTaskAdmissionId: task.learningTaskAdmissionId,
     learningTaskStamp: task.learningTaskStamp,

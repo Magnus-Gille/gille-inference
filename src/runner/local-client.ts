@@ -1,5 +1,6 @@
 import { performance } from 'node:perf_hooks';
 import type { InferenceResult, InferenceOptions } from './openrouter-client.js';
+import { resolveEffectiveSampling, type EffectiveSampling } from './sampling.js';
 
 // Re-export types for convenience
 export type { InferenceResult, InferenceOptions };
@@ -22,6 +23,8 @@ export type LocalInferenceResult =
       finishReason?: string | null;
       /** Explicit false on a clean terminal response; omitted by backends without this signal. */
       truncated?: false;
+      /** Sampling actually sent to the backend (see src/runner/sampling.ts). */
+      sampling?: EffectiveSampling;
     }
   | {
       ok: false;
@@ -35,6 +38,8 @@ export type LocalInferenceResult =
       completionTokens?: number;
       durationMs?: number;
       ttftMs?: number;
+      /** Sampling actually sent to the backend, when the request got that far. */
+      sampling?: EffectiveSampling;
     };
 
 const DEFAULT_BASE_URL = 'http://localhost:11434';
@@ -160,7 +165,13 @@ export async function runLocalInference(
     systemPrompt = 'You are a helpful expert software engineer. Respond with clear, well-structured answers. For coding tasks, provide working code with brief explanations.',
     maxTokens = 4096,
     temperature = 0.0,
+    seed,
   } = options;
+  // Ollama: no temperature floor (unchanged behaviour); seed goes in `options.seed`.
+  const sampling = resolveEffectiveSampling(
+    { temperature, seed },
+    { temperature: 0, temperatureFloor: false }
+  );
 
   const baseUrl = getBaseUrl();
   const startTime = performance.now();
@@ -184,7 +195,8 @@ export async function runLocalInference(
         think: false,    // disable extended thinking — buffers entire chain before streaming, causing extreme TTFT
         keep_alive: -1,  // pin model in memory between tasks (overrides OLLAMA_KEEP_ALIVE default of 5m)
         options: {
-          temperature,
+          temperature: sampling.temperature,
+          ...(sampling.seed !== null ? { seed: sampling.seed } : {}),
           num_predict: maxTokens,
         },
       }),
@@ -192,11 +204,11 @@ export async function runLocalInference(
 
     if (!res.ok) {
       const text = await res.text();
-      return { ok: false, error: `Ollama error ${res.status}: ${text.slice(0, 200)}` };
+      return { ok: false, sampling, error: `Ollama error ${res.status}: ${text.slice(0, 200)}` };
     }
 
     if (!res.body) {
-      return { ok: false, error: 'No response body from Ollama' };
+      return { ok: false, sampling, error: 'No response body from Ollama' };
     }
 
     // Stream the response to capture TTFT
@@ -247,7 +259,7 @@ export async function runLocalInference(
     const response = chunks.join('');
 
     if (!response || response.trim() === '') {
-      return { ok: false, error: 'Empty response from Ollama' };
+      return { ok: false, sampling, error: 'Empty response from Ollama' };
     }
 
     // Calculate generation tok/s (excluding prompt processing time)
@@ -265,14 +277,15 @@ export async function runLocalInference(
       ttftMs,
       tokensPerSecond,
       provider: 'local-ollama',
+      sampling,
     };
   } catch (err) {
     if (err instanceof Error) {
       if (err.message.includes('ECONNREFUSED')) {
-        return { ok: false, error: 'Ollama not running — start it with: ollama serve' };
+        return { ok: false, sampling, error: 'Ollama not running — start it with: ollama serve' };
       }
-      return { ok: false, error: err.message };
+      return { ok: false, sampling, error: err.message };
     }
-    return { ok: false, error: String(err) };
+    return { ok: false, sampling, error: String(err) };
   }
 }

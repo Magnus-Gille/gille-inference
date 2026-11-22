@@ -1,5 +1,6 @@
 import OpenAI from 'openai';
 import { performance } from 'node:perf_hooks';
+import { resolveEffectiveSampling, type EffectiveSampling } from './sampling.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -18,8 +19,10 @@ export type InferenceResult =
       completionTokens: number;
       durationMs: number;
       provider?: string;
+      /** Sampling actually sent to the provider (see src/runner/sampling.ts). */
+      sampling?: EffectiveSampling;
     }
-  | { ok: false; error: string };
+  | { ok: false; error: string; sampling?: EffectiveSampling };
 
 export interface InferenceOptions {
   systemPrompt?: string;
@@ -38,6 +41,17 @@ export interface InferenceOptions {
    * the #164 retry band-aid). Ignored by the OpenRouter path.
    */
   responseFormat?: ResponseFormat;
+  /**
+   * Explicit sampling seed, forwarded to every provider that accepts one. Omitted means no seed is
+   * sent and the backend samples randomly; result rows then record `seed: null`.
+   */
+  seed?: number;
+  /**
+   * Local LM Studio / llama.cpp only: temperature used when the requested temperature is <= 0.
+   * Defaults to 0.6 (the established anti-degeneration floor); `false` sends literal 0.
+   * Whether it was applied is always returned as `sampling.temperatureFloorApplied`.
+   */
+  temperatureFloor?: number | false;
 }
 
 // ─── Client ───────────────────────────────────────────────────────────────────
@@ -84,7 +98,13 @@ export async function runInference(
     systemPrompt,
     maxTokens = 4096,
     temperature = 0.0,
+    seed,
   } = options;
+  // OpenRouter has no temperature floor; top_p/top_k/min_p are not forwarded on this path.
+  const sampling = resolveEffectiveSampling(
+    { temperature, seed },
+    { temperature: 0, temperatureFloor: false }
+  );
 
   const client = createClient();
 
@@ -110,14 +130,15 @@ export async function runInference(
         model: modelId,
         messages,
         max_tokens: maxTokens,
-        temperature,
+        temperature: sampling.temperature,
+        ...(sampling.seed !== null ? { seed: sampling.seed } : {}),
       });
 
       const durationMs = Math.round(performance.now() - start);
       const choice = completion.choices[0];
 
       if (!choice) {
-        return { ok: false, error: 'No choices in response' };
+        return { ok: false, sampling, error: 'No choices in response' };
       }
 
       // Some models (especially reasoning models like DeepSeek R1) may put
@@ -129,7 +150,7 @@ export async function runInference(
 
       if (!content || content.trim() === '') {
         const finishReason = choice.finish_reason ?? 'unknown';
-        return { ok: false, error: `Empty response from model (finish_reason: ${finishReason})` };
+        return { ok: false, sampling, error: `Empty response from model (finish_reason: ${finishReason})` };
       }
 
       return {
@@ -139,6 +160,7 @@ export async function runInference(
         completionTokens: completion.usage?.completion_tokens ?? 0,
         durationMs,
         provider: (completion as unknown as { provider?: string }).provider,
+        sampling,
       };
     } catch (err) {
       lastError = err;
@@ -149,10 +171,10 @@ export async function runInference(
   }
 
   if (lastError instanceof OpenAI.APIError) {
-    return { ok: false, error: `OpenRouter API error ${lastError.status}: ${lastError.message}` };
+    return { ok: false, sampling, error: `OpenRouter API error ${lastError.status}: ${lastError.message}` };
   }
   if (lastError instanceof Error) {
-    return { ok: false, error: lastError.message };
+    return { ok: false, sampling, error: lastError.message };
   }
-  return { ok: false, error: String(lastError) };
+  return { ok: false, sampling, error: String(lastError) };
 }

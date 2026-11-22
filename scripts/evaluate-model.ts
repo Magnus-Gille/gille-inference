@@ -18,6 +18,7 @@
  *   EVAL_MODEL_PORT             9099
  *   EVAL_MODEL_CTX              8192
  *   EVAL_MODEL_REPEATS         1
+ *   EVAL_MODEL_SEED            1 (repeat r uses seed + r - 1; "none" sends no seed)
  *   EVAL_MODEL_REGISTRY        ./data/model-scout-registry.jsonl (historic path)
  *   EVAL_MODEL_IDENTITY        stable opaque identity reused only for an exact retry
  *   LLAMA_SERVER_BIN            /home/magnus/llama.cpp/build/bin/llama-server
@@ -33,6 +34,7 @@ import { dirname, isAbsolute, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { makeChatFn, runProbes } from "../src/homeserver/probe-runner.js";
+import { resolveLocalSampling } from "../src/homeserver/sampling-profile.js";
 import {
   DEFAULT_REGISTRY_PATH,
   appendEntry,
@@ -64,6 +66,8 @@ const DEFAULT_GATEWAY_URL = "http://127.0.0.1:8080";
 const DEFAULT_PORT = 9099;
 const DEFAULT_CTX = 8192;
 const DEFAULT_REPEATS = 1;
+/** Default probe seed; matches the Strix harness (seed 1). */
+const DEFAULT_SEED = 1;
 const DEFAULT_MAINTENANCE_TTL_S = 7200;
 const DEFAULT_MAINTENANCE_DRAIN_TIMEOUT_S = 60;
 const EVALUATION_CLEANUP_RESERVE_S = 320;
@@ -72,6 +76,16 @@ const RESIDENCY_RESTORE_TIMEOUT_MS = 300_000;
 const PORT = Number(process.env["EVAL_MODEL_PORT"] ?? DEFAULT_PORT);
 const CTX = Number(process.env["EVAL_MODEL_CTX"] ?? DEFAULT_CTX);
 const REPEATS = Number(process.env["EVAL_MODEL_REPEATS"] ?? DEFAULT_REPEATS);
+const SEED = parseSeedEnv(process.env["EVAL_MODEL_SEED"]);
+
+/** Parse EVAL_MODEL_SEED: unset = DEFAULT_SEED, "none" = no seed, else a non-negative integer. */
+export function parseSeedEnv(raw: string | undefined): number | null {
+  if (raw === undefined || raw.trim() === "") return DEFAULT_SEED;
+  if (raw.trim() === "none") return null;
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n) || n < 0) throw new Error(`EVAL_MODEL_SEED must be a non-negative integer or "none", got: ${raw}`);
+  return n;
+}
 const BIN = process.env["LLAMA_SERVER_BIN"] ?? DEFAULT_LLAMA_SERVER_BIN;
 const LLAMASWAP_URL = (process.env["LLAMASWAP_URL"] ?? "http://127.0.0.1:8091").replace(/\/$/, "");
 const REGISTRY = process.env["EVAL_MODEL_REGISTRY"] ?? DEFAULT_REGISTRY_PATH;
@@ -153,19 +167,35 @@ export function decideVerdict(summary: ProbeRunSummary): ScoutVerdict {
   return "skip";
 }
 
-function evalServingConfig(): { ctx: number; repeats: number; ngl: number; flashAttn: string } {
-  return { ctx: CTX, repeats: REPEATS, ngl: 99, flashAttn: "on" };
+type EvalServingConfig = NonNullable<RegistryEntry["evalServingConfig"]> & { ngl: number; flashAttn: string };
+
+/**
+ * Exact serving + sampling configuration. `sampling` is the model-aware profile the probe runner
+ * sends (no probe sets its own temperature), so VibeThinker rows say temperature 1, not 0.
+ */
+function evalServingConfig(modelId: string): EvalServingConfig {
+  const s = resolveLocalSampling(modelId, {});
+  return {
+    ctx: CTX,
+    repeats: REPEATS,
+    ngl: 99,
+    flashAttn: "on",
+    seed: SEED,
+    sampling: { temperature: s.temperature, topP: s.topP ?? null, topK: s.topK ?? null, minP: s.minP ?? null },
+  };
 }
 
 function sameEvalServingConfig(
   actual: RegistryEntry["evalServingConfig"],
-  expected: ReturnType<typeof evalServingConfig>,
+  expected: EvalServingConfig,
 ): boolean {
+  // A prior row without `seed` predates seed recording: it was run unseeded (null).
   return actual !== undefined &&
     actual.ctx === expected.ctx &&
     actual.repeats === expected.repeats &&
     actual.ngl === expected.ngl &&
-    actual.flashAttn === expected.flashAttn;
+    actual.flashAttn === expected.flashAttn &&
+    (actual.seed ?? null) === expected.seed;
 }
 
 /** Build the durable content-blind registry row. `served` is always false here. */
@@ -178,7 +208,7 @@ export function buildRegistryEntry(
   for (const task of summary?.byTaskType ?? []) {
     scoresByTaskType[task.taskType] = Math.round(task.passRate * 1000) / 1000;
   }
-  const servingConfig = summary ? evalServingConfig() : undefined;
+  const servingConfig = summary ? evalServingConfig(candidate.id) : undefined;
   const gate = evaluateScoutGate({ id: candidate.id, scoresByTaskType }, EVAL_GATE_CONFIG);
   const gateFlags = [
     "manual-evaluation-only",
@@ -371,6 +401,7 @@ async function evaluate(candidate: ManualEvaluationCandidate, windowSignal: Abor
       endpoint: EVALUATION_ENDPOINT,
       probes: PROBES,
       repeats: REPEATS,
+      ...(SEED !== null ? { seed: SEED } : {}),
       chat: makeChatFn({ endpoint: EVALUATION_ENDPOINT, apiKey: "", signal }),
       signal,
     });
@@ -435,7 +466,7 @@ export async function runProtectedEvaluation(
   if (prior) {
     const servingConfigMatches = prior.verdict === "load_failed"
       ? prior.evalServingConfig === undefined
-      : sameEvalServingConfig(prior.evalServingConfig, evalServingConfig());
+      : sameEvalServingConfig(prior.evalServingConfig, evalServingConfig(candidate.id));
     const sameCandidate =
       prior.evaluationId === candidate.evaluationId &&
       prior.id === candidate.id &&

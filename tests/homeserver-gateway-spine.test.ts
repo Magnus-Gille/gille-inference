@@ -2829,6 +2829,18 @@ describe("gateway spine — HTTP integration", () => {
     expect(j.error.param).toBe("topK");
   });
 
+  it.each([[-1], [1.5], ["7"]])("/delegate rejects a malformed seed (%j) before admission", async (seed) => {
+    const owner = mintKey({ alias: `bad-seed-delegate-${String(seed)}`, tier: "owner", scope: "admin" }, DEFAULTS);
+    const res = await fetch(url("/delegate"), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner.plaintextKey}` },
+      body: JSON.stringify({ prompt: "hi", seed }),
+    });
+    expect(res.status).toBe(400);
+    const j = (await res.json()) as { error: { param: string | null } };
+    expect(j.error.param).toBe("seed");
+  });
+
   it("#15: missing 'modelKey' on /admin/models/load → 400 envelope with param:modelKey", async () => {
     const res = await fetch(url("/admin/models/load"), {
       method: "POST",

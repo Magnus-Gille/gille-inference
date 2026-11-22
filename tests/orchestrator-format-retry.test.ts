@@ -185,6 +185,36 @@ describe("delegate() — retry-on-transient-parse-error (#164)", () => {
     expect(rec.notes ?? "").toContain("format-retry");
   });
 
+  it("offsets an explicit seed on the retry and records the seed that produced the result", async () => {
+    const sampling = (seed: number) => ({
+      requestedTemperature: 0, temperature: 0.6, temperatureFloorApplied: true,
+      seed, topP: 0.95, topK: 20, minP: null,
+    });
+    lmInferenceMock
+      .mockResolvedValueOnce({ ok: false as const, error: PEG_ERROR, sampling: sampling(41) })
+      .mockResolvedValueOnce({ ...lmOk("LOCAL JSON ANSWER"), sampling: sampling(42) });
+
+    const out = await delegate({ prompt: "output ONLY JSON", seed: 41 });
+
+    expect(out.formatRetried).toBe(true);
+    // An identical seeded retry would reproduce the same sample; the retry must differ.
+    expect((lmInferenceMock.mock.calls[0]![2] as { seed?: number }).seed).toBe(41);
+    expect((lmInferenceMock.mock.calls[1]![2] as { seed?: number }).seed).toBe(42);
+    const rec = recordDelegationMock.mock.calls[0]![0] as { effectiveSampling?: { seed: number } };
+    expect(rec.effectiveSampling?.seed).toBe(42);
+  });
+
+  it("sends no seed on either attempt when none is requested", async () => {
+    lmInferenceMock
+      .mockResolvedValueOnce({ ok: false as const, error: PEG_ERROR })
+      .mockResolvedValueOnce(lmOk("LOCAL JSON ANSWER"));
+
+    await delegate({ prompt: "output ONLY JSON" });
+
+    expect(lmInferenceMock.mock.calls[0]![2]).not.toHaveProperty("seed");
+    expect(lmInferenceMock.mock.calls[1]![2]).not.toHaveProperty("seed");
+  });
+
   it("invokes model-start admission for both the initial attempt and its format retry", async () => {
     lmInferenceMock
       .mockResolvedValueOnce({ ok: false as const, error: PEG_ERROR })

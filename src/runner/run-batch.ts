@@ -29,7 +29,21 @@ export interface BatchOptions {
   localModelMap?: Record<string, string>;
   /** Skip preflight checks for local provider (useful in tests) */
   skipPreflight?: boolean;
+  /**
+   * Sampling seed sent with every call. Defaults to DEFAULT_BATCH_SEED so a batch is reproducible;
+   * pass `null` to send no seed. Extra trials must use a different batch id AND a different seed
+   * (evals policy: k=1 by default, extra trials vary seed or prompt explicitly).
+   */
+  seed?: number | null;
+  /**
+   * LM Studio only: temperature used when the requested 0 would otherwise be sent. Default keeps the
+   * client's 0.6 anti-degeneration floor; `false` sends literal 0 (greedy). Recorded per row.
+   */
+  temperatureFloor?: number | false;
 }
+
+/** Default seed for batch runs; matches the Strix harness (temperature 0, seed 1). */
+export const DEFAULT_BATCH_SEED = 1;
 
 export interface BatchResult {
   completed: number;
@@ -59,6 +73,7 @@ export async function runBatch(options: BatchOptions): Promise<BatchResult> {
     provider = 'openrouter',
     localModelMap = {},
   } = options;
+  const seed = options.seed === undefined ? DEFAULT_BATCH_SEED : options.seed;
 
   // Local inference must be sequential — one request at a time per model
   const concurrency = isLocalProvider(provider) ? 1 : requestedConcurrency;
@@ -175,7 +190,11 @@ export async function runBatch(options: BatchOptions): Promise<BatchResult> {
       error_message = @errorMessage,
       completed_at = @completedAt,
       ttft_ms = @ttftMs,
-      tokens_per_second = @tokensPerSecond
+      tokens_per_second = @tokensPerSecond,
+      requested_temperature = @requestedTemperature,
+      effective_temperature = @effectiveTemperature,
+      seed = @seed,
+      sampling_json = @samplingJson
     WHERE batch_id = @batchId AND task_id = @taskId AND model_id = @modelId
   `);
 
@@ -202,6 +221,8 @@ export async function runBatch(options: BatchOptions): Promise<BatchResult> {
       systemPrompt: task.systemPrompt,
       maxTokens,
       temperature: 0.0,
+      ...(seed !== null ? { seed } : {}),
+      ...(options.temperatureFloor !== undefined ? { temperatureFloor: options.temperatureFloor } : {}),
     };
 
     const result =
@@ -212,6 +233,14 @@ export async function runBatch(options: BatchOptions): Promise<BatchResult> {
           : await runInference(model.id, task.prompt, inferenceOpts);
 
     const completedAt = new Date().toISOString();
+    // Record the sampling that was SENT (after any local temperature floor), never the request.
+    const sampling = result.sampling ?? null;
+    const samplingCols = {
+      requestedTemperature: sampling?.requestedTemperature ?? null,
+      effectiveTemperature: sampling?.temperature ?? null,
+      seed: sampling?.seed ?? null,
+      samplingJson: sampling ? JSON.stringify(sampling) : null,
+    };
 
     if (result.ok) {
       // Calculate cost (zero for local)
@@ -241,6 +270,7 @@ export async function runBatch(options: BatchOptions): Promise<BatchResult> {
         modelId: model.id,
         ttftMs,
         tokensPerSecond,
+        ...samplingCols,
       });
 
       completed++;
@@ -265,6 +295,7 @@ export async function runBatch(options: BatchOptions): Promise<BatchResult> {
         modelId: model.id,
         ttftMs: null,
         tokensPerSecond: null,
+        ...samplingCols,
       });
 
       failed++;
