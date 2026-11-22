@@ -66,7 +66,9 @@ describe("Gate D corpus revision contract (#250)", () => {
     for (const path of [RUN, SWEEP]) {
       const source = readFileSync(path, "utf8");
       expect(source).toContain('CORPUS_TOOL="$ROOT/gate_d_corpus.py"');
-      expect(source).toContain('python3 "$CORPUS_TOOL" tasks');
+      // gd_corpus wraps the helper (INFER-521: it adds the external root without bash-4.4 arrays).
+      expect(source).toContain('python3 "$CORPUS_TOOL" "$@"');
+      expect(source).toContain("gd_corpus tasks");
       expect(source).not.toContain('ls -d */');
       expect(source).not.toContain('"$ROOT"/tasks/*/');
     }

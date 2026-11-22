@@ -84,6 +84,7 @@ def task_metadata(task_id: str) -> dict[str, Any]:
 EXTERNAL_MANIFEST = "corpus-manifest.json"
 TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 DIGEST = re.compile(r"[0-9a-f]{64}")
+UNSAFE_PATH = re.compile(r"[\'\"\\$`\x00-\x1f\x7f]")
 # Fields copied from a verified task's meta.json into every result row, so analysis needs no join.
 IDENTITY_STRINGS = ("family", "split")
 
@@ -113,13 +114,15 @@ def _same_or_inside(path: Path, root: Path) -> bool:
         current = parent
 
 
-def tree_digest(task_dir: Path) -> str:
+def tree_digest(task_dir: Path, capture: dict[str, bytes | None] | None = None) -> str:
     """Content digest of a task directory, identical to code-battle's ``core.tree_digest``.
 
     sha256 over ``relpath \0 sha256(file) \n`` for every file, in pathlib order (component-wise,
     which differs from plain string order when a name contains a character below ``/``).
     Symlinks, sockets, FIFOs and devices are refused rather than followed or skipped: the generator
     never writes them, and following one would let the digest vouch for bytes outside the task.
+    Empty directories and file modes are not covered, matching the generator.
+    ``capture`` maps relpaths to fill with the exact bytes that were hashed.
     """
     entries: list[tuple[tuple[str, ...], str, Path]] = []
     for dirpath, dirnames, filenames in os.walk(task_dir, followlinks=False):
@@ -139,7 +142,10 @@ def tree_digest(task_dir: Path) -> str:
     entries.sort(key=lambda entry: entry[0])
     digest = hashlib.sha256()
     for _parts, rel, full in entries:
-        digest.update(rel.encode() + b"\0" + hashlib.sha256(full.read_bytes()).hexdigest().encode() + b"\n")
+        data = full.read_bytes()
+        if capture is not None and rel in capture:
+            capture[rel] = data
+        digest.update(rel.encode() + b"\0" + hashlib.sha256(data).hexdigest().encode() + b"\n")
     return digest.hexdigest()
 
 
@@ -148,6 +154,11 @@ def external_root(raw: str, repo_root: Path = ROOT.parent) -> Path:
     if not raw:
         raise ExternalCorpusError("the external task root is empty")
     root = Path(os.path.realpath(raw))
+    if UNSAFE_PATH.search(str(root)):
+        # check.sh, at-stop.sh and the runner's meta helpers interpolate task paths into
+        # `python3 -c "...open('$path')..."`; a quote there silently changes what they read.
+        raise ExternalCorpusError(
+            f"external task root {root!s} contains a quote, backslash, $, backtick or control character; use a plain path")
     if not root.is_dir():
         raise ExternalCorpusError(f"external task root {root} is not a directory")
     if _same_or_inside(root, repo_root) or _same_or_inside(repo_root, root):
@@ -158,12 +169,22 @@ def external_root(raw: str, repo_root: Path = ROOT.parent) -> Path:
     return root
 
 
-def load_external_manifest(root: Path) -> dict[str, Any]:
+def load_external_manifest(root: Path, expect_sha256: str | None = None) -> dict[str, Any]:
+    """Parse the manifest; with ``expect_sha256``, parse only bytes that hash to that pin."""
     path = root / EXTERNAL_MANIFEST
     if not path.is_file() or path.is_symlink():
         raise ExternalCorpusError(f"{path} is missing or not a regular file")
     try:
-        manifest = json.loads(path.read_text(encoding="utf-8"))
+        data = path.read_bytes()
+    except OSError as error:
+        raise ExternalCorpusError(f"cannot read {path}: {error}") from error
+    if expect_sha256 is not None:
+        actual = "sha256:" + hashlib.sha256(data).hexdigest()
+        if actual != expect_sha256:
+            raise ExternalCorpusError(
+                f"{path} changed since it was pinned ({actual} != {expect_sha256}); refusing to run")
+    try:
+        manifest = json.loads(data.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ExternalCorpusError(f"{path} is not valid JSON: {error}") from error
     if not isinstance(manifest, dict):
@@ -232,11 +253,21 @@ def verify_external_task(root: Path, manifest: dict[str, Any], task_id: str,
     task_dir = root / task_id
     if task_dir.is_symlink() or not task_dir.is_dir():
         raise ExternalCorpusError(f"{task_dir} is missing or not a plain directory")
-    actual = tree_digest(task_dir)
+    hashed: dict[str, bytes | None] = {"meta.json": None}
+    actual = tree_digest(task_dir, hashed)
     if actual != entry["digest"]:
         raise ExternalCorpusError(
             f"task {task_id} content digest {actual} does not match the manifest ({entry['digest']})")
-    meta = _read_meta(task_dir)
+    # Identity comes from the very bytes the digest vouched for, not from a second read.
+    raw_meta = hashed["meta.json"]
+    if raw_meta is None:
+        raise ExternalCorpusError(f"task {task_id} has no meta.json")
+    try:
+        meta = json.loads(raw_meta.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ExternalCorpusError(f"task {task_id} meta.json is not valid JSON: {error}") from error
+    if not isinstance(meta, dict):
+        raise ExternalCorpusError(f"task {task_id} meta.json must hold a JSON object")
     if meta.get("corpusRevision") != manifest["corpusRevision"]:
         raise ExternalCorpusError(
             f"task {task_id} meta.json corpusRevision {meta.get('corpusRevision')!r} "
@@ -264,13 +295,14 @@ def manifest_sha256(root: Path) -> str:
 def external_main(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     include = args.include_holdout or include_holdout_from_env()
     root = external_root(args.tasks_root)
-    manifest = load_external_manifest(root)
+    if args.command == "manifest-sha256":
+        print(manifest_sha256(root))
+        return 0
+    manifest = load_external_manifest(root, args.expect_manifest_sha)
     if args.command == "root":
         print(root)
     elif args.command == "revision":
         print(manifest["corpusRevision"])
-    elif args.command == "manifest-sha256":
-        print(manifest_sha256(root))
     elif args.command in ("tasks", "describe"):
         tasks = external_tasks(root, manifest, include)
         if not tasks:
@@ -327,6 +359,7 @@ def main() -> int:
     parser.add_argument("--include-holdout", action="store_true")
     parser.add_argument("--revision")
     parser.add_argument("--tasks-root", help="external task root with corpus-manifest.json (INFER-521)")
+    parser.add_argument("--expect-manifest-sha", help="refuse unless corpus-manifest.json hashes to this sha256:<hex>")
     args = parser.parse_args()
     if args.tasks_root is not None:
         if args.revision is not None:

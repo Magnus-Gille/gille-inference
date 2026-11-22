@@ -32,19 +32,27 @@ ROOT="$(cd "$(dirname "$0")" && pwd -P)"
 REPO_ROOT="$(cd "$ROOT/.." && pwd -P)"
 cd "$REPO_ROOT" || exit 3
 CORPUS_TOOL="$ROOT/gate_d_corpus.py"
-CORPUS_ARGS=(); TASK_REVISIONS="{}"
+EXTERNAL=0; TASKS_DIR=""; MANIFEST_SHA=""; TASK_REVISIONS="{}"
+# The corpus tool, aimed at the external root and pinned to one manifest digest when there is one.
+# A plain function rather than an argument array: an empty "${arr[@]}" is an unbound-variable error
+# under `set -u` in bash < 4.4, which is still macOS's /bin/bash.
+gd_corpus(){
+  if [ "$EXTERNAL" != 1 ]; then python3 "$CORPUS_TOOL" "$@"
+  elif [ -n "$MANIFEST_SHA" ]; then python3 "$CORPUS_TOOL" "$@" --tasks-root "$TASKS_DIR" --expect-manifest-sha "$MANIFEST_SHA"
+  else python3 "$CORPUS_TOOL" "$@" --tasks-root "$TASKS_DIR"; fi
+}
 if [ -n "${GATE_D_TASKS_ROOT+set}" ]; then
-  GATE_D_TASKS_ROOT="$(python3 "$CORPUS_TOOL" root --tasks-root "$GATE_D_TASKS_ROOT")" || exit 3
-  export GATE_D_TASKS_ROOT
-  CORPUS_ARGS=(--tasks-root "$GATE_D_TASKS_ROOT")
+  TASKS_DIR="$(python3 "$CORPUS_TOOL" root --tasks-root "$GATE_D_TASKS_ROOT")" || exit 3
+  EXTERNAL=1; GATE_D_TASKS_ROOT="$TASKS_DIR"; export GATE_D_TASKS_ROOT
+  # Pinned before enumeration, so every task this sweep lists comes from these manifest bytes.
+  MANIFEST_SHA="$(gd_corpus manifest-sha256)" || exit 3
 fi
-if [ "${1:-}" = "--list-tasks" ]; then python3 "$CORPUS_TOOL" tasks "${CORPUS_ARGS[@]}"; exit $?; fi
-CORPUS_REVISION="$(python3 "$CORPUS_TOOL" revision "${CORPUS_ARGS[@]}")" || exit 3
-TASKS="$(python3 "$CORPUS_TOOL" tasks "${CORPUS_ARGS[@]}")" || exit 3
-if [ "${#CORPUS_ARGS[@]}" -gt 0 ]; then
-  GATE_D_EXPECT_MANIFEST_SHA="$(python3 "$CORPUS_TOOL" manifest-sha256 "${CORPUS_ARGS[@]}")" || exit 3
-  export GATE_D_EXPECT_MANIFEST_SHA
-  TASK_REVISIONS="$(python3 "$CORPUS_TOOL" describe "${CORPUS_ARGS[@]}" \
+if [ "${1:-}" = "--list-tasks" ]; then gd_corpus tasks; exit $?; fi
+CORPUS_REVISION="$(gd_corpus revision)" || exit 3
+TASKS="$(gd_corpus tasks)" || exit 3
+if [ "$EXTERNAL" = 1 ]; then
+  GATE_D_EXPECT_MANIFEST_SHA="$MANIFEST_SHA"; export GATE_D_EXPECT_MANIFEST_SHA
+  TASK_REVISIONS="$(gd_corpus describe \
     | python3 -c 'import json,sys;print(json.dumps(json.load(sys.stdin)["taskRevisions"]))')" || exit 3
 else
   unset GATE_D_EXPECT_MANIFEST_SHA

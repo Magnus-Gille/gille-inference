@@ -283,6 +283,7 @@ function requireCommittedBenchmarkSources(
     "benchmarks/real-agent/pi-models.json",
     "scripts/real-agent-benchmark.ts",
     "scripts/pi-benchmark-telemetry.ts",
+    "scripts/pi-verification-telemetry.ts",
     ...tasks.flatMap((task) => task.oracleFiles.map((oracle) => oracle.source)),
   ])].sort();
   const status = spawnSync("git", [

@@ -61,13 +61,19 @@ python3 scripts/gate-d-code-loop.py --tasks-root "$GATE_D_TASKS_ROOT" --list-tas
 Contract:
 
 - **Location.** The root, after resolving symlinks, may neither lie inside this checkout nor
-  contain it, and the work root may neither lie inside the task root nor contain it.
+  contain it, and the work root may neither lie inside the task root nor contain it. Its path may
+  not contain quotes, backslashes, `$`, backticks or control characters, because `check.sh` and
+  `at-stop.sh` interpolate task paths into Python one-liners.
 - **Integrity.** Each task directory's digest (sha256 over the component-wise sorted
   `relpath\0sha256(file)\n` entries, identical to the generator's `tree_digest`) must equal the
   manifest's `digest` before the arm, after the arm, and after grading. A mismatch, an added or
   removed file, or any symlink or special file aborts with exit 9 and no row. This replaces the
   `git status` guard, which cannot see outside the checkout; the committed-fixture guard still runs.
-  A sweep also pins the manifest's own sha256 and aborts if it changes mid-sweep.
+  `run.sh` pins the manifest's own sha256 when it starts (a sweep pins it once for every run), and
+  every check parses only those bytes, so rewriting a task together with its manifest digest also
+  aborts. The post-run checks must reproduce the pre-run identity exactly. Empty directories and file
+  modes are outside the digest, as in the generator. There is no automatic restore for an external
+  root: regenerate it (`generate.py --check-manifest` shows drift).
 - **Sealing.** A task is sealed when its `meta.json` says `holdout: true` or the manifest's split is
   `sealed`. Sealed tasks need `GATE_D_INCLUDE_HOLDOUT=1` (code-loop: `--include-holdout`), are left
   out of `all` without it, and are refused by name.
@@ -80,8 +86,16 @@ Contract:
   oracle), and the pi-transcript fields `verificationClass`, `typecheckRuns`, `testRuns`,
   `typecheckAfterLastEdit`, `testsAfterLastEdit`, `lastTypecheckOutcome`, `lastTestOutcome`,
   `stoppedWithFailingCheck`, `ambiguousCheckOutcomes`, `firstEditTurn`, `lastEditTurn` and `edits`.
-  `null` means not measured: a non-pi arm, or an at-stop script that failed, timed out or printed
-  anything outside its schema. Neither metric can change pass/fail. r1/r2 rows are unchanged.
+  `null` means not measured for the at-stop fields (a failed, timed-out or off-schema script, which
+  also prints a warning). For the transcript fields use `verificationSchema`: it names the classifier
+  when the fields were measured and is `null` otherwise (non-pi arms), because some of those fields
+  are legitimately `null` when measured (no check ran, no edit). at-stop runs on a throwaway copy of
+  the work dir, so neither metric can change pass/fail. r1/r2 rows are unchanged.
+- **Code-loop runner.** `scripts/gate-d-code-loop.py --tasks-root` applies the same enumeration,
+  sealing, digest and identity rules (manifest read once, held in memory) and records the at-stop
+  fields, but no transcript fields. It grades inside the checkout as before, since its arm runs
+  remotely; it now links `node_modules` into the grading dir, which `check.sh`'s G0-toolchain gate
+  requires.
 
 Both scripts that produce those fields are pinned copies in this repository (`gate-d/at-stop.sh`,
 `scripts/pi-verification-telemetry.ts`) rather than code loaded from the task root, because the

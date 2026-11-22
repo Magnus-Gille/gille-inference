@@ -274,6 +274,7 @@ describe("gate-d/run.sh external task root (INFER-521)", { timeout: 240_000 }, (
       typecheckAfterLastEdit: true, testsAfterLastEdit: false, lastTypecheckOutcome: "passed",
       lastTestOutcome: null, stoppedWithFailingCheck: false, ambiguousCheckOutcomes: 0,
       firstEditTurn: 1, lastEditTurn: 1, edits: 1, turns: 2,
+      verificationSchema: "gate-d-r3/verification-telemetry@1",
     });
     expect(b).toMatchObject({
       pass: false, exitClass: "G2-no-edit", family: "paginate-family", trap: true,
@@ -295,7 +296,7 @@ describe("gate-d/run.sh external task root (INFER-521)", { timeout: 240_000 }, (
     const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["aider", TASK_B]);
     expect(res.status, res.stderr).toBe(0);
     const [row] = rows(out);
-    for (const k of VERIFICATION_KEYS) expect(row![k], k).toBeNull();
+    for (const k of [...VERIFICATION_KEYS, "verificationSchema"]) expect(row![k], k).toBeNull();
     expect(row).toMatchObject({ atStopVisibleTests: "failed", detectableFailureAtStop: true, pass: false });
   });
 
@@ -360,6 +361,53 @@ describe("gate-d/run.sh external task root (INFER-521)", { timeout: 240_000 }, (
     expect(r.res.status).toBe(9);
     expect(r.res.stderr).toContain("does not match the manifest");
     expect(calls(log)).toHaveLength(1);
+  });
+
+  it("aborts without a row when the arm rewrites a task and its manifest digest together", () => {
+    const repo = fixtureRepo();
+    const root = corpus();
+    const { bin, log } = fakeBin(root, `
+const manifestPath = path.join(root, "corpus-manifest.json");
+fs.appendFileSync(path.join(root, task, "INSTRUCTION.md"), "\\nrewritten\\n");
+const h = (d) => { const c = require("crypto"); const files = [];
+  const walk = (x) => { for (const n of fs.readdirSync(x)) { const f = path.join(x, n); fs.statSync(f).isDirectory() ? walk(f) : files.push(path.relative(d, f)); } };
+  walk(d); files.sort((a, b) => { const pa = a.split("/"), pb = b.split("/");
+    for (let i = 0; i < Math.min(pa.length, pb.length); i++) if (pa[i] !== pb[i]) return pa[i] < pb[i] ? -1 : 1; return pa.length - pb.length; });
+  const out = c.createHash("sha256");
+  for (const r of files) out.update(Buffer.concat([Buffer.from(r), Buffer.from([0]), Buffer.from(c.createHash("sha256").update(fs.readFileSync(path.join(d, r))).digest("hex")), Buffer.from("\\n")]));
+  return out.digest("hex"); };
+const m = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+for (const t of m.tasks) if (t.id === task) t.digest = h(path.join(root, task));
+fs.writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\\n");`);
+    const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", TASK_A]);
+    expect(calls(log)).toHaveLength(1);
+    expect(res.status).toBe(9);
+    expect(res.stderr).toContain("changed since it was pinned");
+    expect(rows(out)).toEqual([]);
+  });
+
+  it("refuses a task root whose path a shell-interpolating helper would misread", () => {
+    const repo = fixtureRepo();
+    const parent = tmp("gd-ext-quote-");
+    const quoted = join(parent, "it's a root");
+    cpSync(corpus(), quoted, { recursive: true });
+    const { bin, log } = fakeBin(quoted);
+    const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: quoted }, ["pi", "all"]);
+    expect(res.status).toBe(3);
+    expect(res.stderr).toContain("plain path");
+    expect(calls(log)).toEqual([]);
+    expect(rows(out)).toEqual([]);
+  });
+
+  it("runs at-stop.sh on a copy, so files it leaves behind never reach check.sh", () => {
+    const repo = fixtureRepo();
+    writeFileSync(join(repo, "gate-d", "at-stop.sh"),
+      `#!/usr/bin/env bash\necho junk > "$2/src/leftover.ts"\necho '{"atStopTypecheck":"passed","atStopVisibleTests":"none","detectableFailureAtStop":false}'\n`);
+    const root = corpus();
+    const { bin } = fakeBin(root);
+    const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", TASK_A]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(rows(out)[0]).toMatchObject({ pass: true, exitClass: "pass", atStopTypecheck: "passed" });
   });
 
   it("aborts without a row when the task changes during grading", () => {
@@ -470,6 +518,56 @@ describe("gate-d/run.sh external task root (INFER-521)", { timeout: 240_000 }, (
   });
 });
 
+describe("vendored at-stop.sh provenance (INFER-521)", () => {
+  it("still matches the sha256 of the corpus original recorded in its header", () => {
+    const text = readFileSync(join(REAL_ROOT, "gate-d", "at-stop.sh"), "utf8");
+    const lines = text.split("\n");
+    const recorded = /sha256 of the source\n# file ([0-9a-f]{64})/.exec(text)?.[1];
+    expect(recorded).toMatch(/^[0-9a-f]{64}$/);
+    // The original is the shebang plus everything after the four-line provenance header.
+    const original = [lines[0], ...lines.slice(5)].join("\n");
+    expect(createHash("sha256").update(original).digest("hex")).toBe(recorded);
+  });
+});
+
+describe("scripts/gate-d-code-loop.py external task root (INFER-521)", { timeout: 60_000 }, () => {
+  function codeLoop(repo: string, args: string[], env: Record<string, string> = {}) {
+    cpSync(join(REAL_ROOT, "scripts", "gate-d-code-loop.py"), join(repo, "scripts", "gate-d-code-loop.py"));
+    const work = tmp("gd-ext-cl-");
+    return spawnSync("python3", [join(repo, "scripts", "gate-d-code-loop.py"), ...args], {
+      encoding: "utf8",
+      env: cleanEnv({ GATE_D_CL_REPO: repo, GATE_D_CL_RESULTS: join(work, "cl.jsonl"), ...env }),
+    });
+  }
+
+  it("lists and scores the external corpus without credentials", () => {
+    const repo = fixtureRepo();
+    const root = corpus();
+    let r = codeLoop(repo, ["--tasks-root", root, "--list-tasks"]);
+    expect(r.status, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout)).toMatchObject({ corpusRevision: "gate-d-r3", tasks: [TASK_A, TASK_B] });
+    r = codeLoop(repo, ["--scoreboard-only"], { GATE_D_TASKS_ROOT: root });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout).toContain("no acceptance gate");
+    expect(r.stdout).toContain('"verdict": "REPORT"');
+  });
+
+  it("refuses sealed tasks without the opt-in and a root inside the checkout", () => {
+    const repo = fixtureRepo();
+    const sealed = corpus({ split: "sealed" });
+    let r = codeLoop(repo, ["--tasks-root", sealed, "--list-tasks"]);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain("--include-holdout");
+    r = codeLoop(repo, ["--tasks-root", sealed, "--include-holdout", "--list-tasks"]);
+    expect(r.status, r.stderr).toBe(0);
+    const inside = join(repo, "external");
+    cpSync(corpus(), inside, { recursive: true });
+    r = codeLoop(repo, ["--tasks-root", inside, "--list-tasks"]);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain("overlaps this checkout");
+  });
+});
+
 describe("gate-d/sweep.sh external task root (INFER-521)", { timeout: 240_000 }, () => {
   it("resumes and summarizes by corpus revision and task digest", () => {
     const repo = fixtureRepo();
@@ -500,10 +598,10 @@ describe("gate-d/sweep.sh external task root (INFER-521)", { timeout: 240_000 },
     expect(rows(env.GATE_D_OUT)).toHaveLength(3);
   });
 
-  it("aborts when the manifest changes after the sweep pinned it", () => {
+  it("aborts without a row when the manifest changes after the sweep pinned it", () => {
     const repo = fixtureRepo();
     const root = corpus();
-    // The first arm rewrites the manifest; the next run.sh invocation must refuse.
+    // The first arm rewrites the manifest: its own post-arm check refuses, before any row.
     const { bin, log } = fakeBin(root,
       `const m = path.join(root, "corpus-manifest.json"); fs.writeFileSync(m, fs.readFileSync(m, "utf8") + " ");`);
     const work = tmp("gd-ext-sweep-");
@@ -511,8 +609,9 @@ describe("gate-d/sweep.sh external task root (INFER-521)", { timeout: 240_000 },
       GATE_D_TASKS_ROOT: root, ARMS: "pi", SEEDS: "1",
       GATE_D_OUT: join(work, "rows.jsonl"), GATE_D_LOG: join(work, "sweep.log"),
     }, [], "sweep.sh");
-    expect(res.status).toBe(3);
-    expect(res.stdout + res.stderr).toContain("changed since the sweep started");
+    expect(res.status).toBe(9);
+    expect(res.stdout + res.stderr).toContain("changed since it was pinned");
     expect(calls(log)).toHaveLength(1);
+    expect(rows(join(work, "rows.jsonl"))).toEqual([]);
   });
 });

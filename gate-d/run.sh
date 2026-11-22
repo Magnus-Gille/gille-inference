@@ -75,10 +75,18 @@ mkdir -p "$WORKROOT"
 CORPUS_TOOL="$ROOT/gate_d_corpus.py"
 # External task root (INFER-521). The corpus tool vets it (exists, is a directory, does not overlap
 # this checkout) and prints its physical path; every later call passes that path explicitly.
-EXTERNAL=0; TASKS_DIR="$ROOT/tasks"; CORPUS_ARGS=()
+EXTERNAL=0; TASKS_DIR="$ROOT/tasks"; MANIFEST_SHA=""
+# The corpus tool, aimed at the external root and pinned to one manifest digest when there is one.
+# A plain function rather than an argument array: an empty "${arr[@]}" is an unbound-variable error
+# under `set -u` in bash < 4.4, which is still macOS's /bin/bash.
+gd_corpus(){
+  if [ "$EXTERNAL" != 1 ]; then python3 "$CORPUS_TOOL" "$@"
+  elif [ -n "$MANIFEST_SHA" ]; then python3 "$CORPUS_TOOL" "$@" --tasks-root "$TASKS_DIR" --expect-manifest-sha "$MANIFEST_SHA"
+  else python3 "$CORPUS_TOOL" "$@" --tasks-root "$TASKS_DIR"; fi
+}
 if [ -n "${GATE_D_TASKS_ROOT+set}" ]; then
   TASKS_DIR="$(python3 "$CORPUS_TOOL" root --tasks-root "$GATE_D_TASKS_ROOT")" || exit 3
-  EXTERNAL=1; CORPUS_ARGS=(--tasks-root "$TASKS_DIR")
+  EXTERNAL=1
   # Work dirs stay outside the task root too (#172): an arm must not be able to discover the
   # oracle/ and solution/ siblings of its seed by walking up. Neither may contain the other.
   if ! python3 - "$WORKROOT" "$TASKS_DIR" <<'PY'
@@ -102,24 +110,26 @@ PY
     echo "error: WORKROOT ($WORKROOT) and the external task root ($TASKS_DIR) overlap — refusing to run (#172)." >&2
     exit 3
   fi
-  # A sweep pins the manifest it enumerated; a manifest replaced mid-sweep must not mix revisions.
-  if [ -n "${GATE_D_EXPECT_MANIFEST_SHA:-}" ]; then
-    manifest_sha="$(python3 "$CORPUS_TOOL" manifest-sha256 "${CORPUS_ARGS[@]}")" || exit 3
-    if [ "$manifest_sha" != "$GATE_D_EXPECT_MANIFEST_SHA" ]; then
-      echo "error: $TASKS_DIR/corpus-manifest.json changed since the sweep started ($manifest_sha != $GATE_D_EXPECT_MANIFEST_SHA)" >&2
-      exit 3
-    fi
+  # Pin the manifest once: every later corpus-tool call, including the post-arm and post-grading
+  # digest checks, parses exactly these bytes or fails. Without the pin, an arm could rewrite a
+  # task AND its manifest digest and still get a row. A sweep passes the digest it enumerated, so a
+  # manifest replaced mid-sweep cannot mix revisions either.
+  MANIFEST_SHA="${GATE_D_EXPECT_MANIFEST_SHA:-}"
+  [ -n "$MANIFEST_SHA" ] || MANIFEST_SHA="$(gd_corpus manifest-sha256)" || exit 3
+  if ! gd_corpus revision >/dev/null; then
+    echo "error: $TASKS_DIR/corpus-manifest.json changed since the sweep started; refusing to run" >&2
+    exit 3
   fi
 fi
-if [ "${1:-}" = "--list-tasks" ]; then python3 "$CORPUS_TOOL" tasks "${CORPUS_ARGS[@]}"; exit $?; fi
-CORPUS_REVISION="$(python3 "$CORPUS_TOOL" revision "${CORPUS_ARGS[@]}")" || exit 3
-TASK_IDS="$(python3 "$CORPUS_TOOL" tasks "${CORPUS_ARGS[@]}")" || exit 3
+if [ "${1:-}" = "--list-tasks" ]; then gd_corpus tasks; exit $?; fi
+CORPUS_REVISION="$(gd_corpus revision)" || exit 3
+TASK_IDS="$(gd_corpus tasks)" || exit 3
 
 ARM="${1:?usage: run.sh <pi|aider|opencode|qwen-code> <task-id|all>}"
 SEL="${2:?usage: run.sh <pi|aider|opencode|qwen-code> <task-id|all>}"
 if [ "$EXTERNAL" = 1 ]; then
   # The tool prints why (unknown, or sealed without the opt-in).
-  if [ "$SEL" != "all" ] && ! python3 "$CORPUS_TOOL" contains "$SEL" "${CORPUS_ARGS[@]}"; then exit 3; fi
+  if [ "$SEL" != "all" ] && ! gd_corpus contains "$SEL"; then exit 3; fi
 elif [ "$SEL" != "all" ] && ! python3 "$CORPUS_TOOL" contains "$SEL"; then
   if [ -f "$ROOT/tasks/$SEL/meta.json" ]; then
     echo "error: task '$SEL' is not in $CORPUS_REVISION; holdouts require GATE_D_INCLUDE_HOLDOUT=1" >&2
@@ -192,7 +202,11 @@ metalist(){ python3 -c "import json;print(' '.join(json.load(open('$1')).get('$2
 # the git-status fixture guard for the external root, which is not a checkout. On success it prints
 # the row identity JSON; on any mismatch, missing file, symlink or sealed task without the opt-in it
 # fails, and the caller aborts without writing a row, exactly as the fixture guard does.
-verify_external(){ python3 "$CORPUS_TOOL" verify-task "$1" "${CORPUS_ARGS[@]}"; }
+verify_external(){ gd_corpus verify-task "$1"; }
+# Re-verify after the arm or grading: the task must still match the pinned manifest AND yield the
+# identity recorded before the run, so the row can never describe content other than what ran.
+still_verified(){ local now; now="$(verify_external "$1")" && [ "$now" = "$2" ]; }
+EXTERNAL_HINT="Restore the root from the generator (generate.py --check-manifest shows drift) before re-running."
 
 # Runner configuration never reaches an arm: GATE_D_TASKS_ROOT would name the directory that holds
 # the oracle/ and solution/ siblings of the seed.
@@ -203,6 +217,7 @@ run_one() {
   if [ "$EXTERNAL" = 1 ]; then
     if ! identity="$(verify_external "$id")"; then
       echo "FATAL[$ARM/$id]: the external task failed its manifest check before the run; no row written" >&2
+      echo "$EXTERNAL_HINT" >&2
       exit 9
     fi
     task_revision=""; holdout=""   # taken from $identity when the row is written
@@ -384,8 +399,9 @@ PY
       exit 9
     fi
   fi
-  if [ "$EXTERNAL" = 1 ] && ! verify_external "$id" >/dev/null; then
+  if [ "$EXTERNAL" = 1 ] && ! still_verified "$id" "$identity"; then
     echo "FATAL[$ARM/$id]: the external task changed on disk during this run; no row written (#172, INFER-521)" >&2
+    echo "$EXTERNAL_HINT" >&2
     rm -rf "$W"; exit 9
   fi
   if ! verify_prompt_snapshot; then
@@ -434,14 +450,21 @@ PY
   # schema. Pure observation: it runs with the arm's Git isolation, its output is whitelisted when
   # the row is built, and any failure, timeout or missing script yields '{}' and never changes
   # pass/fail. at-stop.sh is this repository's pinned copy of the corpus script (see its header).
-  local AT_STOP_JSON="{}"
-  if [ "$EXTERNAL" = 1 ] && [ -f "$ROOT/at-stop.sh" ]; then
-    AT_STOP_JSON="$( cd "$W" \
-        && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE $GD_RUNNER_VARS \
-        && export GIT_CEILING_DIRECTORIES="$WORKROOT" \
-        && "$TIMEOUT_BIN" "${AT_STOP_WALL_S:-300}" bash "$ROOT/at-stop.sh" "$T" "$W" </dev/null 2>/dev/null )" \
-      || AT_STOP_JSON="{}"
+  # It runs on a throwaway copy of the work dir, so files a candidate's `npm test` leaves behind
+  # cannot reach check.sh: "never changes pass/fail" holds structurally, not by convention.
+  local AT_STOP_JSON="{}" AT_STOP_W=""
+  if [ "$EXTERNAL" = 1 ]; then
+    if [ -f "$ROOT/at-stop.sh" ] && AT_STOP_W="$(mktemp -d "$WORKROOT/${id}-atstop-XXXX")" \
+       && cp -R "$W/." "$AT_STOP_W/"; then
+      AT_STOP_JSON="$( cd "$AT_STOP_W" \
+          && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE $GD_RUNNER_VARS \
+          && export GIT_CEILING_DIRECTORIES="$WORKROOT" \
+          && "$TIMEOUT_BIN" "${AT_STOP_WALL_S:-300}" bash "$ROOT/at-stop.sh" "$T" "$AT_STOP_W" </dev/null 2>/dev/null )" \
+        || AT_STOP_JSON="{}"
+    fi
+    [ -n "$AT_STOP_W" ] && rm -rf "$AT_STOP_W"
     [ -n "$AT_STOP_JSON" ] || AT_STOP_JSON="{}"
+    [ "$AT_STOP_JSON" = "{}" ] && echo "  [warn] $id: at-stop.sh produced no result; at-stop fields are null for this row" >&2
   fi
   local pass="false" exitclass="$status"
   if bash "$ROOT/check.sh" "$T" "$W" >"$W/.check.log" 2>&1; then pass="true"; exitclass="pass"
@@ -454,8 +477,9 @@ PY
   fi
   # Grading reads the task directory (hidden oracle, structural check) and at-stop.sh ran candidate
   # code: re-verify, so a verdict is never recorded against a task that changed underneath it.
-  if [ "$EXTERNAL" = 1 ] && ! verify_external "$id" >/dev/null; then
+  if [ "$EXTERNAL" = 1 ] && ! still_verified "$id" "$identity"; then
     echo "FATAL[$ARM/$id]: the external task changed on disk during grading; no row written (INFER-521)" >&2
+    echo "$EXTERNAL_HINT" >&2
     rm -rf "$W"; [ -n "$TRANSCRIPT" ] && rm -f "$TRANSCRIPT"; exit 9
   fi
   # Emit the result row via env vars (not shell-interpolation into the Python source): the prior
@@ -506,7 +530,11 @@ if os.environ.get('GD_EXTERNAL')=='1':
            'lastTypecheckOutcome':outcome,'lastTestOutcome':outcome,'stoppedWithFailingCheck':bool,
            'ambiguousCheckOutcomes':int,'firstEditTurn':'turn','lastEditTurn':'turn','edits':int}
     ver=raw.get('verification') if p and isinstance(raw,dict) else None
-    row.update(pick(ver if isinstance(ver,dict) and ver.get('schema')=='gate-d-r3/verification-telemetry@1' else {},vspec))
+    ok=isinstance(ver,dict) and ver.get('schema')=='gate-d-r3/verification-telemetry@1'
+    # verificationSchema is the measured/not-measured flag: several fields are legitimately null
+    # when measured (no check ran, no edit happened), so null alone cannot say \"not measured\".
+    row['verificationSchema']=ver['schema'] if ok else None
+    row.update(pick(ver if ok else {},vspec))
 print(json.dumps(row))" >>"$OUT"
   local row_status=$?
   if [ "$row_status" -eq 0 ]; then

@@ -11,7 +11,10 @@ the battery's own deterministic check.sh (no model in grading). Resumable via JS
 the tasks in DIR/corpus-manifest.json, digest-checked before submission and after grading (a
 mismatch aborts without a row), sealed tasks only with the holdout opt-in, and rows carrying the
 r3 identity plus the at-stop verification fields. External corpora have no acceptance gate here,
-so the scoreboard reports pass counts without a verdict.
+so the scoreboard reports pass counts without a verdict. The manifest is read once and kept in
+memory for the whole run. Unlike run.sh, this runner grades in a work dir inside the checkout
+(WORKROOT below): the arm runs remotely in the gateway and only grading happens here, so the #172
+escape path (a local harness walking up into the checkout) does not exist.
 """
 import argparse, json, os, re, shutil, subprocess, sys, time, urllib.request
 from pathlib import Path
@@ -158,8 +161,13 @@ def mcp(tool, args):
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(json.load(r)["result"]["content"][0]["text"])
 
+# Runner configuration never reaches candidate code (at-stop's npm test, check.sh's oracle):
+# GATE_D_TASKS_ROOT names the directory holding every task's oracle/ and solution/.
+CHILD_ENV = {k: v for k, v in os.environ.items() if not k.startswith("GATE_D_")}
+
+
 def sh(argv, cwd=None):
-    return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=300)
+    return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=300, env=CHILD_ENV)
 
 AT_STOP = os.path.join(REPO, "gate-d", "at-stop.sh")
 AT_STOP_SPEC = {
@@ -169,16 +177,27 @@ AT_STOP_SPEC = {
 }
 
 
+NULL_AT_STOP = {key: None for key in AT_STOP_SPEC}
+
+
 def at_stop(tdir, wdir):
     """Grader-derived verification fields (INFER-521); fails open to nulls, never affects pass/fail."""
     parsed = {}
+    # A throwaway copy, so files a candidate's npm test leaves behind never reach check.sh.
+    scratch = f"{wdir}.atstop"
     try:
-        res = subprocess.run(["bash", AT_STOP, tdir, wdir], cwd=wdir, capture_output=True, text=True,
-                             timeout=300, stdin=subprocess.DEVNULL)
+        shutil.rmtree(scratch, ignore_errors=True)
+        shutil.copytree(wdir, scratch, symlinks=True)
+        res = subprocess.run(["bash", AT_STOP, tdir, scratch], cwd=scratch, capture_output=True, text=True,
+                             timeout=300, stdin=subprocess.DEVNULL, env=CHILD_ENV)
         if res.returncode == 0:
             parsed = json.loads(res.stdout.strip() or "{}")
-    except (OSError, subprocess.SubprocessError, ValueError):
+    except (OSError, subprocess.SubprocessError, ValueError, shutil.Error):
         parsed = {}
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    if not parsed:
+        print("  [warn] at-stop.sh produced no result; at-stop fields are null for this row", flush=True)
     if not isinstance(parsed, dict):
         parsed = {}
     out = {}
@@ -238,6 +257,7 @@ for tid in task_ids:
     }
     if external:
         row.update({k: task_meta.get(k) for k in ("family", "split", "trap")})
+        row.update(NULL_AT_STOP)  # stable schema, also on start-refused rows
     t0 = time.time()
     try:
         start = mcp("code_loop_start", {"instruction": instr, "files": files,
@@ -269,6 +289,8 @@ for tid in task_ids:
     wdir = os.path.join(WORKROOT, tid)
     shutil.rmtree(wdir, ignore_errors=True)
     shutil.copytree(os.path.join(tdir, "repo"), wdir)
+    # check.sh's G0-toolchain gate requires the harness-owned node_modules link (run.sh does the same).
+    os.symlink(os.path.join(REPO, "node_modules"), os.path.join(wdir, "node_modules"))
     for c in (["git", "init", "-q", "."], ["git", "add", "-A"],
               ["git", "-c", "user.email=g@d", "-c", "user.name=gd", "commit", "-qm", "seed"]):
         sh(c, cwd=wdir)
@@ -293,7 +315,8 @@ for tid in task_ids:
     row["wall_s"] = round(time.time() - t0, 1)
     if external:
         try:
-            verify_external_task(Path(TASKS), ext_manifest, tid, include_holdout)
+            if verify_external_task(Path(TASKS), ext_manifest, tid, include_holdout) != task_meta:
+                raise ExternalCorpusError("its identity differs from the one recorded before the run")
         except (ExternalCorpusError, OSError) as error:
             print(f"FATAL[{tid}]: the external task changed during the run; no row written: {error}", file=sys.stderr)
             raise SystemExit(9)
