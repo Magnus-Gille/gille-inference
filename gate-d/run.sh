@@ -42,22 +42,8 @@ WORKROOT="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$WO
 if [ "${1:-}" = "--print-workroot" ]; then echo "$WORKROOT"; exit 0; fi
 # Compare directory identities, not spellings: on a case-insensitive volume a differently
 # capitalized path can name a directory inside the checkout. Walk from the nearest existing
-# ancestor of WORKROOT up to / and refuse if any of them is the checkout itself.
-if ! python3 - "$WORKROOT" "$REPO_ROOT" <<'PY'
-import os, sys
-path, repo = sys.argv[1], os.stat(sys.argv[2])
-while not os.path.exists(path):
-    path = os.path.dirname(path)
-while True:
-    st = os.stat(path)
-    if (st.st_dev, st.st_ino) == (repo.st_dev, repo.st_ino):
-        sys.exit(1)
-    parent = os.path.dirname(path)
-    if parent == path:
-        sys.exit(0)
-    path = parent
-PY
-then
+# ancestor of WORKROOT up to / and refuse if any of them is the checkout itself (path-inside.py).
+if ! python3 "$ROOT/path-inside.py" "$WORKROOT" "$REPO_ROOT"; then
   echo "error: WORKROOT ($WORKROOT) resolves INSIDE the repo ($REPO_ROOT) — refusing to run (#172)." >&2
   echo "       set TMPDIR or GATE_D_WORKROOT to a path outside the checkout." >&2
   exit 3

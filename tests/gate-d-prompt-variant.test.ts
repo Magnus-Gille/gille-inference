@@ -544,6 +544,65 @@ describe("gate-d/run.sh pi prompt variants (INFER-519)", { timeout: 120_000 }, (
     expect(calls(log)).toEqual([]);
   });
 
+  // The case-alias test above returns early on a case-sensitive volume (Linux CI), so exercise the
+  // identity walk itself with a symlinked spelling, which a prefix comparison would not catch.
+  it("path-inside.py compares directory identities, not spellings (INFER-520)", () => {
+    const repo = fixtureRepo();
+    const outside = tmp("gd-alias-");
+    const alias = join(outside, "alias");
+    symlinkSync(repo, alias);
+    const inside = (path: string) =>
+      spawnSync("python3", [join(repo, "gate-d", "path-inside.py"), path, repo], { encoding: "utf8" }).status;
+    expect(inside(repo)).toBe(1);
+    expect(inside(join(repo, "gate-d", "not", "yet", "created"))).toBe(1);
+    expect(inside(join(alias, "work"))).toBe(1);
+    expect(inside(join(alias, "gate-d", "not-yet"))).toBe(1);
+    expect(inside(join(outside, "work"))).toBe(0);
+    expect(inside(dirname(repo))).toBe(0);
+    // A target that cannot be read is an error, never "outside"; run.sh refuses on any non-zero status.
+    const bad = spawnSync("python3", [join(repo, "gate-d", "path-inside.py"), outside, join(outside, "missing")], {
+      encoding: "utf8",
+    });
+    expect(bad.status).not.toBe(0);
+  });
+
+  it("aborts when the .git entry points at a bare repository, so rev-parse prints false (INFER-520)", () => {
+    const repo = fixtureRepo();
+    const bare = join(tmp("gd-bare-"), "bare.git");
+    git(dirname(bare), "clone", "-q", "--bare", repo, bare);
+    rmSync(join(repo, ".git"), { recursive: true, force: true });
+    writeFileSync(join(repo, ".git"), `gitdir: ${bare}\n`);
+    const { bin, log } = fakeBin();
+    const { res, out } = runGateD(repo, bin, {}, ["pi", TASK]);
+    expect(res.status).toBe(3);
+    expect(res.stderr).toContain("Git cannot read it");
+    expect(calls(log)).toEqual([]);
+    expect(rows(out)).toEqual([]);
+  });
+
+  it("aborts on a corrupt index, where rev-parse still prints true but status fails (INFER-520)", () => {
+    const repo = fixtureRepo();
+    writeFileSync(join(repo, ".git", "index"), "garbage\n");
+    expect(git(repo, "rev-parse", "--is-inside-work-tree").trim()).toBe("true");
+    const { bin, log } = fakeBin();
+    const { res, out } = runGateD(repo, bin, {}, ["pi", TASK]);
+    expect(res.status).toBe(3);
+    expect(res.stderr).toContain("Git cannot read it");
+    expect(calls(log)).toEqual([]);
+    expect(rows(out)).toEqual([]);
+  });
+
+  it("aborts without a row when git status fails after the arm runs (INFER-520)", () => {
+    const repo = fixtureRepo();
+    const { bin, log } = fakeBin(`fs.writeFileSync(${JSON.stringify(join(repo, ".git", "index"))}, "garbage\\n");`);
+    const { res, out } = runGateD(repo, bin, {}, ["pi", TASK]);
+    expect(res.status).toBe(9);
+    expect(res.stderr).toContain("git status failed after the run");
+    expect(calls(log).map((c) => c.seeded)).toEqual([true]);
+    expect(rows(out)).toEqual([]);
+    expect(readdirSync(join(dirname(out), "gate-d-work")).filter((n) => n.startsWith(`${TASK}-`))).toEqual([]);
+  });
+
   it("labels baseline rows promptVariant none and passes no prompt flag", () => {
     const repo = fixtureRepo();
     const { bin, log } = fakeBin();
@@ -633,6 +692,72 @@ print(json.dumps({'arm':os.environ['GD_A'],'model':os.environ['MODEL'],'task':os
     expect(r.res.status).toBe(3);
     expect(r.res.stderr).toContain("pi arm only");
     expect(rows(r.out)).toEqual([]);
+  });
+
+  // Portable stand-in for /dev/full (absent on macOS): a python3 shim that fails only the row
+  // writer, so the real run.sh reaches its append step and loses the row (INFER-520).
+  it("aborts the real runner on an append failure instead of resetting on a stale arm-error row", () => {
+    const repo = fixtureRepo();
+    const { bin, log } = fakeBin();
+    const realPython = spawnSync("bash", ["-c", "command -v python3"], { encoding: "utf8" }).stdout.trim();
+    writeFileSync(
+      join(bin, "python3"),
+      `#!/usr/bin/env bash\nfor a in "$@"; do case "$a" in *"row={"*) echo "write error" >&2; exit 1;; esac; done\nexec ${JSON.stringify(realPython)} "$@"\n`,
+    );
+    chmodSync(join(bin, "python3"), 0o755);
+    const work = tmp("gd-sweep-");
+    const out = join(work, "rows.jsonl");
+    const stale = JSON.stringify({ arm: "pi", model: "m", task: "x", exitClass: "arm-error" }) + "\n";
+    writeFileSync(out, stale);
+    const r = runGateD(repo, bin, { ARMS: "pi", SEEDS: "1", MODEL: "m", GATE_D_OUT: out }, [], "sweep.sh");
+    expect(r.res.status).toBe(4);
+    expect(r.res.stdout).toContain("could not append the result row");
+    expect(r.res.stdout).toContain("SWEEP aborted: run.sh exited 4");
+    expect(r.res.stdout).not.toContain("[reset]");
+    expect(calls(log).filter((c) => c.name === "pi")).toHaveLength(1);
+    expect(readFileSync(out, "utf8")).toBe(stale);
+  });
+
+  it("keeps a committed prompt change between two real sweeps apart, and aborts on one made mid-sweep", () => {
+    const repo = fixtureRepo();
+    const promptPath = join(repo, "gate-d", "prompts", VARIANT);
+    const { bin } = fakeBin();
+    const work = tmp("gd-sweep-");
+    const out = join(work, "rows.jsonl");
+    const env = { ARMS: "pi", SEEDS: "1", MODEL: "m", GATE_D_OUT: out, GATE_D_PI_APPEND_SYSTEM: VARIANT };
+
+    const first = runGateD(repo, bin, env, [], "sweep.sh");
+    expect(first.res.status, first.res.stderr).toBe(0);
+    const v1 = sha256(readFileSync(promptPath, "utf8"));
+
+    writeFileSync(promptPath, readFileSync(promptPath, "utf8") + "\nRevised between sweeps.\n");
+    git(repo, "commit", "-q", "-am", "revise prompt");
+    const v2 = sha256(readFileSync(promptPath, "utf8"));
+    expect(v2).not.toBe(v1);
+
+    const second = runGateD(repo, bin, env, [], "sweep.sh");
+    expect(second.res.status, second.res.stderr).toBe(0);
+    // The new digest does not resume from the old rows: every task runs again under its own label.
+    expect(second.res.stdout).not.toContain("[skip]");
+    const all = rows(out);
+    expect(all.filter((r) => r.promptSha256 === v1)).toHaveLength(10);
+    expect(all.filter((r) => r.promptSha256 === v2)).toHaveLength(10);
+    const summary = second.res.stdout.split("\n").filter((l) => l.startsWith("gate-d-r1 pi/m"));
+    expect(summary).toHaveLength(2);
+    for (const v of [v1, v2]) {
+      expect(summary.some((l) => l.includes(`@${v.split(":")[1]!.slice(0, 12)}]`))).toBe(true);
+    }
+
+    // A commit during a sweep: the next run.sh sees a different digest than the pinned one.
+    const { bin: bin3 } = fakeBin(
+      `fs.appendFileSync(${JSON.stringify(promptPath)}, "mid-sweep\\n");
+require("child_process").spawnSync("git", ["-C", ${JSON.stringify(repo)}, "-c", "user.email=t@local", "-c", "user.name=t", "commit", "-q", "-am", "mid-sweep"]);`,
+    );
+    const third = runGateD(repo, bin3, { ...env, SEEDS: "2" }, [], "sweep.sh");
+    expect(third.res.status).toBe(3);
+    expect(third.res.stdout).toContain("this sweep started with");
+    expect(third.res.stdout).toContain("SWEEP aborted: run.sh exited 3");
+    expect(rows(out).filter((r) => r.promptSha256 === v2)).toHaveLength(11);
   });
 
   it("aborts on a runner failure instead of acting on a stale previous row", () => {
