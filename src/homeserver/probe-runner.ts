@@ -11,6 +11,7 @@
 
 import type { Probe } from "./probes.js";
 import { resolveLocalSampling } from "./sampling-profile.js";
+import { offsetSeed } from "../runner/sampling.js";
 import type { ProbeRunResult, ProbeRunSummary, ProbeSampling, TaskTypeScore } from "./scout-types.js";
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -320,11 +321,19 @@ export async function runProbes(opts: RunProbesOpts): Promise<ProbeRunSummary> {
 
   const results: ProbeRunResult[] = [];
 
+  // Greedy decoding ignores the seed: at temperature 0 repeats are the same sample, not new trials.
+  if (repeats > 1 && opts.probes.some((p) => probeSampling(opts.model, p).temperature === 0)) {
+    console.warn(
+      `[probe-runner] ${opts.model}: ${repeats} repeats at temperature 0 are greedy and seed-independent; ` +
+        `they measure server nondeterminism, not sampling variance. Vary the prompt or use temperature > 0 for extra trials.`
+    );
+  }
+
   for (const probe of opts.probes) {
     for (let rep = 1; rep <= repeats; rep++) {
       opts.signal?.throwIfAborted();
       const callProbe: Probe =
-        probe.seed === undefined && opts.seed !== undefined ? { ...probe, seed: opts.seed + rep - 1 } : probe;
+        probe.seed === undefined && opts.seed !== undefined ? { ...probe, seed: offsetSeed(opts.seed, rep - 1) } : probe;
       const sampling = probeSampling(opts.model, callProbe);
       let r: ProbeRunResult;
       try {

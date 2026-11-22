@@ -204,6 +204,19 @@ describe("delegate() — retry-on-transient-parse-error (#164)", () => {
     expect(rec.effectiveSampling?.seed).toBe(42);
   });
 
+  it("records the attempt's sampling when the local call throws", async () => {
+    lmInferenceMock.mockRejectedValueOnce(new Error("socket hang up"));
+
+    await delegate({ prompt: "output ONLY JSON", seed: 9 });
+
+    const rec = recordDelegationMock.mock.calls[0]![0] as {
+      outcome: string;
+      effectiveSampling?: { seed: number; temperature: number; temperatureFloorApplied: boolean };
+    };
+    expect(rec.outcome).toBe("error");
+    expect(rec.effectiveSampling).toMatchObject({ seed: 9, temperature: 0.6, temperatureFloorApplied: true });
+  });
+
   it("sends no seed on either attempt when none is requested", async () => {
     lmInferenceMock
       .mockResolvedValueOnce({ ok: false as const, error: PEG_ERROR })

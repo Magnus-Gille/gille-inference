@@ -35,6 +35,7 @@ import { pathToFileURL } from "node:url";
 
 import { makeChatFn, runProbes } from "../src/homeserver/probe-runner.js";
 import { resolveLocalSampling } from "../src/homeserver/sampling-profile.js";
+import { isValidSeed, MAX_SEED } from "../src/runner/sampling.js";
 import {
   DEFAULT_REGISTRY_PATH,
   appendEntry,
@@ -83,7 +84,7 @@ export function parseSeedEnv(raw: string | undefined): number | null {
   if (raw === undefined || raw.trim() === "") return DEFAULT_SEED;
   if (raw.trim() === "none") return null;
   const n = Number(raw);
-  if (!Number.isSafeInteger(n) || n < 0) throw new Error(`EVAL_MODEL_SEED must be a non-negative integer or "none", got: ${raw}`);
+  if (!isValidSeed(n)) throw new Error(`EVAL_MODEL_SEED must be an integer in [0, ${MAX_SEED}] or "none", got: ${raw}`);
   return n;
 }
 const BIN = process.env["LLAMA_SERVER_BIN"] ?? DEFAULT_LLAMA_SERVER_BIN;

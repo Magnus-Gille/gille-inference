@@ -77,9 +77,21 @@ export function resolveEffectiveSampling(
   };
 }
 
-/** True when `seed` is a non-negative safe integer (llama.cpp treats -1 as "random"). */
+/**
+ * Largest seed that is really a fixed seed. llama.cpp stores seeds as uint32 and treats
+ * 0xFFFFFFFF (and -1) as "pick a random seed", so a larger value would be recorded as seeded but
+ * run random.
+ */
+export const MAX_SEED = 0xfffffffe;
+
+/** True when `seed` is an integer in [0, MAX_SEED]. */
 export function isValidSeed(seed: unknown): seed is number {
-  return typeof seed === "number" && Number.isSafeInteger(seed) && seed >= 0;
+  return typeof seed === "number" && Number.isSafeInteger(seed) && seed >= 0 && seed <= MAX_SEED;
+}
+
+/** `seed + k`, wrapped into [0, MAX_SEED] so derived seeds (repeats, retries) stay valid. */
+export function offsetSeed(seed: number, k: number): number {
+  return (seed + k) % (MAX_SEED + 1);
 }
 
 const warnedFloorModels = new Set<string>();
@@ -101,4 +113,18 @@ export function warnTemperatureFloorOnce(modelId: string, sampling: EffectiveSam
 /** Test-only: reset the once-per-model warning memory. */
 export function resetTemperatureFloorWarningsForTest(): void {
   warnedFloorModels.clear();
+}
+
+/**
+ * The sampling runLmStudioInference sends for these options (top_p 0.95 / top_k 20 defaults, the
+ * 0.6 floor). Lives here, not in the client, so a caller that loses the result to a timeout or a
+ * thrown abort can still record what the attempt was sent with.
+ */
+export function lmStudioEffectiveSampling(options: SamplingRequest): EffectiveSampling {
+  return resolveEffectiveSampling(options, {
+    temperature: 0,
+    topP: 0.95,
+    topK: 20,
+    temperatureFloor: DEFAULT_LOCAL_TEMPERATURE_FLOOR,
+  });
 }

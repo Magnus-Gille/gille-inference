@@ -1,4 +1,5 @@
 import { loadConfig, type HomeserverConfig } from "./config.js";
+import { resolveEffectiveSampling } from "../runner/sampling.js";
 import type { LocalInferenceResult } from "../runner/local-client.js";
 import type { ResponseFormat } from "../runner/openrouter-client.js";
 import { isKnownTaskType } from "./taxonomy.js";
@@ -75,7 +76,7 @@ export interface OrinChatResult {
 export async function runOrinChat(
   model: string,
   messages: Array<{ role: string; content: unknown }>,
-  opts: { maxTokens: number; temperature: number; topP?: number; topK?: number; minP?: number; signal?: AbortSignal },
+  opts: { maxTokens: number; temperature: number; topP?: number; topK?: number; minP?: number; seed?: number; signal?: AbortSignal },
   cfg: HomeserverConfig = loadConfig()
 ): Promise<{ ok: true; value: OrinChatResult } | { ok: false; error: string }> {
   if (!orinEnabled(cfg) || model !== cfg.orin.model) return { ok: false, error: "orin unavailable or model not allowed" };
@@ -94,6 +95,7 @@ export async function runOrinChat(
           top_p: opts.topP,
           top_k: opts.topK,
           min_p: opts.minP,
+          ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
         },
       }),
       signal: opts.signal,
@@ -125,7 +127,7 @@ export async function runOrinChat(
 export async function runOrinInference(
   model: string,
   prompt: string,
-  opts: { systemPrompt?: string; maxTokens: number; temperature: number; topP?: number; topK?: number; minP?: number; responseFormat?: ResponseFormat; signal?: AbortSignal },
+  opts: { systemPrompt?: string; maxTokens: number; temperature: number; topP?: number; topK?: number; minP?: number; seed?: number; responseFormat?: ResponseFormat; signal?: AbortSignal },
   cfg: HomeserverConfig = loadConfig()
 ): Promise<LocalInferenceResult> {
   // Ollama's native API has no equivalent to the gateway's response_format contract. The Orin
@@ -137,7 +139,10 @@ export async function runOrinInference(
     opts,
     cfg
   );
-  if (!r.ok) return r;
+  // Ollama on Orin: no temperature floor; seed goes in options.seed.
+  const sampling = resolveEffectiveSampling(opts, { temperature: 0, temperatureFloor: false });
+  // A pre-call refusal (Orin disabled or model not allowed) sent nothing, so it records no sampling.
+  if (!r.ok) return orinEnabled(cfg) && model === cfg.orin.model ? { ...r, sampling } : r;
   const { response, durationMs, promptTokens, completionTokens } = r.value;
-  return { ok: true, response, durationMs, ttftMs: durationMs, promptTokens, completionTokens, tokensPerSecond: completionTokens / Math.max(durationMs / 1000, 0.001), provider: "local-ollama" };
+  return { ok: true, response, durationMs, ttftMs: durationMs, promptTokens, completionTokens, tokensPerSecond: completionTokens / Math.max(durationMs / 1000, 0.001), provider: "local-ollama", sampling };
 }

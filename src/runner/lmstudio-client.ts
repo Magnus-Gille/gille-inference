@@ -3,11 +3,7 @@ import { performance } from 'node:perf_hooks';
 import type { InferenceOptions } from './openrouter-client.js';
 import type { LocalInferenceResult } from './local-client.js';
 import { currentTraceHeaders } from '../homeserver/tracing.js';
-import {
-  DEFAULT_LOCAL_TEMPERATURE_FLOOR,
-  resolveEffectiveSampling,
-  warnTemperatureFloorOnce,
-} from './sampling.js';
+import { lmStudioEffectiveSampling, warnTemperatureFloorOnce } from './sampling.js';
 
 /**
  * LM Studio inference client.
@@ -57,12 +53,7 @@ export async function runLmStudioInference(
   // applied and a requested temperature <= 0 is raised to the floor (0.6 by default). This used to
   // happen silently; it is now explicit (`temperatureFloor`, `false` = greedy), logged once per
   // model, and returned as `sampling` on every result so run records store what was really sent.
-  const sampling = resolveEffectiveSampling(options, {
-    temperature: 0,
-    topP: 0.95,
-    topK: 20,
-    temperatureFloor: DEFAULT_LOCAL_TEMPERATURE_FLOOR,
-  });
+  const sampling = lmStudioEffectiveSampling(options);
   warnTemperatureFloorOnce(modelId, sampling);
 
   const client = createClient();

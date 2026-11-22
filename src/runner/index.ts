@@ -27,6 +27,7 @@ import { MODELS, getModelById } from './models.js';
 import { ALL_TASKS } from '../tasks/index.js';
 import { runBatch } from './run-batch.js';
 import { runPreflight } from './preflight.js';
+import { isValidSeed, MAX_SEED } from './sampling.js';
 
 // ─── Arg parsing ──────────────────────────────────────────────────────────────
 
@@ -104,8 +105,8 @@ function parseArgs(argv: string[]): {
           seed = null;
         } else {
           const n = Number(val);
-          if (!Number.isSafeInteger(n) || n < 0) {
-            console.error(`--seed must be a non-negative integer or "none", got: ${val}`);
+          if (!isValidSeed(n)) {
+            console.error(`--seed must be an integer in [0, ${MAX_SEED}] or "none", got: ${val}`);
             process.exit(1);
           }
           seed = n;

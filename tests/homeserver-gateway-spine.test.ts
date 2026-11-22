@@ -2829,7 +2829,7 @@ describe("gateway spine — HTTP integration", () => {
     expect(j.error.param).toBe("topK");
   });
 
-  it.each([[-1], [1.5], ["7"]])("/delegate rejects a malformed seed (%j) before admission", async (seed) => {
+  it.each([[-1], [1.5], ["7"], [4294967295]])("/delegate rejects a malformed seed (%j) before admission", async (seed) => {
     const owner = mintKey({ alias: `bad-seed-delegate-${String(seed)}`, tier: "owner", scope: "admin" }, DEFAULTS);
     const res = await fetch(url("/delegate"), {
       method: "POST",

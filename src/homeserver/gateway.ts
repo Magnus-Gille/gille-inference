@@ -2798,7 +2798,8 @@ function parseDelegateBody(rawBody: string): DelegateParse {
     ["topP", 0, 1, false],
     ["topK", 0, Number.MAX_SAFE_INTEGER, true],
     ["minP", 0, 1, false],
-    ["seed", 0, Number.MAX_SAFE_INTEGER, true],
+    // uint32 range minus llama.cpp's "random" sentinel 0xFFFFFFFF (see runner/sampling.ts MAX_SEED).
+    ["seed", 0, 0xfffffffe, true],
   ] as const;
   for (const [field, min, max, integer] of samplerSpecs) {
     const value = body[field];

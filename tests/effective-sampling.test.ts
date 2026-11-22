@@ -13,6 +13,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   resolveEffectiveSampling,
+  isValidSeed,
+  offsetSeed,
+  MAX_SEED,
   DEFAULT_LOCAL_TEMPERATURE_FLOOR,
   type EffectiveSampling,
 } from "../src/runner/sampling.js";
@@ -54,6 +57,16 @@ describe("resolveEffectiveSampling", () => {
       LMSTUDIO_DEFAULTS
     );
     expect(s).toMatchObject({ topP: 0.95, topK: 20, minP: null });
+  });
+});
+
+describe("seed range", () => {
+  it("excludes llama.cpp's random sentinel and wraps derived seeds", () => {
+    expect(isValidSeed(MAX_SEED)).toBe(true);
+    expect(isValidSeed(0xffffffff)).toBe(false);
+    expect(isValidSeed(-1)).toBe(false);
+    expect(offsetSeed(MAX_SEED, 1)).toBe(0);
+    expect(offsetSeed(5, 2)).toBe(7);
   });
 });
 
