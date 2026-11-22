@@ -76,7 +76,7 @@ function fixtureRepo(): string {
   const repo = tmp("gd-fixture-");
   cpSync(join(REAL_ROOT, "gate-d"), join(repo, "gate-d"), { recursive: true });
   mkdirSync(join(repo, "scripts"));
-  cpSync(join(REAL_ROOT, "scripts", "pi-benchmark-telemetry.ts"), join(repo, "scripts", "pi-benchmark-telemetry.ts"));
+  for (const f of ["pi-benchmark-telemetry.ts", "pi-verification-telemetry.ts"]) cpSync(join(REAL_ROOT, "scripts", f), join(repo, "scripts", f));
   symlinkSync(join(REAL_ROOT, "node_modules"), join(repo, "node_modules"));
   // The real package.json declares ESM; without it tsx would load the telemetry collector as CJS.
   cpSync(join(REAL_ROOT, "package.json"), join(repo, "package.json"));

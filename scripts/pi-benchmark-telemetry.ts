@@ -17,6 +17,7 @@ import { dirname, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
+import { createVerificationTelemetry, type VerificationSummary } from "./pi-verification-telemetry.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -164,7 +165,16 @@ function parseArgs(argv: string[]): RecorderPlan {
   return { logPath, summaryPath };
 }
 
-function writeSummary(path: string, summary: PiBenchmarkTelemetrySummary): void {
+/**
+ * What the recorder CLI writes for gate-d/run.sh: the benchmark counters plus, under
+ * `verification`, the content-blind verification-behaviour summary (INFER-521). The library
+ * summary type stays unchanged, because scripts/real-agent-benchmark.ts spreads it into its rows.
+ */
+export interface PiRecorderSummary extends PiBenchmarkTelemetrySummary {
+  verification: VerificationSummary;
+}
+
+function writeSummary(path: string, summary: PiRecorderSummary): void {
   mkdirSync(dirname(path), { recursive: true });
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
   try {
@@ -187,17 +197,30 @@ export async function runPiBenchmarkTelemetry(argv: string[]): Promise<number> {
   mkdirSync(dirname(plan.logPath), { recursive: true });
   const raw = createWriteStream(plan.logPath, { encoding: "utf8", flags: "wx", mode: 0o600 });
   const telemetry = createPiBenchmarkTelemetry();
+  const verification = createVerificationTelemetry();
+  // One parse per line feeds both observers; an unparseable line counts for both.
+  const both: PiBenchmarkTelemetry = {
+    observe(event, observedMs) {
+      telemetry.observe(event, observedMs);
+      verification.observe(event);
+    },
+    unparseable() {
+      telemetry.unparseable();
+      verification.unparseable();
+    },
+    summary: () => telemetry.summary(),
+  };
   const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
   try {
     for await (const line of input) {
       raw.write(`${line}\n`);
-      observePiBenchmarkLine(telemetry, line, performance.now());
+      observePiBenchmarkLine(both, line, performance.now());
     }
     await new Promise<void>((accept, reject) => {
       raw.once("error", reject);
       raw.end(accept);
     });
-    writeSummary(plan.summaryPath, telemetry.summary());
+    writeSummary(plan.summaryPath, { ...telemetry.summary(), verification: verification.summary() });
     return 0;
   } catch (error) {
     raw.destroy();
