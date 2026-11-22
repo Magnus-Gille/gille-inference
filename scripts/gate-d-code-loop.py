@@ -6,6 +6,11 @@ Default enumeration is the pinned r1 corpus. Fresh r2 holdouts require the expli
 seed files -> code_loop_start -> poll -> fetch diff ->
 apply onto a pristine seed copy (own git root, run.sh discipline) -> grade with
 the battery's own deterministic check.sh (no model in grading). Resumable via JSONL.
+
+``GATE_D_TASKS_ROOT=<dir>`` selects an external corpus with a ``corpus-manifest.json`` instead
+(INFER-521; see gate-d/run.sh). Its task digests are checked before seeding and before each row,
+sealed tasks need the holdout opt-in, and resume/scoreboards scope by corpusRevision and digest.
+An external corpus carries no acceptance threshold, so its scoreboard reports counts only.
 """
 import argparse, json, os, re, shutil, subprocess, sys, time, urllib.request
 
@@ -20,10 +25,15 @@ POLL_S, DEADLINE_S, WALL_S = 10, 720, 600
 sys.path.insert(0, os.path.join(REPO, "gate-d"))
 from gate_d_corpus import (  # noqa: E402
     active_revision,
+    external_from_env,
+    external_task_dir,
+    external_task_metadata,
     include_holdout_from_env,
     load_manifest,
     revision_contract,
+    select_external,
     task_metadata,
+    verify_external_digest,
 )
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -34,10 +44,22 @@ parser.add_argument("--scoreboard-only", action="store_true", help="score existi
 args = parser.parse_args()
 include_holdout = args.include_holdout or include_holdout_from_env()
 manifest = load_manifest()
-corpus_revision = active_revision(manifest, include_holdout)
-contract = revision_contract(manifest, corpus_revision)
-task_ids = list(contract["tasks"])
-acceptance = contract["acceptance"]
+try:
+    external = external_from_env()
+    if external is None:
+        corpus_revision = active_revision(manifest, include_holdout)
+        contract = revision_contract(manifest, corpus_revision)
+        task_ids = list(contract["tasks"])
+        acceptance = contract["acceptance"]
+    else:
+        TASKS = str(external["root"])
+        corpus_revision = external["corpusRevision"]
+        task_ids = select_external(external, include_holdout)
+        contract = {"tasks": task_ids, "holdoutTasks": [
+            t for t in task_ids if external_task_metadata(external, t)["holdout"]]}
+        acceptance = None
+except ValueError as error:
+    parser.error(str(error))
 only = args.task
 if only is not None and only not in task_ids:
     if os.path.isfile(os.path.join(TASKS, only, "meta.json")):
@@ -53,6 +75,13 @@ if args.list_tasks:
     raise SystemExit(0)
 
 
+def current_row(row):
+    """A result row of the selected corpus (and, externally, of the task's current digest)."""
+    if row.get("corpusRevision", "gate-d-r1") != corpus_revision or row.get("id") not in task_ids:
+        return False
+    return external is None or row.get("taskRevision") == external["digests"][row["id"]]
+
+
 def scoreboard_summary():
     latest = {}
     if os.path.exists(RESULTS):
@@ -65,13 +94,16 @@ def scoreboard_summary():
                 except json.JSONDecodeError:
                     continue
                 row_revision = row.get("corpusRevision", "gate-d-r1")
-                if row_revision == corpus_revision and row.get("id") in task_ids:
+                if row_revision == corpus_revision and current_row(row):
                     latest[row["id"]] = row
+    npass = sum(1 for row in latest.values() if row.get("passed"))
+    if acceptance is None:
+        return {"corpusRevision": corpus_revision, "passed": npass, "completed": len(latest),
+                "minimumPass": None, "denominator": len(task_ids), "verdict": "REPORT", "rows": latest}
     denominator = acceptance["denominator"]
     minimum_pass = acceptance["minimumPass"]
     if denominator != len(task_ids):
         raise RuntimeError(f"{corpus_revision} denominator {denominator} != {len(task_ids)} selected tasks")
-    npass = sum(1 for row in latest.values() if row.get("passed"))
     complete = len(latest)
     verdict = "PASS" if complete == denominator and npass >= minimum_pass else "FAIL"
     return {
@@ -87,9 +119,11 @@ def scoreboard_summary():
 
 def print_scoreboard():
     summary = scoreboard_summary()
+    threshold = ("no acceptance threshold" if summary["minimumPass"] is None
+                 else f"acceptance >= {summary['minimumPass']}/{summary['denominator']}")
     print(f"\n=== GATE D THROUGH code_loop [{corpus_revision}]: {summary['passed']}/{summary['denominator']} "
           f"(completed {summary['completed']}/{summary['denominator']}; "
-          f"acceptance >= {summary['minimumPass']}/{summary['denominator']}) => {summary['verdict']} ===", flush=True)
+          f"{threshold}) => {summary['verdict']} ===", flush=True)
     for tid in task_ids:
         row = summary["rows"].get(tid)
         if row is None:
@@ -97,7 +131,7 @@ def print_scoreboard():
             continue
         print(f"  {tid}: {'PASS' if row.get('passed') else 'FAIL ' + str(row.get('check_tail', ''))[-80:]}", flush=True)
     print("SCOREBOARD_JSON=" + json.dumps({key: value for key, value in summary.items() if key != "rows"}, sort_keys=True), flush=True)
-    return 0 if summary["verdict"] == "PASS" else 1
+    return 0 if summary["verdict"] in ("PASS", "REPORT") else 1
 
 
 if args.scoreboard_only:
@@ -138,7 +172,7 @@ if os.path.exists(RESULTS):
             except json.JSONDecodeError:
                 continue
             prior_revision = prior.get("corpusRevision", "gate-d-r1")
-            if prior_revision == corpus_revision and prior.get("id") in task_ids:
+            if prior_revision == corpus_revision and current_row(prior):
                 done.add(prior["id"])
 
 for tid in task_ids:
@@ -147,10 +181,15 @@ for tid in task_ids:
     if tid in done:
         print(f"[{tid}] already done — skip", flush=True)
         continue
-    tdir = os.path.join(TASKS, tid)
+    if external is None:
+        tdir = os.path.join(TASKS, tid)
+        task_meta = task_metadata(tid)
+    else:
+        tdir = str(external_task_dir(external, tid))
+        task_meta = external_task_metadata(external, tid)
+        verify_external_digest(external, tid)  # raises (no row) on a drifted task
     instr = open(os.path.join(tdir, "INSTRUCTION.md"), encoding="utf-8").read()
     files = seed_files(os.path.join(tdir, "repo"))
-    task_meta = task_metadata(tid)
     row = {
         "id": tid,
         "corpusRevision": corpus_revision,
@@ -158,6 +197,8 @@ for tid in task_ids:
         "holdout": task_meta["holdout"],
         "n_seed_files": len(files),
     }
+    if external is not None:
+        row.update(family=task_meta["family"], split=task_meta["split"], trap=task_meta["trap"])
     t0 = time.time()
     try:
         start = mcp("code_loop_start", {"instruction": instr, "files": files,
@@ -209,6 +250,8 @@ for tid in task_ids:
     row["check_tail"] = ((chk.stdout or "") + (chk.stderr or ""))[-300:]
     row["passed"] = row.get("applied", False) and chk.returncode == 0
     row["wall_s"] = round(time.time() - t0, 1)
+    if external is not None:
+        verify_external_digest(external, tid, task_meta["taskRevision"])  # no row on drift
     print(f"[{tid}] {'PASS' if row['passed'] else 'FAIL'} "
           f"(loop={row['status']}, check_exit={row['check_exit']}, {row['wall_s']}s)", flush=True)
     with open(RESULTS, "a") as f:

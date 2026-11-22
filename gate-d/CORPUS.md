@@ -42,3 +42,13 @@ as `gate-d-r1`, never as r2. The code-loop acceptance contracts are fixed at >=9
 All revision-2 seeds and solutions are committed before Hugin selects experiment holdouts. Hugin
 owns later matched execution and promotion; authoring and model-free fixture verification do not
 run a model or judge.
+
+## External corpora (INFER-521)
+
+Fresh corpora that must stay sealed, such as code-battle's `gate-d-r3`, live outside this public
+repository and run through `GATE_D_TASKS_ROOT` (see [`README.md`](./README.md#external-corpus-gate_d_tasks_root-infer-521)).
+Their identity is the generator's `corpus-manifest.json`, not `corpus.json`: rows record the
+external `corpusRevision`, the manifest digest as `taskRevision`, and `holdout` from each task's
+`meta.json`. An external revision may not reuse an in-repo revision name, so r3 rows never pool
+with r1 or r2. Sealed external tasks need the same `GATE_D_INCLUDE_HOLDOUT=1` opt-in. External
+corpora carry no acceptance threshold here; their statistics live with the corpus.

@@ -8,6 +8,9 @@
 # Knobs: ARMS (default "aider pi"), SEEDS (default 1), CAP_S (per-run wall cap, default 600),
 # GATE_D_OUT (default data/gate-d-results.jsonl).
 # Holdouts are excluded by default; set GATE_D_INCLUDE_HOLDOUT=1 explicitly to select r2.
+# GATE_D_TASKS_ROOT=<dir> selects an external corpus (INFER-521; see run.sh). Its rows are scoped by
+# corpusRevision AND the manifest digest (taskRevision), so a re-pinned task never resumes from, or
+# pools with, rows of an earlier version of itself.
 #
 # RESUMABLE: counts existing rows per (arm,model,task) in the output JSONL and runs only the
 # shortfall — safe to re-launch after an interruption; already-done triples are skipped.
@@ -32,6 +35,16 @@ CORPUS_TOOL="$ROOT/gate_d_corpus.py"
 if [ "${1:-}" = "--list-tasks" ]; then python3 "$CORPUS_TOOL" tasks; exit $?; fi
 CORPUS_REVISION="$(python3 "$CORPUS_TOOL" revision)" || exit 3
 TASKS="$(python3 "$CORPUS_TOOL" tasks)" || exit 3
+# {task: expected taskRevision} for an external corpus; empty ({}) for the in-repo corpus.
+TASK_REVS="{}"
+if [ -n "${GATE_D_TASKS_ROOT:-}" ]; then
+  TASK_REVS="$(python3 -c '
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import gate_d_corpus as g
+c = g.external_from_env()
+print(json.dumps(c["digests"], sort_keys=True))' "$ROOT")" || exit 3
+fi
 : "${GW:=https://inference.example.com/v1}"
 : "${GW_KEY:?set GW_KEY to a real gateway token (mint via bin/invite)}"
 : "${MODEL:=qwen3-coder-next-80b}"
@@ -58,15 +71,17 @@ if [ -n "$PROMPT_SHA" ]; then export GATE_D_EXPECT_PROMPT_SHA="$PROMPT_SHA"; els
 count_rows() {
   [ -f "$OUT" ] || { echo 0; return; }
   GD_A="$1" GD_M="$2" GD_T="$3" GD_R="$CORPUS_REVISION" GD_OUT="$OUT" \
-    GD_V="$PROMPT_VARIANT" GD_S="$PROMPT_SHA" python3 -c "import json,os
+    GD_V="$PROMPT_VARIANT" GD_S="$PROMPT_SHA" GD_REVS="$TASK_REVS" python3 -c "import json,os
 a=os.environ['GD_A'];m=os.environ['GD_M'];t=os.environ['GD_T'];rev=os.environ['GD_R'];n=0
 want=(os.environ['GD_V'], os.environ['GD_S'] or None)
+taskrev=json.loads(os.environ['GD_REVS']).get(t)
 for l in open(os.environ['GD_OUT']):
     try: r=json.loads(l)
     except: continue
     if not isinstance(r,dict): continue
     rowrev=r.get('corpusRevision','gate-d-r1')
     variant=(r.get('promptVariant','none'), r.get('promptSha256'))
+    if taskrev is not None and r.get('taskRevision')!=taskrev: continue
     if rowrev==rev and r.get('arm')==a and r.get('model')==m and r.get('task')==t and variant==want: n+=1
 print(n)"
 }
@@ -98,13 +113,14 @@ for arm in $ARMS; do
   done
 done
 echo "=== SWEEP done $(date) ===" | tee -a "$LOG"
-GD_R="$CORPUS_REVISION" GD_TASKS="$TASKS" GD_OUT="$OUT" python3 -c "import json,collections,os
-rev=os.environ['GD_R']; allowed=set(os.environ['GD_TASKS'].split())
+GD_R="$CORPUS_REVISION" GD_TASKS="$TASKS" GD_OUT="$OUT" GD_REVS="$TASK_REVS" python3 -c "import json,collections,os
+rev=os.environ['GD_R']; allowed=set(os.environ['GD_TASKS'].split()); revs=json.loads(os.environ['GD_REVS'])
 c=collections.Counter(); p=collections.Counter()
 for l in open(os.environ['GD_OUT']):
     try: r=json.loads(l)
     except: continue
     if r.get('corpusRevision','gate-d-r1') != rev or r.get('task') not in allowed: continue
+    if revs and r.get('taskRevision') != revs.get(r.get('task')): continue
     digest=r.get('promptSha256') or ''
     k=(r.get('arm') or '',r.get('model') or '',r.get('promptVariant','none') or 'none',digest)
     c[k]+=1; p[k]+= 1 if r.get('pass') else 0
