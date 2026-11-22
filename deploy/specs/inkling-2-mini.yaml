@@ -1,0 +1,40 @@
+# Thinking Machines Inkling 2 Mini (released 2026-11-20). Promoted live 2026-11-21 15:42 UTC.
+# Model: thinkingmachines/Inkling-2-Mini — 26.4B total / 3.4B active looped MoE (layers 6-17 run
+# three times), hybrid local/global attention, image input.
+# Artifact: ggml-org/Inkling-2-Mini-GGUF revision db61c5b492a6a034d986328d28274af0a439aa6c
+#   Inkling-2-Mini-IQ4_NL.gguf       sha256 cbdf3fa9dc50a4124977980f37da4f1fa764b0cfe800d275cd43d26ce2a81af4
+#   mmproj-Inkling-2-Mini-BF16.gguf  sha256 e914997fe07fb2066bfdce855ec7275c15bc2b624e5423149f1027839593d9cb
+#   (arch inkling2_loop, 24 physical blocks, loop 6..18 x3). Unsloth's root GGUFs are NOT usable:
+#   they use Unsloth's own `inkling2` looped layout (block_count=48 over 24 physical blocks), which
+#   mainline fails to load (`blk.24.attn_q.weight` not found); their Mainline_Support files need
+#   llama.cpp #32704 (merged after this pin) for NVFP4 per-expert scales. IQ4_NL is requantized
+#   from BF16 and does not depend on #32704.
+# Runtime: upstream llama.cpp master 29b52d398b294509746ec0a3f28948a3107c0213 (Vulkan, production
+#   flags). No earlier pinned runtime contains the inkling2 architecture. Upstream PR
+#   ggml-org/llama.cpp#32268 (chat-template/tool-call parser, vision preprocessing and embedding-norm
+#   fixes) was still an unmerged draft at this pin: text chat is the supported surface; tool calls
+#   and image captions are unqualified until a runtime containing #32268 replaces this pin.
+# Serving: 64K context, one slot, Q8 KV, Flash Attention, no draft model (the separate DSpark draft
+#   GGUF is not qualified). Reasoning depth is per request via `reasoning_effort`.
+# Measured at promotion (2026-11-21): ~25 GiB GTT while loaded (peak host use 32.9 GiB), cold load
+#   ~14 s with weights partly in page cache, decode ~22 tok/s on short prompts. One simple tool call
+#   and one small image test passed; complex tool/vision cases remain unqualified without #32268.
+# /operator-resolve/ paths must be replaced with stable non-scratch operator paths kept in the
+# private operations tracker.
+key: inkling-2-mini
+api: chat
+gguf: /operator-resolve/models/inkling-2-mini/Inkling-2-Mini-IQ4_NL.gguf
+mmproj: /operator-resolve/models/inkling-2-mini/mmproj-Inkling-2-Mini-BF16.gguf
+runtime_bin: /operator-resolve/llama-runtime/releases/29b52d398b294509746ec0a3f28948a3107c0213/bin/llama-server
+ctx: 65536
+ngl: 999
+ubatch: 512
+np: 1
+jinja: true
+fa: on
+reasoning_format: auto
+reasoning: auto
+cache_ram_mib: 2048
+ctk: q8_0
+ctv: q8_0
+ttl: 1800

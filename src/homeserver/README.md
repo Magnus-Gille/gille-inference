@@ -1120,6 +1120,11 @@ specialist. `muse-glimmer-30b` and `nemotron-3.5-lightning-30b-a3b` remain rever
 Glimmer delegation requires a grounded task plus an explicit deterministic verifier, and Nemotron
 is served reasoning-off. A model being present in this roster does not make it a default or an
 enforced route.
+`inkling-2-mini` (Thinking Machines Inkling 2 Mini, 26B-A3.4B looped MoE, ggml-org IQ4_NL plus
+BF16 projector; spec [`deploy/specs/inkling-2-mini.yaml`](../../deploy/specs/inkling-2-mini.yaml)) is a 64K Q8-KV entry on its own pinned llama.cpp runtime, without a draft model.
+Reasoning depth is set per request with `reasoning_effort`. Its runtime predates upstream fixes for
+tool-call parsing and vision preprocessing: text chat is the supported surface, and simple tool calls and
+images passed one canary each. Measured ~22 tok/s decode and ~25 GiB while loaded. It is not a route.
 
 ## Coordinating heavy GPU jobs — `gpu` (issue #88)
 
