@@ -32,6 +32,7 @@ import { REVIEWER_USEFULNESS_VALUES, REVIEW_BOUNDED_TASK_TYPE } from "./review-b
 import { isKnownTaskType } from "./taxonomy.js";
 import { policyTaskTypeIdentity } from "./task-type-identity.js";
 import { CONTENT_CAPTURE_SUPPRESSED, type ContentCapture } from "./content-capture.js";
+import type { EffectiveSampling } from "../runner/sampling.js";
 
 export type {
   EvidenceIdentityBundle,
@@ -139,6 +140,14 @@ export interface DelegationRecord {
    * writes no prompt excerpt and no prompt hash, and marks `content_capture = 'suppressed'`.
    */
   contentCapture?: ContentCapture;
+  /**
+   * Sampling actually sent to the local backend for the attempt that produced this row: requested
+   * and effective temperature, whether the local temperature floor applied, seed (null = none sent),
+   * top_p/top_k/min_p. Stored as JSON in `effective_sampling_json`; NULL on legacy rows and on rows
+   * whose attempt never reached the backend. Deliberately separate from evidenceIdentity.sampling,
+   * which mirrors the admitted Hugin stamp and must keep matching it.
+   */
+  effectiveSampling?: EffectiveSampling | null;
 }
 
 // ─── Verdict ───────────────────────────────────────────────────────────────────
@@ -266,6 +275,8 @@ function ensureSchema(db: Database.Database): void {
     }
     // #487: per-call content opt-out marker. NULL is the legacy/full-excerpt state.
     if (!names.has("content_capture")) db.exec(`ALTER TABLE delegations ADD COLUMN content_capture TEXT`);
+    // Effective (sent) sampling: temperature after the local floor, seed, top_p/top_k/min_p.
+    if (!names.has("effective_sampling_json")) db.exec(`ALTER TABLE delegations ADD COLUMN effective_sampling_json TEXT`);
   })();
   db.exec(`CREATE INDEX IF NOT EXISTS idx_deleg_gate_mode ON delegations(gate_mode)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_deleg_key_alias ON delegations(key_alias)`);
@@ -328,14 +339,14 @@ export function recordDelegation(rec: DelegationRecord): string {
         error_class, escalated, source, notes,
         gate_mode, gate_score, gate_would_escalate, gate_error, key_alias, shadow,
         evidence_identity_hash, evidence_lane, learning_task_admission_id,
-        learning_task_instance_id, learning_task_attempt_id, content_capture)
+        learning_task_instance_id, learning_task_attempt_id, content_capture, effective_sampling_json)
      VALUES
        (@id, @ts, @taskType, @nodeId, @modelId, @promptHash, @promptExcerpt, @outcome, @score,
         @latencyMs, @ttftMs, @promptTokens, @completionTokens, @tokPerSec, @verifier,
         @errorClass, @escalated, @source, @notes,
         @gateMode, @gateScore, @gateWouldEscalate, @gateError, @keyAlias, @shadow,
         @evidenceIdentityHash, @evidenceLane, @learningTaskAdmissionId,
-        @learningTaskInstanceId, @learningTaskAttemptId, @contentCapture)`
+        @learningTaskInstanceId, @learningTaskAttemptId, @contentCapture, @effectiveSamplingJson)`
   );
 
   // #5 (M5 dogfood review): the snapshot upsert and the row insert are two separate statements —
@@ -407,6 +418,7 @@ export function recordDelegation(rec: DelegationRecord): string {
       learningTaskInstanceId: admission?.taskInstanceId ?? null,
       learningTaskAttemptId: admission?.attemptId ?? null,
       contentCapture: suppressed ? CONTENT_CAPTURE_SUPPRESSED : null,
+      effectiveSamplingJson: rec.effectiveSampling ? JSON.stringify(rec.effectiveSampling) : null,
     });
   });
   // Acquire the writer lock before resolving the admission so another process cannot remove or

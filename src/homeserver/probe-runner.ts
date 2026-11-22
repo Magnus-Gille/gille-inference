@@ -11,7 +11,8 @@
 
 import type { Probe } from "./probes.js";
 import { resolveLocalSampling } from "./sampling-profile.js";
-import type { ProbeRunResult, ProbeRunSummary, TaskTypeScore } from "./scout-types.js";
+import { offsetSeed } from "../runner/sampling.js";
+import type { ProbeRunResult, ProbeRunSummary, ProbeSampling, TaskTypeScore } from "./scout-types.js";
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -26,6 +27,21 @@ export interface ChatCallResult {
 }
 
 export type ChatFn = (model: string, probe: Probe) => Promise<ChatCallResult>;
+
+/**
+ * The sampling makeChatFn sends for `probe` on `model`: model-aware defaults (sampling-profile.ts)
+ * plus the probe's explicit seed. Exported so results record it even when the call throws.
+ */
+export function probeSampling(model: string, probe: Probe): ProbeSampling {
+  const s = resolveLocalSampling(model, { temperature: probe.temperature });
+  return {
+    temperature: s.temperature,
+    topP: s.topP ?? null,
+    topK: s.topK ?? null,
+    minP: s.minP ?? null,
+    seed: probe.seed ?? null,
+  };
+}
 
 function failedReviewMetrics(
   probe: Probe
@@ -80,15 +96,16 @@ export function makeChatFn(opts: {
     }
     messages.push({ role: "user", content: probe.prompt });
 
-    const sampling = resolveLocalSampling(model, { temperature: probe.temperature });
+    const sampling = probeSampling(model, probe);
     const body = JSON.stringify({
       model,
       messages,
       max_tokens: probe.maxTokens ?? 2048,
       temperature: sampling.temperature,
-      ...(sampling.topP !== undefined ? { top_p: sampling.topP } : {}),
-      ...(sampling.topK !== undefined ? { top_k: sampling.topK } : {}),
-      ...(sampling.minP !== undefined ? { min_p: sampling.minP } : {}),
+      ...(sampling.topP !== null ? { top_p: sampling.topP } : {}),
+      ...(sampling.topK !== null ? { top_k: sampling.topK } : {}),
+      ...(sampling.minP !== null ? { min_p: sampling.minP } : {}),
+      ...(sampling.seed !== null ? { seed: sampling.seed } : {}),
     });
 
     const headers: Record<string, string> = {
@@ -280,6 +297,12 @@ export interface RunProbesOpts {
   chat?: ChatFn;
   /** Called after each probe×repeat result is built. */
   onResult?: (r: ProbeRunResult) => void;
+  /**
+   * Base sampling seed. Repeat r of a probe is sent with seed + r - 1, so repeats are distinct but
+   * reproducible samples (evals policy: extra trials vary the seed explicitly). Omitted = no seed.
+   * A probe's own `seed` wins.
+   */
+  seed?: number;
 }
 
 /**
@@ -298,12 +321,23 @@ export async function runProbes(opts: RunProbesOpts): Promise<ProbeRunSummary> {
 
   const results: ProbeRunResult[] = [];
 
+  // Greedy decoding ignores the seed: at temperature 0 repeats are the same sample, not new trials.
+  if (repeats > 1 && opts.probes.some((p) => probeSampling(opts.model, p).temperature === 0)) {
+    console.warn(
+      `[probe-runner] ${opts.model}: ${repeats} repeats at temperature 0 are greedy and seed-independent; ` +
+        `they measure server nondeterminism, not sampling variance. Vary the prompt or use temperature > 0 for extra trials.`
+    );
+  }
+
   for (const probe of opts.probes) {
     for (let rep = 1; rep <= repeats; rep++) {
       opts.signal?.throwIfAborted();
+      const callProbe: Probe =
+        probe.seed === undefined && opts.seed !== undefined ? { ...probe, seed: offsetSeed(opts.seed, rep - 1) } : probe;
+      const sampling = probeSampling(opts.model, callProbe);
       let r: ProbeRunResult;
       try {
-        const call = await chat(opts.model, probe);
+        const call = await chat(opts.model, callProbe);
         const finishReason = call.finishReason ?? null;
         const emptyOutput = call.output.trim().length === 0;
         const truncated = finishReason === "length";
@@ -316,6 +350,7 @@ export async function runProbes(opts: RunProbesOpts): Promise<ProbeRunSummary> {
           taskType: probe.taskType,
           verifierName: probe.verifierName,
           repeat: rep,
+          sampling,
           outcome: vr.outcome,
           score: vr.score ?? null,
           latencyMs: call.latencyMs,
@@ -335,6 +370,7 @@ export async function runProbes(opts: RunProbesOpts): Promise<ProbeRunSummary> {
           taskType: probe.taskType,
           verifierName: probe.verifierName,
           repeat: rep,
+          sampling,
           outcome: "error",
           score: 0,
           latencyMs: null,

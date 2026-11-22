@@ -40,6 +40,11 @@ export interface Probe {
    * stochastic decoding (e.g. VibeThinker ~0.6–1.0) so the probe doesn't under-measure them.
    */
   temperature?: number;
+  /**
+   * Explicit sampling seed for this call. Set by runProbes from RunProbesOpts.seed (base seed +
+   * repeat - 1, so repeats are distinct but reproducible samples); omitted = no seed sent.
+   */
+  seed?: number;
   verifier: Verifier;
   verifierName: string;
   /** Seeded-bug denominator retained even when the model call/verifier errors. */

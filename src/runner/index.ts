@@ -14,6 +14,10 @@
  *   --provider <name>         "openrouter" (default) or "local".
  *   --model-map <pairs>       Comma-separated "openrouter-id=ollama-name" pairs for local provider.
  *   --skip-preflight          Skip preflight checks when using --provider local.
+ *   --seed <n>|none           Sampling seed sent with every call. Default: 1. "none" sends no seed.
+ *   --no-temperature-floor    LM Studio: send literal temperature 0 instead of the 0.6 floor.
+ *
+ * Every run row records requested_temperature, effective_temperature, seed and sampling_json.
  */
 
 import { loadEnv } from '../env.js';
@@ -23,6 +27,7 @@ import { MODELS, getModelById } from './models.js';
 import { ALL_TASKS } from '../tasks/index.js';
 import { runBatch } from './run-batch.js';
 import { runPreflight } from './preflight.js';
+import { isValidSeed, MAX_SEED } from './sampling.js';
 
 // ─── Arg parsing ──────────────────────────────────────────────────────────────
 
@@ -38,6 +43,8 @@ function parseArgs(argv: string[]): {
   provider: Provider;
   localModelMap: Record<string, string>;
   skipPreflight: boolean;
+  seed: number | null | undefined;
+  temperatureFloor: false | undefined;
 } {
   const args = argv.slice(2);
   let batchId: string | null = null;
@@ -49,6 +56,8 @@ function parseArgs(argv: string[]): {
   let provider: Provider = 'openrouter';
   const localModelMap: Record<string, string> = {};
   let skipPreflight = false;
+  let seed: number | null | undefined;
+  let temperatureFloor: false | undefined;
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -90,12 +99,29 @@ function parseArgs(argv: string[]): {
       case '--skip-preflight':
         skipPreflight = true;
         break;
+      case '--seed': {
+        const val = args[++i] ?? '';
+        if (val === 'none') {
+          seed = null;
+        } else {
+          const n = Number(val);
+          if (!isValidSeed(n)) {
+            console.error(`--seed must be an integer in [0, ${MAX_SEED}] or "none", got: ${val}`);
+            process.exit(1);
+          }
+          seed = n;
+        }
+        break;
+      }
+      case '--no-temperature-floor':
+        temperatureFloor = false;
+        break;
       default:
         console.warn(`Unknown argument: ${arg}`);
     }
   }
 
-  return { batchId, modelIds, taskIds, concurrency, resume, dryRun, provider, localModelMap, skipPreflight };
+  return { batchId, modelIds, taskIds, concurrency, resume, dryRun, provider, localModelMap, skipPreflight, seed, temperatureFloor };
 }
 
 // ─── Summary table ────────────────────────────────────────────────────────────
@@ -119,7 +145,7 @@ function printSummaryTable(stats: Record<string, { completed: number; failed: nu
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  const { batchId, modelIds, taskIds, concurrency, resume, dryRun, provider, localModelMap, skipPreflight } = parseArgs(process.argv);
+  const { batchId, modelIds, taskIds, concurrency, resume, dryRun, provider, localModelMap, skipPreflight, seed, temperatureFloor } = parseArgs(process.argv);
 
   if (!batchId) {
     console.error('Error: --batch <id> is required');
@@ -175,6 +201,8 @@ async function main(): Promise<void> {
     provider,
     localModelMap,
     skipPreflight: true, // preflight already ran above
+    seed,
+    temperatureFloor,
   });
 
   // For per-model breakdown, query the DB after the run

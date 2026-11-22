@@ -9,11 +9,24 @@
 // ── Benchmark (probe-runner) ────────────────────────────────────────────────────────
 
 /** Per (probe, repeat) outcome from running the probe battery against one endpoint. */
+export interface ProbeSampling {
+  temperature: number;
+  topP: number | null;
+  topK: number | null;
+  minP: number | null;
+  seed: number | null;
+}
+
 export interface ProbeRunResult {
   probeId: string;
   taskType: string;
   verifierName: string;
   repeat: number;
+  /**
+   * Sampling sent for this call (after model-aware defaults). The probe runner talks to llama-server
+   * directly, so no temperature floor applies; seed null = no seed sent. Absent on legacy results.
+   */
+  sampling?: ProbeSampling;
   outcome: string; // pass | partial | fail | error | unverified
   score: number | null;
   latencyMs: number | null;
@@ -128,6 +141,13 @@ export interface RegistryEntry {
     repeats: number;
     ngl?: number;
     flashAttn?: string;
+    /**
+     * Base seed sent with probe calls (repeat r uses seed + r - 1); null = no seed sent.
+     * Absent on rows written before seeds were recorded: their sampling seed is unknown.
+     */
+    seed?: number | null;
+    /** Model-aware sampling actually sent for probes without their own temperature. */
+    sampling?: { temperature: number; topP: number | null; topK: number | null; minP: number | null };
   };
   /** Always false for the manual evaluator; retained for historical adopted rows. */
   served: boolean;

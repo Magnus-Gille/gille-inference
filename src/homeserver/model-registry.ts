@@ -38,10 +38,26 @@ function isNonNegativeCountRecord(value: unknown): value is Record<string, numbe
 }
 
 /** #12: shape-check for the persisted exact eval serving configuration. */
+function isNullableFiniteNumber(value: unknown): boolean {
+  return value === null || (typeof value === "number" && Number.isFinite(value));
+}
+
+function isEvalSampling(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v["temperature"] === "number" && Number.isFinite(v["temperature"]) &&
+    isNullableFiniteNumber(v["topP"]) && isNullableFiniteNumber(v["topK"]) && isNullableFiniteNumber(v["minP"])
+  );
+}
+
 function isEvalServingConfig(value: unknown): value is { ctx: number; repeats: number; ngl?: number; flashAttn?: string } {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const v = value as Record<string, unknown>;
   return (
+    (v["seed"] === undefined || v["seed"] === null ||
+      (typeof v["seed"] === "number" && Number.isSafeInteger(v["seed"]) && v["seed"] >= 0)) &&
+    (v["sampling"] === undefined || isEvalSampling(v["sampling"])) &&
     typeof v["ctx"] === "number" &&
     Number.isFinite(v["ctx"]) &&
     typeof v["repeats"] === "number" &&

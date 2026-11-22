@@ -2743,6 +2743,8 @@ interface DelegateParams {
   topP?: number;
   topK?: number;
   minP?: number;
+  /** Explicit sampling seed (non-negative integer). Omitted = no seed sent. */
+  seed?: number;
   /** Optional v1 handshake. Unstamped /delegate remains the legacy, learning-ineligible lane. */
   learningTaskStamp?: HuginRequestStamp;
   learningTaskObservedFingerprint?: string;
@@ -2796,6 +2798,8 @@ function parseDelegateBody(rawBody: string): DelegateParse {
     ["topP", 0, 1, false],
     ["topK", 0, Number.MAX_SAFE_INTEGER, true],
     ["minP", 0, 1, false],
+    // uint32 range minus llama.cpp's "random" sentinel 0xFFFFFFFF (see runner/sampling.ts MAX_SEED).
+    ["seed", 0, 0xfffffffe, true],
   ] as const;
   for (const [field, min, max, integer] of samplerSpecs) {
     const value = body[field];
@@ -2873,6 +2877,7 @@ function parseDelegateBody(rawBody: string): DelegateParse {
       topP: body["topP"] as number | undefined,
       topK: body["topK"] as number | undefined,
       minP: body["minP"] as number | undefined,
+      seed: body["seed"] as number | undefined,
       learningTaskStamp,
       learningTaskObservedFingerprint,
     },
@@ -3004,6 +3009,7 @@ async function handleDelegate(
     topP: params.topP,
     topK: params.topK,
     minP: params.minP,
+    seed: params.seed,
     source: "gateway",
     keyAlias,
     // #4: the stamp was structurally validated in parseDelegateBody and — on the live /delegate

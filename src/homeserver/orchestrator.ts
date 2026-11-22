@@ -8,6 +8,7 @@ import { HostMemoryAdmissionError, type ModelStartAdmission } from "./host-memor
 import { routingTarget, FRONTIER, UNKNOWN_ROUTE } from "./routing-table.js";
 import { gateEligible, gateDecision, type GateConfig } from "./disagreement-gate.js";
 import { runLmStudioInference } from "../runner/lmstudio-client.js";
+import { lmStudioEffectiveSampling, offsetSeed, resolveEffectiveSampling } from "../runner/sampling.js";
 import { configuredDelegateModelIds, orinAllowsTask, runOrinInference, type ComputeNodeId } from "./nodes.js";
 import type { LocalInferenceResult } from "../runner/local-client.js";
 import { runInference, type ResponseFormat } from "../runner/openrouter-client.js";
@@ -81,6 +82,12 @@ export interface DelegationTask {
   topK?: number;
   /** Min-p override; llama.cpp uses 0 to disable the filter. */
   minP?: number;
+  /**
+   * Explicit sampling seed for the local call. Omitted = no seed sent (backend samples randomly),
+   * which the #164 format retry relies on. When set, the one format retry uses seed + 1 so it is
+   * still a different sample, and the ledger row records the seed that produced its result.
+   */
+  seed?: number;
   /** How to grade the local output. Omit for passthrough (recorded "unverified"). */
   verifier?: Verifier;
   /** Label stored in the ledger's verifier column. */
@@ -903,6 +910,13 @@ async function delegateImpl(
       }
       const controller = new AbortController();
       const startedAtMs = Date.now();
+      // An explicit seed would make the #164 retry an identical request; offset it so the retry is
+      // still a fresh sample. The effective seed is returned in r.sampling.
+      const attemptSampling = sampling.seed !== undefined ? { ...sampling, seed: offsetSeed(sampling.seed, retryOrdinal) } : sampling;
+      // What this attempt is sent with, kept even when the result is lost to a timeout/abort.
+      const sentSampling = nodeId === "orin"
+        ? resolveEffectiveSampling(attemptSampling, { temperature: 0, temperatureFloor: false })
+        : lmStudioEffectiveSampling(attemptSampling);
       let timedOut = false;
       const timer = setTimeout(() => {
         timedOut = true;
@@ -914,17 +928,18 @@ async function delegateImpl(
           ? await runOrinInference(modelId, task.prompt, {
               systemPrompt: task.systemPrompt,
               maxTokens,
-              temperature: sampling.temperature,
-              topP: sampling.topP,
-              topK: sampling.topK,
-              minP: sampling.minP,
+              temperature: attemptSampling.temperature,
+              topP: attemptSampling.topP,
+              topK: attemptSampling.topK,
+              minP: attemptSampling.minP,
+              seed: attemptSampling.seed,
               responseFormat,
               signal: controller.signal,
             }, cfg)
           : await runLmStudioInference(modelId, task.prompt, {
               systemPrompt: task.systemPrompt,
               maxTokens,
-              ...sampling,
+              ...attemptSampling,
               responseFormat,
               signal: controller.signal,
             });
@@ -932,12 +947,12 @@ async function delegateImpl(
         // runLmStudioInference catches its own errors, but if an abort (or anything else)
         // ever escapes, fold it into a result instead of throwing out of delegate().
         r = timedOut
-          ? { ok: false, error: TIMEOUT_SENTINEL }
-          : { ok: false, error: err instanceof Error ? err.message : String(err) };
+          ? { ok: false, error: TIMEOUT_SENTINEL, sampling: sentSampling }
+          : { ok: false, error: err instanceof Error ? err.message : String(err), sampling: sentSampling };
       } finally {
         clearTimeout(timer);
       }
-      const effective = timedOut ? { ok: false as const, error: TIMEOUT_SENTINEL } : r;
+      const effective = timedOut ? { ok: false as const, error: TIMEOUT_SENTINEL, sampling: sentSampling } : r;
       updateCurrentTraceSpan({
         retryOrdinal,
         ...(effective.ok ? {} : { errorClass: effective.truncated === true ? "truncated" : classifyError(effective.error) }),
@@ -989,6 +1004,7 @@ async function delegateImpl(
       source: task.source,
       keyAlias: task.keyAlias,
       notes: [failNote, retryNote].filter(Boolean).join(" | "),
+      effectiveSampling: result.sampling ?? null,
       evidenceIdentity,
       learningTaskAdmissionId: task.learningTaskAdmissionId,
       learningTaskStamp: task.learningTaskStamp,
@@ -1107,6 +1123,7 @@ async function delegateImpl(
     gateScore: gate?.score ?? null,
     gateWouldEscalate: gate?.wouldEscalate ?? null,
     gateError: gate?.secondaryError ?? null,
+    effectiveSampling: result.sampling ?? null,
     evidenceIdentity,
     learningTaskAdmissionId: task.learningTaskAdmissionId,
     learningTaskStamp: task.learningTaskStamp,

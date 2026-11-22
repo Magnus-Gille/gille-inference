@@ -3,6 +3,7 @@ import { performance } from 'node:perf_hooks';
 import type { InferenceOptions } from './openrouter-client.js';
 import type { LocalInferenceResult } from './local-client.js';
 import { currentTraceHeaders } from '../homeserver/tracing.js';
+import { lmStudioEffectiveSampling, warnTemperatureFloorOnce } from './sampling.js';
 
 /**
  * LM Studio inference client.
@@ -46,14 +47,14 @@ export async function runLmStudioInference(
   prompt: string,
   options: InferenceOptions & { signal?: AbortSignal } = {}
 ): Promise<LocalInferenceResult> {
-  const { systemPrompt, maxTokens = 4096, temperature = 0.0, responseFormat } = options;
-  // Sampler floor for reasoning/MoE models: greedy decoding (temp 0) sends models
-  // like Mellum2 into degenerate repetition loops that run to the token cap. Apply
-  // the recommended sampler (top_p/top_k) and clamp temperature off zero.
-  const topP = options.topP ?? 0.95;
-  const topK = options.topK ?? 20;
-  const minP = options.minP;
-  const effectiveTemp = temperature <= 0 ? 0.6 : temperature;
+  const { systemPrompt, maxTokens = 4096, responseFormat } = options;
+  // Sampler floor for reasoning/MoE models: greedy decoding (temp 0) sends models like Mellum2 into
+  // degenerate repetition loops that run to the token cap. The recommended sampler (top_p/top_k) is
+  // applied and a requested temperature <= 0 is raised to the floor (0.6 by default). This used to
+  // happen silently; it is now explicit (`temperatureFloor`, `false` = greedy), logged once per
+  // model, and returned as `sampling` on every result so run records store what was really sent.
+  const sampling = lmStudioEffectiveSampling(options);
+  warnTemperatureFloorOnce(modelId, sampling);
 
   const client = createClient();
 
@@ -79,11 +80,13 @@ export async function runLmStudioInference(
       model: modelId,
       messages,
       max_tokens: maxTokens,
-      temperature: effectiveTemp,
-      top_p: topP,
+      temperature: sampling.temperature,
+      top_p: sampling.topP ?? undefined,
       // top_k is not in the OpenAI type but LM Studio honors it; pass through.
-      top_k: topK,
-      ...(minP !== undefined ? { min_p: minP } : {}),
+      top_k: sampling.topK ?? undefined,
+      ...(sampling.minP !== null ? { min_p: sampling.minP } : {}),
+      // Explicit seed only; no seed means the backend samples randomly (recorded as seed: null).
+      ...(sampling.seed !== null ? { seed: sampling.seed } : {}),
       // Grammar-constrained structured output (#166). Only sent when the caller/task supplies one:
       // for gpt-oss-120b a json_object/json_schema format engages llama.cpp's constrained decoder and
       // prevents the harmony/PEG 500; omitting it entirely preserves the unconstrained default.
@@ -137,6 +140,7 @@ export async function runLmStudioInference(
     if (finishReason === 'length') {
       return {
         ok: false,
+        sampling,
         error:
           `LM Studio completion truncated: finish_reason=length, max_tokens=${maxTokens}, ` +
           `completion_tokens=${completionTokens}, visible_content_chars=${content.length}`,
@@ -150,7 +154,7 @@ export async function runLmStudioInference(
     }
 
     if (!content || content.trim() === '') {
-      return { ok: false, error: 'Empty response from LM Studio model' };
+      return { ok: false, sampling, error: 'Empty response from LM Studio model' };
     }
 
     // tok/s over the generation phase (after first token), the meaningful local metric.
@@ -171,9 +175,10 @@ export async function runLmStudioInference(
       provider: 'local-ollama', // reuse the local result tag so analysis treats it as local hardware
       finishReason,
       truncated: false,
+      sampling,
     };
   } catch (err) {
-    if (err instanceof Error) return { ok: false, error: `LM Studio error: ${err.message}` };
-    return { ok: false, error: String(err) };
+    if (err instanceof Error) return { ok: false, sampling, error: `LM Studio error: ${err.message}` };
+    return { ok: false, sampling, error: String(err) };
   }
 }

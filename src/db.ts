@@ -95,6 +95,12 @@ export function initDb(dbPath?: string): Database.Database {
   for (const migration of [
     'ALTER TABLE runs ADD COLUMN ttft_ms INTEGER',
     'ALTER TABLE runs ADD COLUMN tokens_per_second REAL',
+    // Effective sampling actually sent (see src/runner/sampling.ts). NULL on pre-existing rows:
+    // those rows' sampling is unknown, not "temperature 0".
+    'ALTER TABLE runs ADD COLUMN requested_temperature REAL',
+    'ALTER TABLE runs ADD COLUMN effective_temperature REAL',
+    'ALTER TABLE runs ADD COLUMN seed INTEGER',
+    'ALTER TABLE runs ADD COLUMN sampling_json TEXT',
   ]) {
     try {
       db.exec(migration);
