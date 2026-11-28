@@ -102,7 +102,7 @@ describe("scope narrowing order matches gateway grants (INFER-152)", () => {
   it("pins the ask decision: ask reaches only MCP ask (no files), tokenize/list_models/model_status and four GETs", () => {
     expect([...reach.get("ask")!].sort()).toEqual([
       "GET /healthz", "GET /portal/capture-policy", "GET /portal/me", "GET /v1/models", "POST /mcp",
-      "mcp tool ask", "mcp tool list_models", "mcp tool model_status", "mcp tool tokenize",
+      "mcp tool ask", "mcp tool ask_batch", "mcp tool list_models", "mcp tool model_status", "mcp tool tokenize",
     ]);
     expect(reach.get("ask")!.has("mcp ask accepts files")).toBe(false);
     // So ask is a strict subset of admin, agent and inference, and shares nothing exclusive with monitor.

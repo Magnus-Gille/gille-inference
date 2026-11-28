@@ -255,6 +255,12 @@ function ensureSchema(db: Database.Database): void {
       redeemed_key_alias TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_invites_code ON invites(code_hash);
+    CREATE TABLE IF NOT EXISTS key_file_grants (
+      key_hash   TEXT PRIMARY KEY,
+      alias      TEXT NOT NULL,
+      roots      TEXT NOT NULL DEFAULT '[]',
+      updated_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS credit_topups (
       request_id TEXT PRIMARY KEY,
       alias TEXT NOT NULL,
@@ -1853,4 +1859,67 @@ export function lookupActiveKeyByAlias(alias: string, now: Date = new Date()): A
   const rec = rowToRecord(row);
   if (rec.expiresAt !== null && new Date(rec.expiresAt).getTime() <= now.getTime()) return null;
   return rec;
+}
+
+// ─── INFER-524: per-key blind-context file grants ───────────────────────────────────
+
+/** Thrown when a file-root grant is malformed or targets a key that cannot hold one. */
+export class InvalidFileGrantError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidFileGrantError";
+  }
+}
+
+/** Hard cap on granted roots per key (mirrors the global MAX_BLIND_CONTEXT_ROOTS order of magnitude). */
+export const MAX_KEY_FILE_ROOTS = 32;
+
+/**
+ * Replace the blind-context roots granted to ONE exact active owner key. `[]` clears the grant.
+ * The grant is bound to the credential's hash, so a rotation (new key, new hash) starts without
+ * one — re-grant explicitly after rotating. Roots must be absolute; they only NARROW the server's
+ * HOMESERVER_BLIND_CONTEXT_ROOTS at request time and can never widen it.
+ */
+export function setKeyFileRoots(alias: string, roots: readonly string[], now: Date = new Date()): string[] {
+  if (!Array.isArray(roots) || roots.length > MAX_KEY_FILE_ROOTS ||
+      roots.some((root) => typeof root !== "string" || !root.startsWith("/") || root.includes("\0")) ||
+      new Set(roots).size !== roots.length) {
+    throw new InvalidFileGrantError(`file roots must be up to ${MAX_KEY_FILE_ROOTS} distinct absolute paths`);
+  }
+  const rec = lookupActiveKeyByAlias(alias, now);
+  if (!rec) throw new InvalidFileGrantError(`no active key with alias '${alias}'`);
+  if (rec.tier !== "owner") throw new InvalidFileGrantError("file roots can only be granted to owner-tier keys");
+  const db = ksDb();
+  if (roots.length === 0) {
+    db.prepare(`DELETE FROM key_file_grants WHERE key_hash = ?`).run(rec.keyHash);
+    return [];
+  }
+  db.prepare(
+    `INSERT INTO key_file_grants (key_hash, alias, roots, updated_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(key_hash) DO UPDATE SET roots = excluded.roots, alias = excluded.alias, updated_at = excluded.updated_at`
+  ).run(rec.keyHash, rec.alias, JSON.stringify([...roots]), now.toISOString());
+  return [...roots];
+}
+
+/** Granted roots for a credential hash; [] when none (the default for every key). */
+export function getKeyFileRootsByHash(keyHash: string | null): string[] {
+  if (keyHash === null) return [];
+  const row = ksDb().prepare(`SELECT roots FROM key_file_grants WHERE key_hash = ?`).get(keyHash) as
+    | { roots: string }
+    | undefined;
+  if (!row) return [];
+  try {
+    const parsed = JSON.parse(row.roots) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((root): root is string => typeof root === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Granted roots for an alias (operator display); [] when the key is unknown or has none. */
+export function getKeyFileRootsByAlias(alias: string): string[] {
+  const row = ksDb().prepare(`SELECT key_hash FROM api_keys WHERE alias = ?`).get(alias) as
+    | { key_hash: string }
+    | undefined;
+  return row ? getKeyFileRootsByHash(row.key_hash) : [];
 }

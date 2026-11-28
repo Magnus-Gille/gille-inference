@@ -926,6 +926,10 @@ for chunk in stream:
             <td>Runs a completion: <span class="badge mono">{model, prompt, system?, max_tokens?, output_profile?, temperature?, top_p?, top_k?, min_p?}</span> → returns the text. For bounded multi-section work, <span class="badge mono">output_profile: "complete-within-budget"</span> prioritizes finishing every required section within the token cap (and uses low reasoning effort on gpt-oss). A model outside your allow-list, exhausted credits, a quota hit, or a busy box come back as a tool error with a clear message.</td>
           </tr>
           <tr>
+            <td><span class="badge mono">ask_batch</span></td>
+            <td><span class="badge mono">{tasks: [ask arguments, &hellip;], content_capture?}</span> runs 1&ndash;16 independent <span class="badge mono">ask</span> tasks in one call, each with exactly the same allow-list, credits, quotas and admission as a single ask. At most min(your concurrency limit, 4) run at a time; one failing task never stops the others. Results keep input order in <span class="badge mono">structuredContent.results</span>. A large batch can take longer than the stock <span class="badge mono">m5 ... mcp</span> bridge&#8217;s 30-second limit; keep batches small there.</td>
+          </tr>
+          <tr>
             <td><span class="badge mono">tokenize</span></td>
             <td><span class="badge mono">{model, text}</span> returns exact raw-text token counts,
               IDs and pieces from the selected llama.cpp tokenizer. Uses your model allow-list and

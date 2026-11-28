@@ -527,6 +527,17 @@ the gateway, so the same **credit metering** (`reserveCredits`/`reconcileCredits
   and described by an exact `outputSchema`: `files_enabled`, stable `files_reason`, and
   `resolved_root_count` (guest-safe `null`). The published `m5-cli/1.2.0` user-agent keeps its
   text-only wire contract; `m5-cli/1.2.1+` and non-`m5` callers may receive the structured object.
+- `ask_batch` (INFER-525) — `{tasks: [<ask arguments>, …], content_capture?}` runs 1–16
+  independent `ask` tasks in one call. Every task is dispatched through the `ask` handler itself,
+  so authorization, model allow-list, `files` grants, credits, quotas, admission, logging and
+  metering are exactly those of a single ask; the batch adds no authority and is advertised to
+  every key that sees `ask` (including `ask` scope). At most `min(key max_parallel, 4)` tasks run
+  concurrently. One task's failure never aborts the others. `structuredContent` is
+  `{results: [{index, ok, model, text, finish_reason, truncated, usage, error}], succeeded,
+  failed}` in input order (`error` = `{message, m5_code, retryable, retry_after_seconds}`), the
+  text content is a delimited rendering, and `isError` is true only when every task failed. A
+  top-level `content_capture: "none"` applies to every task and is echoed as
+  `_meta.content_capture: "suppressed"`.
 - `tokenize` — `{model, text}` returns exact raw-text `{model, count, tokens, pieces,
   add_special:false, parse_special:false}` in both `structuredContent` and JSON text. This is a
   tool, not a separate model in `list_models`. It calls the selected llama.cpp runtime's native
@@ -618,6 +629,31 @@ for a synthetic owner call. Source tests use fixtures; a successful approved dep
 real backend response are required before claiming the current serving stack emits reasoning.
 
 #### Blind-context delegation (`files`, issue #128) — OWNER-TIER ONLY
+
+**Per-key grant for `ask` scope (INFER-524).** An `ask`-scope key reads no files by default
+(INFER-450: the gateway's service account does the reading, so an on-box agent account must not get
+a confused deputy). The operator can grant ONE exact credential a list of roots with
+`keys files --alias A --roots /abs/a:/abs/b` (`--clear` removes it; no flag shows it). The grant
+is stored by credential hash, so `keys rotate` drops it; re-grant after rotating. At request time
+the key's effective roots are its granted roots that realpath-resolve to a directory **inside** a
+resolved `HOMESERVER_BLIND_CONTEXT_ROOTS` entry — a grant can only narrow the server allowlist,
+never widen it. Discovery reports `files_reason: "enabled"` with the key's own effective root count,
+`no_resolved_roots` when no granted root survives narrowing, and keeps the stable
+`owner_tier_required` (count `null`) for an ungranted ask key so deployed clients keep parsing.
+The `files` input is advertised to a granted ask key only. Agent/admin/inference owner keys keep
+the server roots unchanged.
+
+**Secret denylist (every caller, INFER-524).** Independent of tier, a path is refused
+(`sensitive_path`) when a directory below its root is `.git`, `.hg`, `.svn`, `.ssh`, `.gnupg`,
+`.aws`, `.azure`, `.gcloud`, `.kube`, `.docker`, `.config`, `.password-store`, `.terraform`,
+`data`, `secrets` or `node_modules`, or when the file name looks like a secret, key, keystore or
+database (`.env*`, `*.env`, `.envrc`, `*.pem`/`*.key`/`*.p12`/`*.pfx`/`*.jks`/`*.keystore`/`*.kdbx`
+and similar, `id_rsa*`/`id_ed25519*`, `authorized_keys`, `.npmrc`/`.pypirc`/`.netrc`/`.pgpass`/
+`.git-credentials`, `credentials*`/`*-credentials*`, `secrets*`, `*.tfstate`/`*.tfvars`,
+`kubeconfig*`, `service-account*.json`, `STATUS.md`, `*.sqlite`/`*.db` and WAL/SHM
+siblings). Content containing a PEM `PRIVATE KEY` block is refused (`sensitive_content`). The
+denylist is a backstop: roots should still be clean repo mirrors, never the live gateway tree
+(which holds `.env`, `data/` and keystores).
 
 `ask` accepts an optional `files: string[]` of **absolute paths on the box**. When present, the
 gateway expands each file **server-side** into a clearly-delimited context block and prepends it

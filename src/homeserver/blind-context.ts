@@ -1,5 +1,5 @@
 import { closeSync, constants, fstatSync, openSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { isAbsolute, relative, sep } from "node:path";
 
 /**
  * Blind-context delegation (issue #128): the MCP `ask` tool accepts an OWNER-ONLY optional
@@ -101,6 +101,13 @@ export interface BlindContextConfig {
   maxFileBytes: number;
   /** Cumulative byte cap across every file in one request. */
   maxTotalBytes: number;
+  /**
+   * INFER-524: a per-key grant that NARROWS `roots`. When present, the effective allowlist is the
+   * subset of these (realpath-resolved) directories that lie inside a resolved `roots` entry — a
+   * key grant can never widen the operator's global allowlist. Absent = use `roots` unchanged
+   * (agent/admin owner keys). Present but empty = disabled.
+   */
+  keyRoots?: readonly string[];
 }
 
 export type BlindContextErrorCode =
@@ -113,7 +120,9 @@ export type BlindContextErrorCode =
   | "binary"
   | "file_too_large"
   | "total_too_large"
-  | "too_many_files";
+  | "too_many_files"
+  | "sensitive_path"
+  | "sensitive_content";
 
 export interface BlindContextError {
   code: BlindContextErrorCode;
@@ -454,6 +463,72 @@ function inspectBlindContextAvailabilityWithRootStates(
 }
 
 /**
+ * INFER-524: effective allowlist for a key-scoped grant. Each granted root is resolved exactly
+ * like a global root (absolute directory, realpath, deduped) and kept only when it lies inside a
+ * resolved global root. The result never contains a directory the operator did not already allow.
+ */
+function narrowRoots(globalResolved: readonly string[], keyRoots: readonly string[]): string[] {
+  if (globalResolved.length === 0 || keyRoots.length === 0) return [];
+  const { resolvedRoots } = resolveRoots(keyRoots, DEFAULT_FS_OPS);
+  return resolvedRoots.filter((root) => globalResolved.some((global) => isUnderRoot(root, global)));
+}
+
+/**
+ * Content-blind availability for a key-scoped grant (INFER-524): `unconfigured` when the operator
+ * set no global roots, `no_resolved_roots` when none of the key's granted roots survive narrowing.
+ */
+export function describeKeyScopedBlindContextAvailability(
+  globalRoots: readonly string[],
+  keyRoots: readonly string[]
+): BlindContextAvailability {
+  const global = describeBlindContextAvailability(globalRoots);
+  if (!global.enabled) return global;
+  const effective = narrowRoots(inspectBlindContextAvailability(globalRoots).resolvedRoots, keyRoots);
+  return effective.length === 0
+    ? { enabled: false, reason: "no_resolved_roots", resolvedRootCount: 0 }
+    : { enabled: true, reason: "enabled", resolvedRootCount: effective.length };
+}
+
+/**
+ * INFER-524 secret denylist. Applies to EVERY caller (owner keys included): a path is refused when
+ * any component BELOW its allowlist root is a credential/VCS/state directory, or when its file name
+ * looks like a secret, key, keystore or database. This is a deny-by-name guard on top of — never a
+ * replacement for — choosing clean roots (repo mirrors, never the live gateway tree). Matching is
+ * case-insensitive.
+ */
+const SENSITIVE_DIR_NAMES: ReadonlySet<string> = new Set([
+  ".git", ".hg", ".svn", ".ssh", ".gnupg", ".aws", ".azure", ".gcloud", ".kube", ".docker",
+  ".config", ".password-store", ".terraform", "data", "secrets", "node_modules",
+]);
+const SENSITIVE_FILE_PATTERNS: readonly RegExp[] = [
+  /^\.env(\..*)?$/,
+  /\.env$/,
+  /^\.?envrc$/,
+  /\.(pem|key|crt|cer|der|p8|p12|pfx|jks|keystore|kdbx|gpg|asc|ovpn)$/,
+  /^id_(rsa|dsa|ecdsa|ed25519)(\..*)?$/,
+  /^(authorized_keys|known_hosts)$/,
+  /^\.(npmrc|pypirc|netrc|pgpass|git-credentials|htpasswd|dockercfg)$/,
+  /^(credentials?|secrets?)([._-].*)?$/,
+  /[._-]credentials?([._-].*)?$/,
+  /\.(tfstate|tfvars)(\..*)?$/,
+  /^kubeconfig/,
+  /^service[-_]?account.*\.json$/,
+  /^status\.md$/,
+  /\.(sqlite3?|db|db-wal|db-shm|sqlite-wal|sqlite-shm)$/,
+];
+const PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY(?: BLOCK)?-----/;
+
+function sensitivePathReason(resolvedPath: string, root: string): boolean {
+  const rel = relative(root, resolvedPath);
+  if (rel === "" || rel.startsWith("..")) return true; // a root itself is never a file to read
+  const parts = rel.split(sep).map((part) => part.toLowerCase());
+  const fileName = parts[parts.length - 1]!;
+  if (parts.slice(0, -1).some((dir) => SENSITIVE_DIR_NAMES.has(dir))) return true;
+  if (SENSITIVE_DIR_NAMES.has(fileName) && fileName.startsWith(".")) return true;
+  return SENSITIVE_FILE_PATTERNS.some((pattern) => pattern.test(fileName));
+}
+
+/**
  * True iff `resolvedPath` is `root` itself or lies strictly under it. Deliberately NOT a bare
  * `startsWith(root)` — that would also admit an unrelated sibling like `${root}-evil`.
  */
@@ -493,7 +568,19 @@ export function expandBlindContext(filePaths: readonly string[], cfg: BlindConte
       },
     };
   }
-  const roots = availability.resolvedRoots;
+  const roots = cfg.keyRoots === undefined
+    ? availability.resolvedRoots
+    : narrowRoots(availability.resolvedRoots, cfg.keyRoots);
+  if (roots.length === 0) {
+    return {
+      ok: false,
+      error: {
+        code: "disabled",
+        path: null,
+        message: "File attachments are not enabled for this key (no granted root resolves inside the server's allowed roots).",
+      },
+    };
+  }
 
   // Count cap — bounds the un-byte-metered delimiter/header overhead (see MAX_FILES_PER_REQUEST).
   if (filePaths.length > MAX_FILES_PER_REQUEST) {
@@ -529,13 +616,26 @@ export function expandBlindContext(filePaths: readonly string[], cfg: BlindConte
       return { ok: false, error: { code: "not_found", path: rawPath, message: `'${rawPath}' does not exist.` } };
     }
 
-    if (!roots.some((root) => isUnderRoot(resolved, root))) {
+    const containingRoot = roots.find((root) => isUnderRoot(resolved, root));
+    if (containingRoot === undefined) {
       return {
         ok: false,
         error: {
           code: "outside_roots",
           path: rawPath,
-          message: `'${rawPath}' resolves outside the allowed HOMESERVER_BLIND_CONTEXT_ROOTS.`,
+          message: cfg.keyRoots === undefined
+            ? `'${rawPath}' resolves outside the allowed HOMESERVER_BLIND_CONTEXT_ROOTS.`
+            : `'${rawPath}' resolves outside the file roots granted to this key.`,
+        },
+      };
+    }
+    if (sensitivePathReason(resolved, containingRoot)) {
+      return {
+        ok: false,
+        error: {
+          code: "sensitive_path",
+          path: rawPath,
+          message: `'${rawPath}' looks like a secret, credential, VCS-internal or state file and is never attached.`,
         },
       };
     }
@@ -632,8 +732,16 @@ export function expandBlindContext(filePaths: readonly string[], cfg: BlindConte
       };
     }
 
+    const text = buf.toString("utf-8");
+    if (PRIVATE_KEY_BLOCK.test(text)) {
+      return {
+        ok: false,
+        error: { code: "sensitive_content", path: rawPath, message: `'${rawPath}' contains a private-key block and was rejected.` },
+      };
+    }
+
     totalBytes += buf.length;
-    blocks.push(`${FILE_HEADER(rawPath)}\n${buf.toString("utf-8")}\n${FILE_FOOTER}`);
+    blocks.push(`${FILE_HEADER(rawPath)}\n${text}\n${FILE_FOOTER}`);
   }
 
   return {
