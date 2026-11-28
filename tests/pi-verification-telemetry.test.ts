@@ -124,3 +124,18 @@ test("a command that checks and mutates is never credited as a green check after
   assert.equal(classifyCommand("npm test && sed -i 's/a/b/' src/x.ts").mutates, true);
   assert.equal(classifyCommand("npm test > out.log").mutates, false);
 });
+
+test("a failed shell call that mutated still counts as a possible edit", () => {
+  const s = run(turn, start("1", "edit"), end("1", "edit", true), start("2", "bash", "npm test"), end("2", "bash", true),
+    turn, start("3", "bash", "sed -i 's/a/b/' src/x.ts && false"), end("3", "bash", false));
+  assert.equal(s.bashMutations, 1);
+  assert.notEqual(s.verificationClass, "checked-green-after-last-edit");
+});
+
+test("a known failure stays flagged when the retry is unattributable", () => {
+  const s = run(turn, start("1", "edit"), end("1", "edit", true), start("2", "bash", "npm test"), end("2", "bash", false),
+    start("3", "bash", "npm test | tail -5"), end("3", "bash", true));
+  assert.equal(s.stoppedWithFailingCheck, true);
+  assert.equal(s.verificationClass, "stopped-on-red");
+  assert.equal(s.lastTestOutcome, "unknown");
+});

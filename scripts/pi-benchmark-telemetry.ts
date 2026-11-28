@@ -205,7 +205,9 @@ export function createVerificationTelemetry() {
       }
       if (type === "tool_execution_end" && id !== null) {
         if (pendingEdits.delete(id) && ev["isError"] === false) noteEdit();
-        if (pendingMutations.delete(id) && ev["isError"] === false) {
+        // A failed shell call may still have changed files in an earlier segment (`sed -i ... && false`),
+        // so a detected mutation counts as a possible edit whatever the exit status (INFER-521 review).
+        if (pendingMutations.delete(id)) {
           bashMutations++;
           noteEdit();
         }
@@ -231,7 +233,13 @@ export function createVerificationTelemetry() {
       const last = (xs: CheckRecord[]) => (xs.length === 0 ? null : xs[xs.length - 1]!.outcome);
       const tcAfter = after("typecheck");
       const tsAfter = after("tests");
-      const stoppedRed = [tcAfter, tsAfter].some((xs) => last(xs) === "failed");
+      // A known failure stays flagged until a confirmed pass: an unattributable retry
+      // (`npm test | tail`) neither clears it nor counts as green (INFER-521 review).
+      const lastKnown = (xs: CheckRecord[]) => {
+        const known = xs.filter((c) => c.outcome !== "unknown");
+        return known.length === 0 ? null : known[known.length - 1]!.outcome;
+      };
+      const stoppedRed = [tcAfter, tsAfter].some((xs) => lastKnown(xs) === "failed");
       let cls: VerificationClass;
       if (edits === 0) cls = "no-edit";
       else if (checks.length === 0) cls = "never-checked";

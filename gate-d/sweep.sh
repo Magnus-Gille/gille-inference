@@ -30,6 +30,14 @@ set -o pipefail
 unset CDPATH   # a relative CDPATH makes `cd` print, corrupting $(cd ... && pwd)
 ROOT="$(cd "$(dirname "$0")" && pwd -P)"
 REPO_ROOT="$(cd "$ROOT/.." && pwd -P)"
+# Relative corpus and at-stop settings mean "from where the sweep was started": resolve them before
+# the cd below, or they would silently name other paths (INFER-521 review).
+for v in GATE_D_TASKS_ROOT GATE_D_AT_STOP; do
+  if [ -n "${!v:-}" ]; then
+    resolved="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "${!v}")" || exit 3
+    export "$v=$resolved"
+  fi
+done
 cd "$REPO_ROOT" || exit 3
 CORPUS_TOOL="$ROOT/gate_d_corpus.py"
 if [ "${1:-}" = "--list-tasks" ]; then python3 "$CORPUS_TOOL" tasks; exit $?; fi

@@ -482,5 +482,59 @@ sys.stdout.write(r.stdout); sys.stderr.write(r.stderr); sys.exit(r.returncode)
     expect(res.status, res.stdout + res.stderr).toBe(0);
     const [row] = rows(results);
     expect(row, res.stdout).toMatchObject({ id: "r3-test-a", corpusRevision: "gate-d-r3", family: "make-pass", applied: true, passed: true });
+    // Content-blind: an external row keeps the gate id, never check.sh output or gateway text.
+    expect(row).toMatchObject({ check_gate: "pass" });
+    for (const key of ["check_tail", "detail", "summary"]) expect(row).not.toHaveProperty(key);
+  });
+
+  it("rejects missing or contradictory holdout metadata", () => {
+    const repo = fixtureRepo();
+    const root = externalCorpus(repo);
+    const metaPath = join(root, "r3-test-a", "meta.json");
+    const meta = JSON.parse(readFileSync(metaPath, "utf8"));
+    const repin = () => {
+      const manifest = JSON.parse(readFileSync(join(root, "corpus-manifest.json"), "utf8"));
+      manifest.tasks[0].digest = digestOf(repo, join(root, "r3-test-a"));
+      writeFileSync(join(root, "corpus-manifest.json"), JSON.stringify(manifest));
+    };
+    const { holdout: _drop, ...noHoldout } = meta;
+    writeFileSync(metaPath, JSON.stringify(noHoldout)); repin();
+    expect(corpusTool(repo, { GATE_D_TASKS_ROOT: root }, "tasks").stderr).toContain("must set holdout");
+    writeFileSync(metaPath, JSON.stringify({ ...meta, split: "sealed", holdout: false })); repin();
+    expect(corpusTool(repo, { GATE_D_TASKS_ROOT: root }, "tasks").stderr).toContain("sealed split but does not set holdout");
+  });
+
+  it("binds the digest check to the exact directory that is seeded and graded", () => {
+    const repo = fixtureRepo();
+    const root = externalCorpus(repo);
+    const copy = join(tmp("gd-ext-copy-"), "r3-test-a");
+    cpSync(join(root, "r3-test-a"), copy, { recursive: true });
+    appendFileSync(join(copy, "INSTRUCTION.md"), "tampered\n");
+    const manifest = JSON.parse(readFileSync(join(root, "corpus-manifest.json"), "utf8"));
+    expect(corpusTool(repo, { GATE_D_TASKS_ROOT: root }, "verify-digest", "r3-test-a").status).toBe(0);
+    const r = corpusTool(repo, { GATE_D_TASKS_ROOT: root }, "verify-digest", "r3-test-a", "--expect", manifest.tasks[0].digest, "--dir", copy);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain("digest");
+  });
+
+  it("resolves a relative GATE_D_TASKS_ROOT from where the sweep was started", () => {
+    const repo = fixtureRepo();
+    const root = externalCorpus(repo);
+    const { bin } = fakePi({ root, solve: true });
+    const work = tmp("gd-ext-swrel-");
+    const out = join(work, "rows.jsonl");
+    const res = spawnSync("bash", [join(repo, "gate-d", "sweep.sh")], {
+      cwd: dirname(root),
+      encoding: "utf8",
+      env: cleanEnv({
+        GW_KEY: "test-key", GW: "http://127.0.0.1:9/v1", TMPDIR: work,
+        GATE_D_WORKROOT: join(work, "gate-d-work"), GATE_D_OUT: out, GATE_D_LOG: join(work, "sweep.log"),
+        PATH: `${bin}:${process.env.PATH}`, ARMS: "pi", SEEDS: "1",
+        GATE_D_TASKS_ROOT: root.split("/").pop()!,
+      }),
+      timeout: 240_000,
+    });
+    expect(res.status, res.stderr).toBe(0);
+    expect(rows(out).map((r) => r.task)).toEqual(["r3-test-a", "r3-test-b"]);
   });
 });

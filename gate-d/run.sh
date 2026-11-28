@@ -77,6 +77,8 @@ CORPUS_REVISION="$(python3 "$CORPUS_TOOL" revision)" || exit 3
 # The task source: gate-d/tasks, or a validated external root outside the checkout (INFER-521).
 EXTERNAL=0; [ -n "${GATE_D_TASKS_ROOT:-}" ] && EXTERNAL=1
 TASKS_DIR="$(python3 "$CORPUS_TOOL" tasks-root)" || exit 3
+# Every later helper call sees the resolved root, never a symlink that could be repointed mid-run.
+[ "$EXTERNAL" = 1 ] && export GATE_D_TASKS_ROOT="$TASKS_DIR"
 if [ "$EXTERNAL" = 1 ]; then
   # Work dirs must stay outside the task root, and the task root outside WORKROOT: an arm that can
   # reach either could rewrite the seed or the oracle it is graded against.
@@ -178,7 +180,7 @@ fi
 # External corpus content guard (INFER-521): replaces the git-status guard for a root that is not
 # under Git. The expected digest is captured once, before the arm, so a manifest edited mid-run
 # cannot re-bless edited task files.
-external_intact(){ python3 "$CORPUS_TOOL" verify-digest "$1" --expect "$2"; }
+external_intact(){ python3 "$CORPUS_TOOL" verify-digest "$1" --expect "$2" --dir "$3"; }
 # Grader-derived verification metric (INFER-521, CBATTLE-14 §3). Runs the corpus's at-stop.sh on a
 # COPY of the work dir, so whatever its checks write can never reach the workspace check.sh grades.
 # Content-blind and fail-open: a missing or failing script, or output that is not exactly the three
@@ -223,7 +225,7 @@ run_one() {
       echo "FATAL[$ARM/$id]: the manifest digest changed since the sweep started (re-pinned); no row written" >&2
       exit 3
     fi
-    if ! external_intact "$id" "$task_revision"; then
+    if ! external_intact "$id" "$task_revision" "$T"; then
       echo "FATAL[$ARM/$id]: the external task does not match its manifest digest before the run; refusing to run" >&2
       exit 9
     fi
@@ -408,7 +410,7 @@ PY
       exit 9
     fi
   fi
-  if [ "$EXTERNAL" = 1 ] && ! external_intact "$id" "$task_revision"; then
+  if [ "$EXTERNAL" = 1 ] && ! external_intact "$id" "$task_revision" "$T"; then
     echo "FATAL[$ARM/$id]: the external task changed on disk during this run; no row written (#172)" >&2
     rm -rf "$W"; exit 9
   fi
@@ -464,7 +466,7 @@ PY
     exitclass="$(grep -m1 -oE 'FAIL\[[^]]+\]' "$W/.check.log" | sed 's/^FAIL\[//; s/\]$//')"
     [ -n "$exitclass" ] || exitclass="check-fail"
   fi
-  if [ "$EXTERNAL" = 1 ] && ! external_intact "$id" "$task_revision"; then
+  if [ "$EXTERNAL" = 1 ] && ! external_intact "$id" "$task_revision" "$T"; then
     echo "FATAL[$ARM/$id]: the external task changed on disk during grading; no row written (#172)" >&2
     rm -rf "$W"; [ -n "$TRANSCRIPT" ] && rm -f "$TRANSCRIPT"; exit 9
   fi

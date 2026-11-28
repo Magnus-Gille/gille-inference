@@ -200,9 +200,13 @@ def external_task_metadata(corpus: dict[str, Any], task_id: str) -> dict[str, An
         raise ValueError(f"external task {task_id} corpusRevision does not match the manifest")
     if meta.get("id", task_id) != task_id:
         raise ValueError(f"external task {task_id} meta.json names another id")
-    holdout = meta.get("holdout", False)
+    # External tasks must state holdout explicitly, and a sealed split must say true: a metadata
+    # slip must never expose a fresh holdout without the opt-in (INFER-521 review).
+    holdout = meta.get("holdout")
     if not isinstance(holdout, bool):
-        raise ValueError(f"external task {task_id} holdout must be a boolean")
+        raise ValueError(f"external task {task_id} must set holdout to true or false")
+    if meta.get("split") == "sealed" and holdout is not True:
+        raise ValueError(f"external task {task_id} is in the sealed split but does not set holdout: true")
 
     def opt_str(key: str) -> Optional[str]:
         value = meta.get(key)
@@ -219,10 +223,21 @@ def external_task_metadata(corpus: dict[str, Any], task_id: str) -> dict[str, An
     }
 
 
-def verify_external_digest(corpus: dict[str, Any], task_id: str, expected: Optional[str] = None) -> None:
-    """Raise unless the task directory's content digest equals ``expected`` (default: the manifest's)."""
+def verify_external_digest(corpus: dict[str, Any], task_id: str, expected: Optional[str] = None,
+                           directory: Optional[str] = None) -> None:
+    """Raise unless the task directory's content digest equals ``expected`` (default: the manifest's).
+
+    ``directory`` binds the check to the exact path a runner seeds and grades from, so repointing a
+    symlinked root mid-run cannot make the check read a different tree (INFER-521 review).
+    """
     want = expected if expected is not None else corpus["digests"][task_id]
-    got = tree_digest(external_task_dir(corpus, task_id))
+    tdir = external_task_dir(corpus, task_id)
+    if directory is not None:
+        given = Path(directory)
+        if given.is_symlink() or not given.is_dir() or os.path.basename(os.path.normpath(directory)) != task_id:
+            raise ValueError(f"--dir for {task_id} is not a plain directory named after the task")
+        tdir = given
+    got = tree_digest(tdir)
     if got != want:
         raise ValueError(f"external task {task_id} digest {got} != manifest {want}")
 
@@ -265,6 +280,7 @@ def main() -> int:
     parser.add_argument("--include-holdout", action="store_true")
     parser.add_argument("--revision")
     parser.add_argument("--expect", help="verify-digest: compare with this digest instead of the manifest's")
+    parser.add_argument("--dir", help="verify-digest: digest exactly this task directory")
     args = parser.parse_args()
     try:
         manifest = load_manifest()
@@ -345,7 +361,7 @@ def external_main(parser: argparse.ArgumentParser, args: argparse.Namespace,
     elif command == "task-metadata":
         print(json.dumps(external_task_metadata(corpus, task_id), sort_keys=True))
     else:
-        verify_external_digest(corpus, task_id, args.expect)
+        verify_external_digest(corpus, task_id, args.expect, args.dir)
     return 0
 
 

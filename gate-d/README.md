@@ -210,3 +210,9 @@ GATE_D_TASKS_ROOT=/tmp/r3-validation GATE_D_AT_STOP=~/src/code-battle/gate-d-r3/
   `GATE_D_AT_STOP` resolves from the caller's directory. The copy shares the read-only-by-convention
   `node_modules` link with the graded workspace, exactly as the arm itself does; neither is covered
   by the task digest.
+- **Content-blind code-loop rows.** For an external corpus, `scripts/gate-d-code-loop.py` records
+  only `check_gate` (the failing gate id, or `pass`) instead of `check_tail`, and drops the gateway's
+  `detail`/`summary` text, because a failing hidden oracle can print sealed assertion values.
+- **Metadata.** External tasks must set `holdout` explicitly, and a `split: "sealed"` task must set
+  it to `true`. Relative `GATE_D_TASKS_ROOT`/`GATE_D_AT_STOP` resolve from where `run.sh` or
+  `sweep.sh` was started; digest checks are bound to the exact directory that is seeded and graded.

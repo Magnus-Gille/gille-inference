@@ -135,7 +135,8 @@ def print_scoreboard():
         if row is None:
             print(f"  {tid}: MISSING", flush=True)
             continue
-        print(f"  {tid}: {'PASS' if row.get('passed') else 'FAIL ' + str(row.get('check_tail', ''))[-80:]}", flush=True)
+        why = row.get("check_gate") if external is not None else str(row.get("check_tail", ""))[-80:]
+        print(f"  {tid}: {'PASS' if row.get('passed') else 'FAIL ' + str(why or '')}", flush=True)
     print("SCOREBOARD_JSON=" + json.dumps({key: value for key, value in summary.items() if key != "rows"}, sort_keys=True), flush=True)
     return 0 if summary["verdict"] in ("PASS", "REPORT") else 1
 
@@ -214,9 +215,12 @@ for tid in task_ids:
     if external is not None:
         verify_external_digest(external, tid, task_meta["taskRevision"])  # no row on drift
     if "work_id" not in start:
-        row.update(status="start-refused", detail=json.dumps(start)[:300],
-                   passed=False, wall_s=round(time.time() - t0, 1))
-        print(f"[{tid}] START REFUSED: {row['detail']}", flush=True)
+        row.update(status="start-refused", passed=False, wall_s=round(time.time() - t0, 1))
+        if external is None:
+            row["detail"] = json.dumps(start)[:300]
+        else:
+            row["refusal"] = start.get("refusal") if isinstance(start.get("refusal"), str) else None
+        print(f"[{tid}] START REFUSED: {row.get('detail', row.get('refusal'))}", flush=True)
         with open(RESULTS, "a") as f:
             f.write(json.dumps(row) + "\n")
         continue
@@ -233,9 +237,9 @@ for tid in task_ids:
     res = mcp("code_loop_result", {"work_id": wid})
     if external is not None:
         verify_external_digest(external, tid, task_meta["taskRevision"])  # before grading
-    row.update(status=res.get("status"), usage=res.get("usage"),
-               detail=(res.get("detail") or "")[:200],
-               summary=(res.get("summary") or "")[:150])
+    row.update(status=res.get("status"), usage=res.get("usage"))
+    if external is None:
+        row.update(detail=(res.get("detail") or "")[:200], summary=(res.get("summary") or "")[:150])
     # grade: pristine seed copy + own git root (run.sh discipline) + apply + check.sh
     wdir = os.path.join(WORKROOT, tid)
     shutil.rmtree(wdir, ignore_errors=True)
@@ -253,13 +257,20 @@ for tid in task_ids:
         os.remove(dpath)
         row["applied"] = ap.returncode == 0
         if ap.returncode != 0:
-            row["apply_err"] = (ap.stderr or "")[:200]
+            row["apply_err"] = (ap.stderr or "")[:200] if external is None else "apply-failed"
     else:
         row["applied"] = False
         row["apply_err"] = "empty diff"
     chk = sh(["bash", CHECK, tdir, wdir])
     row["check_exit"] = chk.returncode
-    row["check_tail"] = ((chk.stdout or "") + (chk.stderr or ""))[-300:]
+    check_out = (chk.stdout or "") + (chk.stderr or "")
+    if external is None:
+        row["check_tail"] = check_out[-300:]
+    else:
+        # External (possibly sealed) tasks: hidden-oracle failures can print assertion values and
+        # fixture data, so the row keeps only the gate id, never check.sh output (content-blind).
+        gate = re.search(r"FAIL\[([A-Za-z0-9_-]+)\]", check_out)
+        row["check_gate"] = "pass" if chk.returncode == 0 else (gate.group(1) if gate else "check-fail")
     row["passed"] = row.get("applied", False) and chk.returncode == 0
     row["wall_s"] = round(time.time() - t0, 1)
     if external is not None:
