@@ -93,10 +93,20 @@ describe("gateway-supplied cause in _meta is preferred over the sentence (#357)"
   );
 
   it("does not let _meta rename codes the client does not map yet", async () => {
-    for (const meta of [{ m5_code: "server_busy", retryable: true }, { m5_code: "made_up" }, "nope", null]) {
+    for (const meta of [{ m5_code: "made_up" }, { m5_code: "__proto__" }, "nope", null]) {
       const error = await askWith("The server is busy. Retry after 5s.", meta);
       expect(error).toMatchObject({ code: "tool_error" });
     }
+  });
+
+  it("maps gateway admission saturation to server_busy with a fixed retryability and bounded delay (INFER-242)", async () => {
+    const busy = await askWith("The server is busy. Retry after 5s.", {
+      m5_code: "server_busy", retryable: false, retry_after_seconds: 5,
+    });
+    expect(busy).toMatchObject({ code: "server_busy", retryable: true, retryAfterSeconds: 5 });
+    const absurd = await askWith("The server is busy.", { m5_code: "server_busy", retry_after_seconds: 86_401 });
+    expect(absurd).toMatchObject({ code: "server_busy", retryable: true });
+    expect(absurd.toJSON().error).not.toHaveProperty("retry_after_seconds");
   });
 
   it("classifies allowlisted model-backend reasons with safe fixed text", async () => {
