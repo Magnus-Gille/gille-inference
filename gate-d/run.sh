@@ -44,7 +44,7 @@ if [ "${1:-}" = "--print-workroot" ]; then echo "$WORKROOT"; exit 0; fi
 # capitalized path can name a directory inside the checkout. Walk from the nearest existing
 # ancestor of WORKROOT up to / and refuse if any of them is the checkout itself (path-inside.py).
 if ! python3 "$ROOT/path-inside.py" "$WORKROOT" "$REPO_ROOT"; then
-  echo "error: WORKROOT ($WORKROOT) resolves INSIDE the repo ($REPO_ROOT) — refusing to run (#172)." >&2
+  echo "error: WORKROOT ($WORKROOT) resolves INSIDE the repo ($REPO_ROOT), or could not be checked — refusing to run (#172)." >&2
   echo "       set TMPDIR or GATE_D_WORKROOT to a path outside the checkout." >&2
   exit 3
 fi
