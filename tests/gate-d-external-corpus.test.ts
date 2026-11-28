@@ -198,6 +198,8 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         tool = body["params"]["name"]
+        if tool == "code_loop_start" and os.environ.get("CL_START_LOG"):
+            open(os.environ["CL_START_LOG"], "w").write(json.dumps(body["params"]["arguments"].get("writable")))
         out = {"code_loop_start": {"work_id": "w1"}, "code_loop_status": {"status": "done"},
                "code_loop_result": {"status": "done", "diff": diff}}[tool]
         data = json.dumps({"result": {"content": [{"text": json.dumps(out)}]}}).encode()
@@ -478,7 +480,7 @@ require("fs").writeFileSync(".arm-telemetry.json", JSON.stringify({ verification
     cpSync(join(REAL_ROOT, "scripts", "gate-d-code-loop.py"), join(repo, "scripts", "gate-d-code-loop.py"));
     const res = spawnSync("python3", ["-c", CODE_LOOP_HARNESS, join(root, "r3-test-a"), join(repo, "scripts", "gate-d-code-loop.py")], {
       encoding: "utf8",
-      env: cleanEnv({ HOME: home, GATE_D_CL_REPO: repo, GATE_D_CL_RESULTS: results, GATE_D_TASKS_ROOT: root, NO_PROXY: "127.0.0.1", no_proxy: "127.0.0.1" }),
+      env: cleanEnv({ HOME: home, GATE_D_CL_REPO: repo, GATE_D_CL_RESULTS: results, GATE_D_TASKS_ROOT: root, CL_START_LOG: join(home, "start.json"), NO_PROXY: "127.0.0.1", no_proxy: "127.0.0.1" }),
       timeout: 120_000,
     });
     expect(res.status, res.stdout + res.stderr).toBe(0);
@@ -487,6 +489,9 @@ require("fs").writeFileSync(".arm-telemetry.json", JSON.stringify({ verification
     // Content-blind: an external row keeps the gate id, never check.sh output or gateway text.
     expect(row).toMatchObject({ check_gate: "pass" });
     for (const key of ["check_tail", "detail", "summary"]) expect(row).not.toHaveProperty(key);
+    // The declared edit targets are the writable scope, so files the task must create survive.
+    const meta = JSON.parse(readFileSync(join(root, "r3-test-a", "meta.json"), "utf8"));
+    expect(JSON.parse(readFileSync(join(home, "start.json"), "utf8"))).toEqual(meta.edit);
     // Grading happened in a private temp dir, not under the public checkout.
     expect(existsSync(join(repo, "gate-d", ".work-cl", "r3-test-a"))).toBe(false);
   });
@@ -592,16 +597,19 @@ require("fs").writeFileSync(".arm-telemetry.json", JSON.stringify({ verification
     const repo = fixtureRepo();
     const probeDir = tmp("gd-ext-envprobe-");
     const root = externalCorpus(repo, {
-      atStop: `#!/usr/bin/env bash\nenv | sed -n 's/^\\(GW[A-Z_]*\\|GATE_D_[A-Z_]*\\)=.*/\\1/p' > ${JSON.stringify(join(probeDir, "at-stop.txt"))}\nprintf '{"atStopTypecheck":"passed","atStopVisibleTests":"none","detectableFailureAtStop":false}\\n'\n`,
+      atStop: `#!/usr/bin/env bash\nenv | sed -n 's/^\\(GW[A-Z_]*\\|GATE_D_[A-Z_]*\\)=.*/\\1/p' > ${JSON.stringify(join(probeDir, "at-stop.txt"))}\n[ -e "$HOME/.scout-maintenance.env" ] && echo HOME-LEAK >> ${JSON.stringify(join(probeDir, "at-stop.txt"))}\nprintf '{"atStopTypecheck":"passed","atStopVisibleTests":"none","detectableFailureAtStop":false}\\n'\n`,
     });
     writeFileSync(join(repo, "gate-d", "check.sh"), [
       "#!/usr/bin/env bash",
       `env | sed -n 's/^\\(GW[A-Z_]*\\|GATE_D_[A-Z_]*\\)=.*/\\1/p' > ${JSON.stringify(join(probeDir, "check.txt"))}`,
+      `[ -e "$HOME/.scout-maintenance.env" ] && echo HOME-LEAK >> ${JSON.stringify(join(probeDir, "check.txt"))}`,
       "exit 0",
       "",
     ].join("\n"));
     const { bin } = fakePi({ root, solve: true });
-    const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", "r3-test-a"]);
+    const home = tmp("gd-ext-callerhome-");
+    writeFileSync(join(home, ".scout-maintenance.env"), "KEY=hs_owner_test_key\n");
+    const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root, HOME: home }, ["pi", "r3-test-a"]);
     expect(res.status, res.stderr).toBe(0);
     expect(rows(out)[0]).toMatchObject({ pass: true, atStopTypecheck: "passed" });
     expect(readFileSync(join(probeDir, "at-stop.txt"), "utf8")).toBe("");
@@ -635,6 +643,7 @@ require("fs").writeFileSync(".arm-telemetry.json", JSON.stringify({ verification
     writeFileSync(join(repo, "gate-d", "check.sh"), [
       "#!/usr/bin/env bash",
       `env | sed -n 's/^\\(GW[A-Z_]*\\|GATE_D_[A-Z_]*\\|SECRET_[A-Z_]*\\)=.*/\\1/p' > ${JSON.stringify(probe)}`,
+      `[ -e "$HOME/.scout-maintenance.env" ] && echo HOME-LEAK >> ${JSON.stringify(probe)}`,
       'echo "FAIL[G3-tsc]: src/FAIL[G5-oracle].ts broke"',
       "exit 1",
       "# gate ids defined here: fail G3-tsc fail G5-oracle",

@@ -113,19 +113,37 @@ interface CheckRecord {
 }
 
 const SEGMENT_SPLIT = /\s*(?:&&|\|\||;|\n)\s*/;
+// Every pattern is anchored at the command a segment runs (after `commandHead` strips env
+// assignments and launchers), never searched in arbitrary text: `which tsc`, `git grep "npm test"`
+// and `git diff -- test/vitest.config.ts` run no check (INFER-521 review).
 const TYPECHECK = [
-  /(^|[\s/])tsc(\s|$)/, // tsc, npx tsc, ./node_modules/.bin/tsc
-  /\bnpm\s+run\s+(typecheck|type-check|tsc|build)\b/,
-  /\bpnpm\s+(run\s+)?(typecheck|tsc)\b/,
+  /^(?:\S*\/)?tsc(\s|$)/, // tsc, npx tsc, ./node_modules/.bin/tsc
+  /^npm\s+run\s+(typecheck|type-check|tsc|build)\b/,
+  /^pnpm\s+(run\s+)?(typecheck|tsc)\b/,
 ];
 const TESTS = [
-  /\bnpm\s+(run\s+)?test\b/, /\bnpm\s+t\b/, /\bpnpm\s+(run\s+)?test\b/, /\byarn\s+test\b/,
-  /\btsx\s+--test\b/, /\bnode\s+(--import\s+tsx\s+)?--test\b/,
-  /\btsx\s+\S*test\S*\.ts\b/, // npx tsx test/foo.test.ts — running a test file directly
-  // vitest/jest as the executable (bare, a path to it, or via npx/pnpm/yarn exec), never as an
-  // argument: `git diff -- test/vitest.config.ts` runs no test (INFER-521 review).
-  /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:(?:npx|pnpm(?:\s+exec)?|yarn|bunx)\s+(?:--?\S+\s+)*)?(?:\S*\/)?(?:vitest|jest)(?:\s|$)/,
+  /^npm\s+(run\s+)?test\b/, /^npm\s+t\b/, /^pnpm\s+(run\s+)?test\b/, /^yarn\s+test\b/,
+  /^tsx\s+--test\b/, /^node\s+(--import\s+tsx\s+)?--test\b/,
+  /^tsx\s+\S*test\S*\.ts\b/, // npx tsx test/foo.test.ts — running a test file directly
+  /^(?:\S*\/)?(?:vitest|jest)(?:\s|$)/, /^yarn\s+(?:vitest|jest)(?:\s|$)/,
 ];
+
+/** The command a segment runs: leading `(` or `!`, env assignments, `time`/`timeout N` and launchers removed. */
+export function commandHead(segment: string): string {
+  let s = segment.trim();
+  for (;;) {
+    const next = s
+      .replace(/^\(\s*/, "")
+      .replace(/^!\s+/, "") // still a check, but unattributable (see `negated` below)
+      .replace(/^[A-Za-z_][A-Za-z0-9_]*=\S*\s+/, "")
+      .replace(/^time\s+/, "")
+      .replace(/^timeout\s+(?:-\S+\s+)*\S+\s+/, "")
+      .replace(/^(?:npx|bunx)\s+(?:-\S+\s+)*/, "")
+      .replace(/^(?:pnpm|yarn)\s+exec\s+/, "");
+    if (next === s) return s;
+    s = next;
+  }
+}
 const MUTATING_BASH = [/\bsed\s+-i/, /(^|[^>2&])>{1,2}\s*[^&\s]/, /\btee\b/, /\b(mv|cp|rm)\s/, /\bperl\s+-p?i/, /\bpatch\b/];
 
 /** Which checks a shell command runs. Exported for the classifier tests. */
@@ -138,8 +156,9 @@ export function classifyCommand(command: string): { kinds: CheckKind[]; attribut
     // `tsc --version`, `tsc --showConfig`, `vitest --help` verify nothing (INFER-521 review).
     if (/(^|\s)(--version|-v|--help|-h|--showConfig|--listFiles(Only)?|--init)(\s|$)/.test(seg)) continue;
     let hit = false;
-    if (TYPECHECK.some((re) => re.test(seg))) { kinds.add("typecheck"); hit = true; }
-    if (TESTS.some((re) => re.test(seg))) { kinds.add("tests"); hit = true; }
+    const head = commandHead(seg);
+    if (TYPECHECK.some((re) => re.test(head))) { kinds.add("typecheck"); hit = true; }
+    if (TESTS.some((re) => re.test(head))) { kinds.add("tests"); hit = true; }
     if (hit) checkSegments++;
   }
   // A pipe hides the check's exit status (`npm test | tail` exits with tail's status).

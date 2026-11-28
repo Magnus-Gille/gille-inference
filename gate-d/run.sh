@@ -203,9 +203,16 @@ fi
 # candidate code) get a fixed allowlisted environment: no gateway token, no runner configuration,
 # nothing inherited by accident (INFER-521 review). Only the selected arm ever sees GW_KEY.
 VERIFY_TMP=""
-[ "$EXTERNAL" = 1 ] && { VERIFY_TMP="$(python3 "$CORPUS_TOOL" scratch-parent)" || exit 3; }
+VERIFY_HOME=""
+if [ "$EXTERNAL" = 1 ]; then
+  VERIFY_TMP="$(python3 "$CORPUS_TOOL" scratch-parent)" || exit 3
+  # A private, empty HOME: the caller's HOME holds credential files (the gateway owner key under
+  # ~/.scout-maintenance.env), which code run here must not find there (INFER-521 review).
+  VERIFY_HOME="$(mktemp -d "$VERIFY_TMP/gd-home.XXXXXXXX")" || exit 3
+  trap 'rm -rf "$PROMPT_DIR" "$AT_STOP_DIR" "$VERIFY_HOME"' EXIT
+fi
 verify_env(){
-  env -i PATH="$PATH" HOME="${HOME:-/nonexistent}" LANG="${LANG:-C.UTF-8}" TMPDIR="$VERIFY_TMP" \
+  env -i PATH="$PATH" HOME="$VERIFY_HOME" LANG="${LANG:-C.UTF-8}" TMPDIR="$VERIFY_TMP" \
     GIT_CONFIG_NOSYSTEM=1 GIT_CEILING_DIRECTORIES="$WORKROOT" "$@"
 }
 # External corpus content guard (INFER-521): replaces the git-status guard for a root that is not

@@ -168,3 +168,14 @@ test("vitest and jest count only as the command, not as an argument or filename"
   const s = run(turn, start("1", "edit"), end("1", "edit", true), start("2", "bash", "git diff -- test/vitest.config.ts"), end("2", "bash", true));
   assert.equal(s.verificationClass, "never-checked");
 });
+
+test("only the command a segment runs counts as a check, never text that names one", () => {
+  for (const cmd of ["which tsc", 'git grep "npm test"', "grep -r tsc .", "man jest", "git log --grep='npm test'", "find . -name tsc"]) {
+    assert.deepEqual(classifyCommand(cmd).kinds, [], cmd);
+  }
+  for (const [cmd, kind] of [["timeout 60 npm test", "tests"], ["(npx tsc --noEmit)", "typecheck"], ["time npx --yes tsc -p .", "typecheck"], ["NODE_ENV=test npm run typecheck", "typecheck"]] as const) {
+    assert.deepEqual(classifyCommand(cmd).kinds, [kind], cmd);
+  }
+  const s = run(turn, start("1", "edit"), end("1", "edit", true), start("2", "bash", "which tsc"), end("2", "bash", true));
+  assert.equal(s.verificationClass, "never-checked");
+});

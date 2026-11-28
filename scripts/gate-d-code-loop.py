@@ -168,11 +168,25 @@ GRADER_ENV = {k: v for k, v in os.environ.items() if not k.startswith("GATE_D_")
 
 def external_grader_env(scratch_parent, wdir):
     """A fixed allowlist for grading an external task, as run.sh's verify_env: check.sh runs corpus
-    checks and candidate code, so no gateway token or other caller credential reaches it."""
-    return {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "/nonexistent"),
+    checks and candidate code, so no gateway token or other caller credential reaches it. HOME is a
+    fresh empty directory beside the work dir: the caller's HOME holds this runner's owner key."""
+    home = os.path.join(os.path.dirname(wdir), "home")
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    return {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": home,
             "LANG": os.environ.get("LANG", "C.UTF-8"), "TMPDIR": scratch_parent,
             "GIT_CONFIG_NOSYSTEM": "1", "GIT_CEILING_DIRECTORIES": os.path.dirname(wdir)}
 KNOWN_GATES = set(re.findall(r"\bfail (G[0-9]+-[A-Za-z0-9-]+)", open(CHECK, encoding="utf-8").read()))
+
+def external_edit_targets(tdir, tid):
+    """meta.json's `edit` list, validated as plain relative paths (no traversal, no glob syntax)."""
+    with open(os.path.join(tdir, "meta.json"), encoding="utf-8") as fh:
+        edit = json.load(fh).get("edit")
+    if not isinstance(edit, list) or not edit or not all(
+            isinstance(p, str) and p and not p.startswith("/") and ".." not in p.split("/")
+            and not re.search(r"[*?\[\]{}\\\x00-\x1f]", p) for p in edit):
+        raise SystemExit(f"[{tid}] meta.json edit must list plain relative paths; refusing to submit")
+    return edit
+
 
 def seed_files(repo_dir):
     out = []
@@ -218,6 +232,11 @@ for tid in task_ids:
         scratch_parent = safe_scratch_parent(external)
     instr = open(os.path.join(tdir, "INSTRUCTION.md"), encoding="utf-8").read()
     files = seed_files(os.path.join(tdir, "repo"))
+    start_args = {"instruction": instr, "files": files, "caps": {"wall_s": WALL_S}}
+    if external is not None:
+        # The task's declared edit targets are the writable scope, so a file the task must create
+        # reaches the returned diff (the gateway's default scope is the seed paths only).
+        start_args["writable"] = external_edit_targets(tdir, tid)
     row = {
         "id": tid,
         "corpusRevision": corpus_revision,
@@ -229,8 +248,7 @@ for tid in task_ids:
         row.update(family=task_meta["family"], split=task_meta["split"], trap=task_meta["trap"])
     t0 = time.time()
     try:
-        start = mcp("code_loop_start", {"instruction": instr, "files": files,
-                                        "caps": {"wall_s": WALL_S}})
+        start = mcp("code_loop_start", start_args)
     except Exception as e:
         start = {"refusal": "transport", "message": str(e)[:200]}
     if external is not None:
