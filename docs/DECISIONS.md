@@ -82,3 +82,29 @@ current real usage is too light to justify the maintenance surface by intent alo
 
 **Consequence:** No manufactured traffic and no forced Hugin path for direct inference. Governing
 criteria: [`hugin-role-validation.md`](./hugin-role-validation.md).
+
+## ADR-007: connector diagnostics stop at the client boundary (INFER-242)
+
+**Decision:** The standalone `m5 doctor` and `bin/m5-network-doctor.mjs` deliberately do not
+inspect the interactive host connector session (Claude Code / Codex MCP host state); they keep
+reporting `connector.status=unsupported` / `connector_session: not_inspected`. A transport failure
+that never reached the gateway carries no `request_id`; only gateway answers (such as the
+`server_busy` refusal of a retry) carry the gateway's own `request_id`.
+
+**Why:** The host connector session lives inside the L1 host process, which exposes no stable,
+content-free API to a separate CLI; reading its state would mean scraping host-private files or
+logs, which can contain credentials and prompts. A gateway `request_id` names a server-side
+record; a request that timed out before any HTTP response has no such record, so repeating an id
+across "timeout" and "busy" would point the operator at a log line that does not exist.
+
+**Why not:** (a) *Install the authenticated `list_models` route monitor in production* — useful,
+but it observes the gateway route, not the host connector, and installing it is an
+owner-attended production step outside this ticket. (b) *Client-generated correlation id sent on
+every call* — the prescribed retry is a new tool call issued by the L1, so the client cannot
+know two calls belong together without trusting caller-supplied ids; that is a protocol change
+that deserves its own ticket if a real incident needs it.
+
+**Consequence:** Regression tests cover the "public base unconfigured + tailnet stopped" local
+diagnostic (`tests/m5-network-doctor.test.ts`) and the mixed-health sequence "discovery ok, ask
+connector timeout, retry busy" (`tests/m5-mcp-bridge.test.ts`); each failure names a distinct
+layer and none leaks a locator or credential.
