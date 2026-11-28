@@ -1,3 +1,4 @@
+import { parseGpuModelGttMinBytes, parseGpuUnattributedBaselineBytes } from "./gpu-attribution.js";
 import { loadEnv } from "../env.js";
 import { loadOAuthConfig, type OAuthConfig } from "./oauth-config.js";
 import { parseStaticKeyKillSwitch, type StaticKeyKillSwitch } from "./static-keys.js";
@@ -621,6 +622,7 @@ function envNum(name: string, fallback: number): number {
 }
 
 let hostMemoryBudgetsWarned = false;
+let gpuGttMinWarned = false;
 
 function loadHostMemoryAdmissionConfig(): HostMemoryAdmissionConfig {
   const { budgets, reclaim, invalid } = parseHostMemoryBudgets(process.env["HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB"]);
@@ -630,6 +632,11 @@ function loadHostMemoryAdmissionConfig(): HostMemoryAdmissionConfig {
       `[host-memory-admission] ignoring invalid HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB entries: ${invalid.join(", ")}`,
     );
   }
+  const { gttMin, invalid: invalidGttMin } = parseGpuModelGttMinBytes(process.env["HOMESERVER_GPU_MODEL_GTT_MIN_GIB"]);
+  if (invalidGttMin.length > 0 && !gpuGttMinWarned) {
+    gpuGttMinWarned = true;
+    console.warn(`[gpu-attribution] ignoring invalid HOMESERVER_GPU_MODEL_GTT_MIN_GIB entries: ${invalidGttMin.join(", ")}`);
+  }
   const reserveGib = envNum("HOMESERVER_HOST_MEMORY_RESERVE_GIB", 12);
   const retryAfter = envNum("HOMESERVER_HOST_MEMORY_RETRY_AFTER_SECONDS", 30);
   return {
@@ -638,6 +645,8 @@ function loadHostMemoryAdmissionConfig(): HostMemoryAdmissionConfig {
     modelReclaimBytes: reclaim,
     reserveBytes: Math.round(Math.max(0, reserveGib) * 1024 ** 3),
     retryAfterSeconds: Math.max(1, Math.round(retryAfter)),
+    gpuUnattributedBaselineBytes: parseGpuUnattributedBaselineBytes(process.env["HOMESERVER_GPU_UNATTRIBUTED_BASELINE_GIB"]),
+    gpuModelGttMinBytes: gttMin,
   };
 }
 

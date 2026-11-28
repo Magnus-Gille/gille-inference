@@ -220,6 +220,12 @@ describe("m5-network-doctor — credential-free local contract", () => {
     expect(result.public_route).toBe("unconfigured");
     expect(result.tailscale).toBe("stopped");
     expect(result.remediation.length).toBeGreaterThanOrEqual(2);
+    // #242 regression: one diagnostic names both local layers and leaks no locator.
+    expect(result.remediation).toEqual([
+      "Configure an explicit public base or select the private route explicitly.",
+      "Ask the owner to start Tailscale with its existing configuration, then rerun this diagnostic.",
+    ]);
+    expectNoTaintedContent(result);
   });
 
   it("reports configured public route independently of gateway reachability", () => {

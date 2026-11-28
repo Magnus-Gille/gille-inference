@@ -1047,3 +1047,78 @@ describe("local build_run MCP tool", () => {
     expect(calls).toHaveLength(1); expect(JSON.stringify(calls)).not.toContain("build_run");
   });
 });
+
+describe("mixed-health connector regression (#242)", () => {
+  // Reproduction from 2026-09-04: discovery succeeds, the first ask times out at the
+  // connector transport, and the prescribed identical retry is refused as busy.
+  const BUSY_REQUEST_ID = "42424242-4242-4242-8242-424242424242";
+  const LIST_MODELS = '{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"list_models","arguments":{}}}';
+  const ASK = (id: number) => JSON.stringify({
+    jsonrpc: "2.0", id, method: "tools/call",
+    params: { name: "ask", arguments: { model: "gpt-oss-120b", prompt: "draft", max_tokens: 64 } },
+  });
+
+  function mixedHealthFetch() {
+    let asks = 0;
+    const fetchImpl = (async (_input: unknown, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as { id: number; params?: { name?: string } };
+      if (request.params?.name === "list_models") {
+        return rpcResponse(request.id, {
+          content: [{ type: "text", text: "Models available to you:\n- gpt-oss-120b — test" }],
+          isError: false,
+        });
+      }
+      if (request.params?.name === "ask") {
+        asks += 1;
+        if (asks === 1) {
+          // Never reaches the gateway: hang until the client deadline aborts it.
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => {
+              reject(Object.assign(new Error("connect timeout to gateway.invalid"), { code: "UND_ERR_CONNECT_TIMEOUT" }));
+            }, { once: true });
+          });
+        }
+        return rpcResponse(request.id, {
+          content: [{ type: "text", text: "The server is busy. Retry after 5s." }],
+          isError: true,
+          _meta: { m5_code: "server_busy", request_id: BUSY_REQUEST_ID, retryable: true, retry_after_seconds: 5 },
+        });
+      }
+      return rpcResponse(request.id, { tools: [] });
+    }) as typeof fetch;
+    return { fetchImpl, asks: () => asks };
+  }
+
+  it("names a distinct layer for discovery ok, ask connector timeout, and busy retry", async () => {
+    const { fetchImpl, asks } = mixedHealthFetch();
+    const bridge = await makeBridge(fetchImpl, { timeoutMs: 1_000 });
+
+    const discovery = JSON.parse((await bridge.handleLine(LIST_MODELS))!);
+    expect(discovery.result.isError).toBe(false);
+
+    const first = JSON.parse((await bridge.handleLine(ASK(32)))!);
+    expect(first.error.data).toMatchObject({
+      m5_code: "timeout",
+      failure_layer: "connector_transport",
+      retryable: true,
+    });
+    // No response arrived, so delivery is unknown and the client has no gateway id to report;
+    // the retry's id below belongs to the retry alone (ADR-007).
+    expect(first.error.data).not.toHaveProperty("request_id");
+    expect(first.error.message).toContain("failure_layer=connector_transport");
+
+    const retry = JSON.parse((await bridge.handleLine(ASK(33)))!);
+    const retryText = JSON.stringify(retry);
+    // The busy refusal is an admission answer from a reachable gateway, not a transport fault.
+    expect(retryText).toContain("server_busy");
+    expect(retryText).toContain(BUSY_REQUEST_ID);
+    expect(retryText).not.toContain("connector_transport");
+    expect(asks()).toBe(2);
+
+    for (const line of [discovery, first, retry]) {
+      const serialized = JSON.stringify(line);
+      expect(serialized).not.toContain(SECRET);
+      expect(serialized).not.toContain("gateway.invalid");
+    }
+  });
+});

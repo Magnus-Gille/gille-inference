@@ -163,7 +163,56 @@ function insertLifecycleStart(model: string, ts: number): void {
   });
 }
 
+const UNKNOWN_ESTIMATE_ATTRIBUTION = {
+  status: "unknown",
+  reason: "estimate_missing",
+  unattributedGpuBytes: null,
+  unattributedGpuBytesMin: null,
+  residentGttMinBytes: null,
+  residentPeakBytes: null,
+  residentWithoutEstimate: 1,
+  baselineBytes: 4 * 1024 ** 3,
+  inUseWhileNothingResident: null,
+  exceedsBaseline: null,
+  mayExceedBaseline: null,
+  estimateBasis: "declared_peak_and_gtt_min",
+};
+
 describe("GET /models/residency", () => {
+  it("reports GPU memory in use while nothing is resident (INFER-355)", async () => {
+    runningModels = [];
+    const response = await getResidency(monitorKey);
+    expect(response.status).toBe(200);
+    const body = await response.json() as { gpuAttribution: Record<string, unknown> };
+    expect(body.gpuAttribution).toEqual({
+      status: "nothing_resident",
+      reason: null,
+      unattributedGpuBytes: 18 * 1024 ** 3,
+      unattributedGpuBytesMin: 18 * 1024 ** 3,
+      residentGttMinBytes: 0,
+      residentPeakBytes: 0,
+      residentWithoutEstimate: 0,
+      baselineBytes: 4 * 1024 ** 3,
+      inUseWhileNothingResident: true,
+      exceedsBaseline: true,
+      mayExceedBaseline: true,
+      estimateBasis: "declared_peak_and_gtt_min",
+    });
+  });
+
+  it("keeps GPU attribution unknown when DRM counters are missing (INFER-355)", async () => {
+    hostMemory = { ok: true, memory: {
+      memTotalBytes: 64 * 1024 ** 3,
+      memAvailableBytes: 24 * 1024 ** 3,
+      cmaFreeBytes: null,
+      gttUsedBytes: null,
+      gttTotalBytes: null,
+    } };
+    const response = await getResidency(monitorKey);
+    const body = await response.json() as { gpuAttribution: Record<string, unknown> };
+    expect(body.gpuAttribution).toMatchObject({ status: "unknown", reason: "gtt_unavailable", unattributedGpuBytes: null });
+  });
+
   it("returns the safe diagnostic and narrow last-use shape to an admin", async () => {
     const ts = Date.now() - 1_000;
     runningModels = [
@@ -197,6 +246,7 @@ describe("GET /models/residency", () => {
         gttTotalBytes: 32 * 1024 ** 3,
         gttAccounting: "unattributed",
       },
+      gpuAttribution: UNKNOWN_ESTIMATE_ATTRIBUTION,
       resourceEvidence: {
         admissionMode: "off",
         oom: { status: "available", oomKillCount: 17, observedAt: expect.any(String) },
@@ -253,6 +303,7 @@ describe("GET /models/residency", () => {
         gttTotalBytes: 32 * 1024 ** 3,
         gttAccounting: "unattributed",
       },
+      gpuAttribution: UNKNOWN_ESTIMATE_ATTRIBUTION,
       resourceEvidence: {
         admissionMode: "off",
         oom: { status: "available", oomKillCount: 17, observedAt: expect.any(String) },

@@ -259,6 +259,71 @@ unknown/arbitrary string collapses to `unknown` — a raw, user-controlled model
 as a metric label or a log value. The catalogue is read synchronously and refreshed in the
 background, so it never blocks the request hot path.
 
+## GPU memory held outside the model service (INFER-355)
+
+`GET /models/residency` returns a content-blind `gpuAttribution` object next to `hostMemory`. It
+brackets the device-wide GTT counter against what the resident models can hold:
+
+- `unattributedGpuBytesMin` = GTT used − Σ declared peak start budget
+  (`HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB`, INFER-352). A peak is a whole-host upper bound on a
+  model's footprint and therefore also on its GTT share, so this is a *lower* bound on memory held
+  outside the model service.
+- `unattributedGpuBytes` = GTT used − Σ declared GTT lower bound
+  (`HOMESERVER_GPU_MODEL_GTT_MIN_GIB`, `modelId=gttMinGiB`). A model without one contributes 0, so
+  this stays a valid *upper* bound. The admission reclaim estimate is deliberately not used: it
+  bounds whole-host memory released on eviction, not GTT held, and subtracting it could hide a
+  tenant.
+- `exceedsBaseline` is true only when the lower bound is above the allowance: memory is certainly
+  held outside the model service. `mayExceedBaseline` uses the upper bound: possible, not proven.
+  With large models resident and no GTT lower bounds declared, `mayExceedBaseline` alone is not an
+  incident.
+- `status:"nothing_resident"` — llama-swap reports no resident model, so both bounds equal GTT
+  used and `inUseWhileNothingResident` is true above the allowance. This is the sharpest signal.
+- `status:"unknown"` with a fixed `reason`: `gtt_unavailable`, `residency_unknown`,
+  `residency_transition` (a model is starting or stopping, or residency changed between the
+  snapshots taken before and after the counter read), or `estimate_missing` (a resident model has
+  no declared peak; `residentWithoutEstimate` counts them, never names them). Until the INFER-352
+  budgets are declared, any resident model makes attribution unknown.
+
+The allowance is `HOMESERVER_GPU_UNATTRIBUTED_BASELINE_GIB` (default 4 GiB: above the idle
+driver/desktop GTT baseline seen in calibration and below the smallest roster model's footprint).
+The object never contains model names, process names, command lines, PIDs, or paths. Feeding the
+unattributed amount into the admission decision is deferred until the INFER-352 budgets are
+calibrated.
+
+**Why bracket instead of one estimate:** declared peaks are admission margins, not measurements of
+steady residency, and reclaim figures are whole-host. A single subtraction would either flag every
+large resident model permanently or hide a tenant next to one. Two bounds keep the certain and the
+possible cases apart.
+
+### Policy for out-of-band GPU tenants (proposed; owner approval pending, gate E)
+
+A process that holds GPU memory on the M5 outside `home-gateway.service` / llama-swap is an
+out-of-band tenant. Such a tenant **either holds the durable GPU lease and is counted against the
+host budget, or does not run**:
+
+1. **Leased and counted.** A transient tenant (benchmark, calibration, controlled-evaluation unit)
+   runs only inside an owner-approved envelope, holds the canonical GPU lease (`gpu` CLI /
+   maintenance window) for its whole lifetime, and declares its peak in the envelope so admission
+   and the operator can count it.
+2. **Long-lived tenants are not allowed.** No always-on model server, embedding daemon, or desktop
+   application may keep GPU memory resident outside the model service. A model it needs is added to
+   the llama-swap roster instead, where admission, budgets, and residency diagnostics cover it.
+3. **Detection and response.** `gpuAttribution.exceedsBaseline=true` (or
+   `inUseWhileNothingResident=true`) outside an active lease or envelope is an incident: the
+   operator identifies the tenant on the host, stops it or brings it under rule 1, and records the
+   resolution in the private operations tracker, not in this repository.
+
+**Why:** GPU memory that admission cannot see makes every budget wrong in the unsafe direction;
+an earlier host OOM (INFER-350) had exactly this as a contributing cause.
+
+**Why not:** (a) *subtract the unattributed amount from admission now* — without calibrated
+budgets the figure is too wide and would refuse fitting starts; deferred to INFER-352. (b) *expose
+the tenant's process name or command line* — that leaks host-private detail through a
+monitor-readable surface; the operator already has shell access to identify it. (c) *allow
+long-lived tenants with a static declared budget* — a declaration cannot be verified and drifts
+silently; the roster path gives the same capability with measured evidence.
+
 ## Retention & rotation
 
 `request_log` and `owner_request_log` are unbounded by default. Suggested operator hygiene:

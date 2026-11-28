@@ -231,7 +231,11 @@ Admin output may also contain `lastUse.alias`; monitor output deliberately omits
 `hostMemory` object reports total RAM, `MemAvailable`, free CMA, and best-effort DRM GTT used/total
 bytes. GTT counters are device-wide and always marked `unattributed` when present; they cannot say
 which model or process owns the allocation, even with resident models. Missing DRM counters are
-explicit `null` values and `gttAccounting:"unknown"`. If the memory snapshot itself cannot be read,
+explicit `null` values and `gttAccounting:"unknown"`. A separate `gpuAttribution` object (INFER-355)
+brackets GTT memory not attributable to settled resident models between declared peak budgets
+(`unattributedGpuBytesMin`) and declared GTT lower bounds (`unattributedGpuBytes`), with `inUseWhileNothingResident`,
+`exceedsBaseline` (certain) and `mayExceedBaseline` (possible) flags, or `status:"unknown"` with a fixed
+reason when GTT, residency, or a peak budget is missing or a model is in transition; see `docs/observability.md`. If the memory snapshot itself cannot be read,
 the object reports `status:"unknown"` and null values. If the model snapshot is unavailable, the
 safe response remains `503 {status:"unavailable",resourceEvidence:{...}}` with no `models` array. This endpoint is
 read-only and content-blind: it does not expose prompts, responses, token counts, keys, key hashes,
@@ -1238,6 +1242,8 @@ HOMESERVER_BUSY_RETRY_AFTER_S=2               # Retry-After on a guest 503 at ca
 HOMESERVER_HOST_MEMORY_ADMISSION=off          # whole-host memory check before a model start (#350): off (default) | shadow (log only, never rejects) | enforce
 HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB=     # comma-separated modelId=peakGiB[:reclaimGiB] (decimals ok): peak host memory a start may need, and optionally a conservative lower bound on what evicting the model releases (<= peak; absent = no eviction credit); invalid entries, and every entry for a model id listed twice, are dropped and named at startup; uncalibrated
 HOMESERVER_HOST_MEMORY_RESERVE_GIB=12         # host memory that must remain free after a start
+HOMESERVER_GPU_UNATTRIBUTED_BASELINE_GIB=4    # INFER-355: GTT not attributed to resident models before /models/residency flags gpuAttribution.exceedsBaseline (diagnostic only; never affects admission)
+HOMESERVER_GPU_MODEL_GTT_MIN_GIB=             # INFER-355: optional modelId=gttMinGiB lower bounds on GTT a settled resident model holds; tighten the gpuAttribution upper bound (diagnostic only; undeclared = 0 credit)
 HOMESERVER_HOST_MEMORY_RETRY_AFTER_SECONDS=30 # Retry-After on 503 insufficient_memory
 HOMESERVER_MAINTENANCE_MODE=off               # boot in bench/maintenance mode (guests refused) — #108
 # HOMESERVER_STARTUP_EXCLUSIVE_UNTIL=<canonical UTC ISO timestamp, at most 30 minutes ahead>
