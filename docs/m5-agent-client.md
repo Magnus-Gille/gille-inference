@@ -395,6 +395,12 @@ else stays a plain `tool_error`:
 | --- | --- | --- | --- |
 | `insufficient_memory` | Not enough host memory to start the model right now | `true` | `retry_after_seconds` when the message names one |
 | `memory_admission_unavailable` | The host cannot approve the start; the operator must fix it | `false` | none (retrying will not help) |
+| `server_busy` | Gateway admission is saturated; nothing ran and nothing was billed | `true` | `retry_after_seconds` from `_meta` |
+
+`server_busy` is read only from `_meta` (INFER-242), and its `request_id` is kept. It is a gateway
+answer, so it is distinct from a connector or gateway transport failure on an earlier attempt. A
+transport failure before any gateway response carries no `request_id`: the client does not invent
+one, so an initial transport timeout and its retry cannot share a correlation id.
 
 `m5 ask` prints these in its normal error object. The MCP bridge forwards the `ask` result
 unchanged and adds `_meta: { m5_code, retryable, retry_after_seconds? }` when the gateway did not

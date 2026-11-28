@@ -1174,7 +1174,13 @@ export function classifyAskRefusal(text) {
 }
 
 // Retryability is part of each code's contract, so it is fixed here, not taken from the peer.
-const ASK_REFUSAL_RETRYABLE = new Map([["insufficient_memory", true], ["memory_admission_unavailable", false]]);
+// `server_busy` is gateway admission saturation (INFER-242): it must stay distinguishable from a
+// connector transport failure and keep the gateway's request id and delay.
+const ASK_REFUSAL_RETRYABLE = new Map([
+  ["insufficient_memory", true],
+  ["memory_admission_unavailable", false],
+  ["server_busy", true],
+]);
 /**
  * The gateway's own machine-readable cause, when it sends one in the result's `_meta` (newer
  * gateways). Preferred over reading the sentence. Returns null for anything else, so an older

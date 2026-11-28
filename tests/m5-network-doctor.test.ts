@@ -222,6 +222,22 @@ describe("m5-network-doctor — credential-free local contract", () => {
     expect(result.remediation.length).toBeGreaterThanOrEqual(2);
   });
 
+  it("names both layers in one diagnostic without leaking locators (INFER-242)", () => {
+    // The INFER-242 reproduction: no public base configured and local Tailscale stopped. One diagnostic must carry both actionable layers; an absent or empty base is
+    // never treated as configured (no silent loopback fallback).
+    for (const env of [cleanEnv(), cleanEnv({ M5_GATEWAY_URL: "" })]) {
+      const { result } = injected(validStatus("Stopped"), env);
+      expectSafeShape(result);
+      expect(result.public_route).not.toBe("configured");
+      expect(result.tailscale).toBe("stopped");
+      expect(result.remediation).toEqual(expect.arrayContaining([
+        "Ask the owner to start Tailscale with its existing configuration, then rerun this diagnostic.",
+      ]));
+      expect(result.remediation.some((item) => /public base/.test(item))).toBe(true);
+      expectNoTaintedContent(result);
+    }
+  });
+
   it("reports configured public route independently of gateway reachability", () => {
     const { result } = injected(
       Object.assign(new Error(TAINTED_ERROR), { code: "ECONNREFUSED" }),
