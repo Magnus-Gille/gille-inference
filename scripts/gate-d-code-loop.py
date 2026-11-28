@@ -54,7 +54,13 @@ try:
     else:
         TASKS = str(external["root"])
         corpus_revision = external["corpusRevision"]
-        task_ids = select_external(external, include_holdout)
+        if args.task is not None and args.task in external["digests"]:
+            # A single named task needs only its own holdout opt-in, not its siblings'.
+            if external_task_metadata(external, args.task)["holdout"] and not include_holdout:
+                parser.error(f"task {args.task!r} is sealed; holdouts require --include-holdout")
+            task_ids = [args.task]
+        else:
+            task_ids = select_external(external, include_holdout)
         contract = {"tasks": task_ids, "holdoutTasks": [
             t for t in task_ids if external_task_metadata(external, t)["holdout"]]}
         acceptance = None
@@ -205,6 +211,8 @@ for tid in task_ids:
                                         "caps": {"wall_s": WALL_S}})
     except Exception as e:
         start = {"refusal": "transport", "message": str(e)[:200]}
+    if external is not None:
+        verify_external_digest(external, tid, task_meta["taskRevision"])  # no row on drift
     if "work_id" not in start:
         row.update(status="start-refused", detail=json.dumps(start)[:300],
                    passed=False, wall_s=round(time.time() - t0, 1))
@@ -223,6 +231,8 @@ for tid in task_ids:
         if status not in ("running", "?"):
             break
     res = mcp("code_loop_result", {"work_id": wid})
+    if external is not None:
+        verify_external_digest(external, tid, task_meta["taskRevision"])  # before grading
     row.update(status=res.get("status"), usage=res.get("usage"),
                detail=(res.get("detail") or "")[:200],
                summary=(res.get("summary") or "")[:150])
@@ -230,7 +240,9 @@ for tid in task_ids:
     wdir = os.path.join(WORKROOT, tid)
     shutil.rmtree(wdir, ignore_errors=True)
     shutil.copytree(os.path.join(tdir, "repo"), wdir)
-    for c in (["git", "init", "-q", "."], ["git", "add", "-A"],
+    # check.sh G0-toolchain requires exactly this runner-owned link (run.sh discipline).
+    os.symlink(os.path.join(os.path.realpath(REPO), "node_modules"), os.path.join(wdir, "node_modules"))
+    for c in (["git", "init", "-q", "."], ["git", "add", "-A"], ["git", "add", "-f", "--", "node_modules"],
               ["git", "-c", "user.email=g@d", "-c", "user.name=gd", "commit", "-qm", "seed"]):
         sh(c, cwd=wdir)
     diff = res.get("diff") or ""

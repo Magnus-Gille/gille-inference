@@ -103,7 +103,9 @@ for arm in $ARMS; do
     if [ "$need" -le 0 ]; then echo "[skip] $arm/$MODEL/$t (have $have ≥ $SEEDS)" | tee -a "$LOG"; continue; fi
     for i in $(seq 1 "$need"); do
       echo "[run ] $arm/$MODEL/$t (seed $((have+i))/$SEEDS) $(date +%T)" | tee -a "$LOG"
-      bash "$ROOT/run.sh" "$arm" "$t" 2>&1 | tee -a "$LOG"
+      # Pin each child to the digest this sweep scheduled against (empty for in-repo tasks).
+      GATE_D_EXPECT_TASK_REVISION="$(GD_REVS="$TASK_REVS" python3 -c 'import json,os,sys;print(json.loads(os.environ["GD_REVS"]).get(sys.argv[1],""))' "$t")" \
+        bash "$ROOT/run.sh" "$arm" "$t" 2>&1 | tee -a "$LOG"
       rc="${PIPESTATUS[0]}"
       # A failed runner wrote no row for this invocation, so the last row belongs to an earlier run:
       # stop before consulting it rather than acting on stale state.

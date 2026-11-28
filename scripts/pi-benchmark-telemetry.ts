@@ -142,7 +142,10 @@ export function classifyCommand(command: string): { kinds: CheckKind[]; attribut
   const piped = /(^|[^|])\|([^|]|$)/.test(command);
   const otherSeparators = /;|\|\||\n/.test(command.trim());
   const attribution: Attribution = piped || otherSeparators ? "none" : segments.length > 1 || checkSegments > 1 ? "and-chain" : "exact";
-  const mutates = MUTATING_BASH.some((re) => re.test(command)) && !/^\s*(npm|npx|tsc|node|tsx)\b/.test(command);
+  // Per segment (INFER-521 review): a whole-command test let `npm test && sed -i ...` hide its edit
+  // behind the leading `npm`. Pipes are split too, so `cat x | tee y` still counts as a mutation.
+  const mutates = command.trim().split(/\s*(?:&&|\|\||;|\n|\|)\s*/).some((seg) =>
+    MUTATING_BASH.some((re) => re.test(seg)) && !/^\s*(npm|npx|tsc|node|tsx)\b/.test(seg));
   return { kinds: [...kinds], attribution, mutates };
 }
 
@@ -193,7 +196,10 @@ export function createVerificationTelemetry() {
           if (typeof command === "string") {
             const c = classifyCommand(command);
             if (c.kinds.length > 0) pending.set(id, { kinds: c.kinds, seq, attribution: c.attribution });
-            else if (c.mutates) pendingMutations.set(id, true);
+            // A command that both checks and mutates (INFER-521 review): the order inside it is not
+            // attributable, so the mutation is placed after its checks. Verification of the final
+            // state is then never credited to it; it can only under-credit `sed -i ... && npm test`.
+            if (c.mutates) pendingMutations.set(id, true);
           }
         }
       }

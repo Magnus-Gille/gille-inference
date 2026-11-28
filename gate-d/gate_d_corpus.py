@@ -104,6 +104,9 @@ def external_root_from_env() -> Optional[Path]:
     root = os.path.realpath(value)
     if not os.path.isdir(root):
         raise ValueError(f"GATE_D_TASKS_ROOT is not a directory: {value}")
+    # check.sh and older helpers interpolate task paths into Python source; refuse quoting hazards.
+    if re.search(r"[\x00-\x1f'\"\\$`]", root):
+        raise ValueError(f"GATE_D_TASKS_ROOT contains a quote, backslash, $, backtick or control character: {root!r}")
     if same_or_inside(root, str(REPO_ROOT)) or same_or_inside(str(REPO_ROOT), root):
         raise ValueError(
             f"GATE_D_TASKS_ROOT ({root}) overlaps this checkout ({REPO_ROOT}); an external corpus "

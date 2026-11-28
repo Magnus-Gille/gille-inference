@@ -123,7 +123,7 @@ function externalCorpus(repo: string, opts: { root?: string; sealed?: boolean; a
  * Fake pi: logs its call, optionally applies the task's reference solution (so the run passes) and
  * runs extra JS, then emits a small NDJSON transcript: one edit followed by a green typecheck.
  */
-function fakePi(opts: { solve?: boolean; script?: string } = {}): { bin: string; log: string } {
+function fakePi(opts: { root?: string; solve?: boolean; script?: string } = {}): { bin: string; log: string } {
   const bin = tmp("gd-ext-bin-");
   const log = join(bin, "calls.jsonl");
   writeFileSync(
@@ -131,8 +131,10 @@ function fakePi(opts: { solve?: boolean; script?: string } = {}): { bin: string;
     `#!/usr/bin/env node
 const fs = require("fs"), path = require("path");
 const id = path.basename(process.cwd()).replace(/-pi-[^-]+$/, "");
-const taskDir = path.join(process.env.GATE_D_TASKS_ROOT || "", id);
-fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ id }) + "\\n");
+// The runner scrubs its GATE_D_* configuration from the arm, so the test hands the root in directly.
+const taskDir = path.join(${JSON.stringify(opts.root ?? "")}, id);
+const gateEnv = Object.keys(process.env).filter((k) => k.startsWith("GATE_D_"));
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ id, gateEnv }) + "\\n");
 ${opts.solve ? `fs.cpSync(path.join(taskDir, "solution"), process.cwd(), { recursive: true });` : ""}
 ${opts.script ?? ""}
 const ev = (o) => console.log(JSON.stringify(o));
@@ -149,7 +151,7 @@ ev({ type: "turn_end", message: { usage: { input: 10, output: 4 } } });
   return { bin, log };
 }
 
-function calls(log: string): Array<{ id: string }> {
+function calls(log: string): Array<{ id: string; gateEnv: string[] }> {
   if (!existsSync(log)) return [];
   return readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
 }
@@ -191,10 +193,12 @@ describe("Gate D external task root (INFER-521)", { timeout: 240_000 }, () => {
     const repo = fixtureRepo();
     const root = externalCorpus(repo);
     const manifest = JSON.parse(readFileSync(join(root, "corpus-manifest.json"), "utf8"));
-    const { bin, log } = fakePi({ solve: true });
+    const { bin, log } = fakePi({ root, solve: true });
     const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", "all"]);
     expect(res.status, res.stderr).toBe(0);
     expect(calls(log).map((c) => c.id)).toEqual(["r3-test-a", "r3-test-b"]);
+    // The arm never learns where the corpus (with its solutions and oracles) lives.
+    for (const c of calls(log)) expect(c.gateEnv).toEqual([]);
     const all = rows(out);
     expect(all).toHaveLength(2);
     for (const [n, row] of all.entries()) {
@@ -284,7 +288,7 @@ describe("Gate D external task root (INFER-521)", { timeout: 240_000 }, () => {
       : mode === "add"
         ? `fs.writeFileSync(path.join(taskDir, "oracle-extra.ts"), "x");`
         : "";
-    const { bin, log } = fakePi({ solve: true, script });
+    const { bin, log } = fakePi({ root, solve: true, script });
     const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", "r3-test-a"]);
     expect(res.status).toBe(9);
     expect(res.stderr).toMatch(/manifest digest before the run|changed on disk during this run/);
@@ -297,7 +301,7 @@ describe("Gate D external task root (INFER-521)", { timeout: 240_000 }, () => {
     const root = externalCorpus(repo, {
       atStop: `#!/usr/bin/env bash\necho tampered >> "$1/INSTRUCTION.md"\n`,
     });
-    const { bin } = fakePi({ solve: true });
+    const { bin } = fakePi({ root, solve: true });
     const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", "r3-test-a"]);
     expect(res.status).toBe(9);
     expect(res.stderr).toContain("changed on disk during grading");
@@ -355,7 +359,7 @@ describe("Gate D external task root (INFER-521)", { timeout: 240_000 }, () => {
   ])("an at-stop.sh that is %s leaves pass/fail unchanged", (kind, atStop) => {
     const repo = fixtureRepo();
     const root = externalCorpus(repo, { atStop });
-    const { bin } = fakePi({ solve: true });
+    const { bin } = fakePi({ root, solve: true });
     const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", "r3-test-a"]);
     expect(res.status, res.stderr).toBe(0);
     const [row] = rows(out);
@@ -382,5 +386,101 @@ require("fs").writeFileSync(".arm-telemetry.json", JSON.stringify({ verification
     const [row] = rows(out);
     for (const key of VERIFICATION_KEYS) expect(row![key]).toBeNull();
     expect(row).toMatchObject({ corpusRevision: "gate-d-r3", family: "make-pass" });
+  });
+
+  it("runs a named validation task in a mixed corpus without the opt-in, but never its sealed sibling", () => {
+    const repo = fixtureRepo();
+    const root = externalCorpus(repo);
+    const metaPath = join(root, "r3-test-b", "meta.json");
+    const meta = JSON.parse(readFileSync(metaPath, "utf8"));
+    writeFileSync(metaPath, JSON.stringify({ ...meta, holdout: true, split: "sealed" }));
+    const manifest = JSON.parse(readFileSync(join(root, "corpus-manifest.json"), "utf8"));
+    manifest.tasks[1].digest = digestOf(repo, join(root, "r3-test-b"));
+    writeFileSync(join(root, "corpus-manifest.json"), JSON.stringify(manifest));
+    const { bin, log } = fakePi({ root, solve: true });
+    let r = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", "r3-test-a"]);
+    expect(r.res.status, r.res.stderr).toBe(0);
+    expect(rows(r.out)[0]).toMatchObject({ task: "r3-test-a", holdout: false, pass: true });
+    for (const sel of ["r3-test-b", "all"]) {
+      r = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", sel]);
+      expect(r.res.status).toBe(3);
+      expect(r.res.stderr).toContain("holdouts require GATE_D_INCLUDE_HOLDOUT=1");
+    }
+    expect(calls(log).map((c) => c.id)).toEqual(["r3-test-a"]);
+  });
+
+  it("refuses a child run whose digest differs from the one the sweep pinned", () => {
+    const repo = fixtureRepo();
+    const root = externalCorpus(repo);
+    const { bin, log } = fakePi({ root, solve: true });
+    const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root, GATE_D_EXPECT_TASK_REVISION: "0".repeat(64) }, ["pi", "r3-test-a"]);
+    expect(res.status).toBe(3);
+    expect(res.stderr).toContain("changed since the sweep started");
+    expect(rows(out)).toEqual([]);
+    expect(calls(log)).toEqual([]);
+  });
+
+  it("resolves a relative GATE_D_AT_STOP from the caller's directory", () => {
+    const repo = fixtureRepo();
+    const root = externalCorpus(repo, { atStop: null });
+    const scripts = join(repo, "at-stop-local");
+    mkdirSync(scripts);
+    writeFileSync(join(scripts, "at-stop.sh"), `#!/usr/bin/env bash\nprintf '{"atStopTypecheck":"failed","atStopVisibleTests":"none","detectableFailureAtStop":true}\\n'\n`);
+    const { bin } = fakePi({ root, solve: true });
+    // runGateD runs from the fixture checkout, so this relative path names the file above.
+    const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root, GATE_D_AT_STOP: "at-stop-local/at-stop.sh" }, ["pi", "r3-test-a"]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(rows(out)[0]).toMatchObject({ pass: true, atStopTypecheck: "failed", detectableFailureAtStop: true });
+  });
+
+  it("refuses a task root whose path would break quoting", () => {
+    const repo = fixtureRepo();
+    const root = externalCorpus(repo, { root: join(tmp("gd-ext-q-"), "it's") });
+    const r = corpusTool(repo, { GATE_D_TASKS_ROOT: root }, "tasks");
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain("quote");
+  });
+
+  it("grades an external task through the code-loop runner with the runner-owned toolchain link", () => {
+    const repo = fixtureRepo();
+    const root = externalCorpus(repo);
+    const home = tmp("gd-ext-home-");
+    writeFileSync(join(home, ".scout-maintenance.env"), "KEY=hs_owner_test_key\n");
+    const results = join(tmp("gd-ext-cl-"), "cl.jsonl");
+    // A stand-in code_loop gateway that returns the reference solution as the diff.
+    const harness = `
+import http.server, json, os, shutil, subprocess, sys, tempfile, threading
+task = sys.argv[1]
+seed = tempfile.mkdtemp()
+shutil.copytree(os.path.join(task, "repo"), seed, dirs_exist_ok=True)
+g = lambda *a: subprocess.run(["git", "-c", "user.email=t@l", "-c", "user.name=t", *a], cwd=seed, check=True, capture_output=True, text=True).stdout
+g("init", "-q"); g("add", "-A"); g("commit", "-qm", "seed")
+shutil.copytree(os.path.join(task, "solution"), seed, dirs_exist_ok=True)
+diff = g("diff")
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        tool = body["params"]["name"]
+        out = {"code_loop_start": {"work_id": "w1"}, "code_loop_status": {"status": "done"},
+               "code_loop_result": {"status": "done", "diff": diff}}[tool]
+        data = json.dumps({"result": {"content": [{"text": json.dumps(out)}]}}).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+env = dict(os.environ, GATE_D_CL_GATEWAY=f"http://127.0.0.1:{srv.server_port}/mcp")
+r = subprocess.run([sys.executable, sys.argv[2], "r3-test-a"], env=env, capture_output=True, text=True)
+sys.stdout.write(r.stdout); sys.stderr.write(r.stderr); sys.exit(r.returncode)
+`;
+    mkdirSync(join(repo, "scripts"), { recursive: true });
+    cpSync(join(REAL_ROOT, "scripts", "gate-d-code-loop.py"), join(repo, "scripts", "gate-d-code-loop.py"));
+    const res = spawnSync("python3", ["-c", harness, join(root, "r3-test-a"), join(repo, "scripts", "gate-d-code-loop.py")], {
+      encoding: "utf8",
+      env: cleanEnv({ HOME: home, GATE_D_CL_REPO: repo, GATE_D_CL_RESULTS: results, GATE_D_TASKS_ROOT: root, NO_PROXY: "127.0.0.1", no_proxy: "127.0.0.1" }),
+      timeout: 120_000,
+    });
+    expect(res.status, res.stdout + res.stderr).toBe(0);
+    const [row] = rows(results);
+    expect(row, res.stdout).toMatchObject({ id: "r3-test-a", corpusRevision: "gate-d-r3", family: "make-pass", applied: true, passed: true });
   });
 });

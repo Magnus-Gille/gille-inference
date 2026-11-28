@@ -74,7 +74,6 @@ mkdir -p "$WORKROOT"
 CORPUS_TOOL="$ROOT/gate_d_corpus.py"
 if [ "${1:-}" = "--list-tasks" ]; then python3 "$CORPUS_TOOL" tasks; exit $?; fi
 CORPUS_REVISION="$(python3 "$CORPUS_TOOL" revision)" || exit 3
-TASK_IDS="$(python3 "$CORPUS_TOOL" tasks)" || exit 3
 # The task source: gate-d/tasks, or a validated external root outside the checkout (INFER-521).
 EXTERNAL=0; [ -n "${GATE_D_TASKS_ROOT:-}" ] && EXTERNAL=1
 TASKS_DIR="$(python3 "$CORPUS_TOOL" tasks-root)" || exit 3
@@ -95,6 +94,10 @@ fi
 
 ARM="${1:?usage: run.sh <pi|aider|opencode|qwen-code> <task-id|all>}"
 SEL="${2:?usage: run.sh <pi|aider|opencode|qwen-code> <task-id|all>}"
+# Enumerate only for `all`: a single named task is checked on its own below, so a validation task
+# in a mixed external corpus does not need the opt-in its sealed siblings do (INFER-521 review).
+TASK_IDS=""
+if [ "$SEL" = "all" ]; then TASK_IDS="$(python3 "$CORPUS_TOOL" tasks)" || exit 3; fi
 if [ "$SEL" != "all" ] && ! python3 "$CORPUS_TOOL" contains "$SEL"; then
   if [ -f "$TASKS_DIR/$SEL/meta.json" ]; then
     echo "error: task '$SEL' is not in $CORPUS_REVISION; holdouts require GATE_D_INCLUDE_HOLDOUT=1" >&2
@@ -157,8 +160,21 @@ elif gd_git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; the
 fi
 # Prints the porcelain status of the fixtures; returns non-zero if Git cannot produce it.
 fixture_dirty(){ gd_git -C "$REPO_ROOT" status --porcelain -- gate-d/tasks gate-d/src; }
-metaget(){ python3 -c "import json;v=json.load(open('$1')).get('$2','');print(str(v).lower() if isinstance(v,bool) else v)"; }
-metalist(){ python3 -c "import json;print(' '.join(json.load(open('$1')).get('$2',[])))"; }
+# Path and key go in as arguments, never into the Python source (a quote in a path broke it).
+metaget(){ python3 -c 'import json,sys;v=json.load(open(sys.argv[1])).get(sys.argv[2],"");print(str(v).lower() if isinstance(v,bool) else v)' "$1" "$2"; }
+metalist(){ python3 -c 'import json,sys;print(" ".join(json.load(open(sys.argv[1])).get(sys.argv[2],[])))' "$1" "$2"; }
+# Arms never see the runner's own configuration: GATE_D_TASKS_ROOT would hand a shell-capable arm
+# the path to the sealed solutions and oracles (INFER-521 review). Called inside each arm subshell.
+scrub_arm_env(){
+  local v
+  for v in $(compgen -e); do case "$v" in GATE_D_*) unset "$v" ;; esac; done
+}
+# at-stop.sh, resolved once to an absolute path: it runs from inside the copied workspace, where a
+# relative override would name a different (usually missing) file.
+AT_STOP_SCRIPT=""
+if [ "$EXTERNAL" = 1 ]; then
+  AT_STOP_SCRIPT="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "${GATE_D_AT_STOP:-$TASKS_DIR/at-stop.sh}")" || exit 3
+fi
 # External corpus content guard (INFER-521): replaces the git-status guard for a root that is not
 # under Git. The expected digest is captured once, before the arm, so a manifest edited mid-run
 # cannot re-bless edited task files.
@@ -168,13 +184,13 @@ external_intact(){ python3 "$CORPUS_TOOL" verify-digest "$1" --expect "$2"; }
 # Content-blind and fail-open: a missing or failing script, or output that is not exactly the three
 # documented fields with their documented values, yields {}.
 at_stop_json(){
-  local T="$1" W="$2" script="${GATE_D_AT_STOP:-$TASKS_DIR/at-stop.sh}" copy out=""
+  local T="$1" W="$2" script="$AT_STOP_SCRIPT" cap="${GATE_D_AT_STOP_CAP_S:-300}" copy out=""
   [ -f "$script" ] || { echo "{}"; return 0; }
   copy="$(mktemp -d "$WORKROOT/atstop-XXXXXXXX" 2>/dev/null)" || { echo "{}"; return 0; }
   if cp -R "$W/." "$copy/" 2>/dev/null; then
-    out="$( cd "$copy" && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \
+    out="$( cd "$copy" && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE && scrub_arm_env \
             && export GIT_CEILING_DIRECTORIES="$WORKROOT" \
-            && "$TIMEOUT_BIN" "${GATE_D_AT_STOP_CAP_S:-300}" bash "$script" "$T" "$copy" </dev/null 2>/dev/null )" || out=""
+            && "$TIMEOUT_BIN" "$cap" bash "$script" "$T" "$copy" </dev/null 2>/dev/null )" || out=""
   fi
   rm -rf "$copy"
   GD_AT_STOP_RAW="$out" python3 -c '
@@ -201,6 +217,11 @@ run_one() {
     holdout="$(GD_I="$identity" python3 -c 'import json,os;print(str(json.loads(os.environ["GD_I"])["holdout"]).lower())')" || exit 3
     if [ "$holdout" = true ] && [ "${GATE_D_INCLUDE_HOLDOUT:-0}" != 1 ]; then
       echo "error: task '$id' is sealed; holdouts require GATE_D_INCLUDE_HOLDOUT=1" >&2; exit 3
+    fi
+    # sweep.sh pins the digest it scheduled against; a task re-pinned mid-sweep is refused.
+    if [ -n "${GATE_D_EXPECT_TASK_REVISION:-}" ] && [ "$GATE_D_EXPECT_TASK_REVISION" != "$task_revision" ]; then
+      echo "FATAL[$ARM/$id]: the manifest digest changed since the sweep started (re-pinned); no row written" >&2
+      exit 3
     fi
     if ! external_intact "$id" "$task_revision"; then
       echo "FATAL[$ARM/$id]: the external task does not match its manifest digest before the run; refusing to run" >&2
@@ -327,7 +348,7 @@ PY
       # a ceiling so git-based root discovery — this arm's or anything it shells out to — cannot
       # climb past $WORKROOT, on top of $W already living outside the repo entirely.
       ( cd "$W" \
-          && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \
+          && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE && scrub_arm_env \
           && export GIT_CEILING_DIRECTORIES="$WORKROOT" \
           && HS_API_KEY="$GW_KEY" "$TIMEOUT_BIN" "$CAP_S" pi --provider "${PI_PROVIDER:-inference-gille}" --model "$MODEL" \
              --no-session --print --mode json ${PROMPT_FILE:+--append-system-prompt "$PROMPT_FILE"} "$instr" </dev/null 2>"$W/.arm.stderr.log" \
@@ -336,7 +357,7 @@ PY
       ;;
     aider)
       ( cd "$W" \
-          && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \
+          && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE && scrub_arm_env \
           && export GIT_CEILING_DIRECTORIES="$WORKROOT" \
           && OPENAI_API_BASE="$GW" OPENAI_API_KEY="$GW_KEY" "$TIMEOUT_BIN" "$CAP_S" \
              aider --model "openai/$MODEL" --edit-format diff \
@@ -349,7 +370,7 @@ PY
     opencode)
       # provider 'homebox' must exist in opencode.json (see docs/gate-de-evaluation-plan.md)
       ( cd "$W" \
-          && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \
+          && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE && scrub_arm_env \
           && export GIT_CEILING_DIRECTORIES="$WORKROOT" \
           && HOMEBOX_API_KEY="$GW_KEY" "$TIMEOUT_BIN" "$CAP_S" opencode run -m "homebox/$MODEL" \
              --dir "$W" --format json "$instr" </dev/null >"$W/.arm.log" 2>&1 ) || status="arm-error"
@@ -361,7 +382,7 @@ PY
       # OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL, plus -m explicitly. --max-tool-calls is a
       # defensive inner bound only — the outer `timeout`/CAP_S remains the real wall-clock cap.
       ( cd "$W" \
-          && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \
+          && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE && scrub_arm_env \
           && export GIT_CEILING_DIRECTORIES="$WORKROOT" \
           && OPENAI_API_KEY="$GW_KEY" OPENAI_BASE_URL="$GW" OPENAI_MODEL="$MODEL" "$TIMEOUT_BIN" "$CAP_S" \
              qwen -m "$MODEL" --yolo --max-tool-calls 100 "$instr" </dev/null >"$W/.arm.log" 2>&1 ) || status="arm-error"

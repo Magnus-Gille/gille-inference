@@ -113,3 +113,14 @@ test("summary is content-blind", () => {
   const s = run(start("1", "edit"), end("1", "edit", true), start("2", "bash", "npm test -- --grep SECRET_TOKEN"), end("2", "bash", true));
   assert.ok(!JSON.stringify(s).includes("SECRET"));
 });
+
+// INFER-521 review: a command that tests and then edits must not count as verifying the final state.
+test("a command that checks and mutates is never credited as a green check after the last edit", () => {
+  const s = run(turn, start("1", "edit"), end("1", "edit", true), turn,
+    start("2", "bash", "npm test && sed -i 's/a/b/' src/x.ts"), end("2", "bash", true));
+  assert.notEqual(s.verificationClass, "checked-green-after-last-edit");
+  assert.equal(s.testsAfterLastEdit, false);
+  assert.equal(s.bashMutations, 1);
+  assert.equal(classifyCommand("npm test && sed -i 's/a/b/' src/x.ts").mutates, true);
+  assert.equal(classifyCommand("npm test > out.log").mutates, false);
+});

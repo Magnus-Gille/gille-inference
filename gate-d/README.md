@@ -183,7 +183,11 @@ GATE_D_TASKS_ROOT=/tmp/r3-validation GATE_D_AT_STOP=~/src/code-battle/gate-d-r3/
 ```
 
 - **Isolation.** The root must lie outside this checkout, and the work root must not overlap it in
-  either direction. Work dirs and the `node_modules` link are unchanged (#172).
+  either direction. Work dirs and the `node_modules` link are unchanged (#172). Arms (and
+  `at-stop.sh`) run with every `GATE_D_*` variable removed, so they are not told where the corpus,
+  its solutions or its oracles live. This is not a filesystem sandbox: an arm running as the
+  operator could still find and read the root, which `peek-scan.py`'s `graderPathInTranscript`
+  flags when the transcript shows it. Keep sealed roots in an unpredictable location.
 - **Content guard.** Instead of `git status`, each task directory's digest (sha256 over the sorted
   `relpath\0sha256(file)\n` entries, byte-compatible with the generator's `tree_digest`) must equal
   the manifest's before the arm, after the arm and after grading. Any mismatch, added file or
@@ -193,10 +197,16 @@ GATE_D_TASKS_ROOT=/tmp/r3-validation GATE_D_AT_STOP=~/src/code-battle/gate-d-r3/
 - **Row identity.** `corpusRevision` and `holdout` come from `meta.json` (validated against the
   manifest; a revision that collides with r1/r2 is refused), `taskRevision` is the manifest digest,
   and `family`, `split` and `trap` are copied so analysis needs no join. Resume counts and summaries
-  scope by `corpusRevision` and by the current digest, so a re-pinned task starts afresh.
+  scope by `corpusRevision` and by the current digest, so a re-pinned task starts afresh. `sweep.sh`
+  passes each child run the digest it scheduled against (`GATE_D_EXPECT_TASK_REVISION`); a task
+  re-pinned mid-sweep is refused rather than mixed into one study. A single named task needs only
+  its own holdout opt-in, so validation tasks in a mixed manifest run without it.
 - **Grader-derived verification.** After the arm and before `check.sh` stages the hidden oracle,
   the corpus's `at-stop.sh <TASKDIR> <WORKDIR>` (`GATE_D_AT_STOP`, default `<dir>/at-stop.sh`) runs
   on a copy of the work dir, so its checks can never change what is graded. Its
   `atStopTypecheck`, `atStopVisibleTests` and `detectableFailureAtStop` are recorded only when its
   output is exactly those three fields with their documented values; anything else, a failure or a
-  missing script yields `null` for all three. Pass/fail never depends on it.
+  missing script yields `null` for all three. Pass/fail never depends on it. A relative
+  `GATE_D_AT_STOP` resolves from the caller's directory. The copy shares the read-only-by-convention
+  `node_modules` link with the graded workspace, exactly as the arm itself does; neither is covered
+  by the task digest.
