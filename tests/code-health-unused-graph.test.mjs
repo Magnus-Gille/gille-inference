@@ -367,7 +367,7 @@ it('tracked AST inventory is complete, deterministic, and source-links all opera
     .every(reference => reference.kind === 'unsupported-child-process-import'),
   'only process-launch consumers may keep candidate modules unresolved');
   assert.equal(audit.reviewed_data_enumeration_count, 1);
-});
+}, 30_000); // whole-repo AST scan: ~3 s alone, past the 5 s default under full-suite CI load
 
 // Exercise each acquisition alone so a different unknown cannot mask a missed form.
 it('each computed builtin acquisition independently prevents qualification', async () => {

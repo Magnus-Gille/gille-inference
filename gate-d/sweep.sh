@@ -8,6 +8,9 @@
 # Knobs: ARMS (default "aider pi"), SEEDS (default 1), CAP_S (per-run wall cap, default 600),
 # GATE_D_OUT (default data/gate-d-results.jsonl).
 # Holdouts are excluded by default; set GATE_D_INCLUDE_HOLDOUT=1 explicitly to select r2.
+# GATE_D_TASKS_ROOT=<dir> selects an external corpus (INFER-521; see run.sh). Its rows are scoped by
+# corpusRevision AND the manifest digest (taskRevision), so a re-pinned task never resumes from, or
+# pools with, rows of an earlier version of itself.
 #
 # RESUMABLE: counts existing rows per (arm,model,task) in the output JSONL and runs only the
 # shortfall — safe to re-launch after an interruption; already-done triples are skipped.
@@ -27,11 +30,41 @@ set -o pipefail
 unset CDPATH   # a relative CDPATH makes `cd` print, corrupting $(cd ... && pwd)
 ROOT="$(cd "$(dirname "$0")" && pwd -P)"
 REPO_ROOT="$(cd "$ROOT/.." && pwd -P)"
+# Relative corpus and at-stop settings mean "from where the sweep was started": resolve them before
+# the cd below, or they would silently name other paths (INFER-521 review).
+for v in GATE_D_TASKS_ROOT GATE_D_AT_STOP; do
+  if [ -n "${!v:-}" ]; then
+    resolved="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "${!v}")" || exit 3
+    export "$v=$resolved"
+  fi
+done
 cd "$REPO_ROOT" || exit 3
 CORPUS_TOOL="$ROOT/gate_d_corpus.py"
 if [ "${1:-}" = "--list-tasks" ]; then python3 "$CORPUS_TOOL" tasks; exit $?; fi
 CORPUS_REVISION="$(python3 "$CORPUS_TOOL" revision)" || exit 3
 TASKS="$(python3 "$CORPUS_TOOL" tasks)" || exit 3
+# {task: expected taskRevision} for an external corpus; empty ({}) for the in-repo corpus.
+TASK_REVS="{}"
+if [ -n "${GATE_D_TASKS_ROOT:-}" ]; then
+  # Pin the at-stop observer too: rows from another observer (or none) are not resumed from, and a
+  # child refuses to run if the script changes mid-sweep. Empty = no script.
+  at_stop_path="${GATE_D_AT_STOP:-$(python3 "$CORPUS_TOOL" tasks-root)/at-stop.sh}" || exit 3
+  GATE_D_EXPECT_AT_STOP_SHA=""
+  if [ -f "$at_stop_path" ]; then
+    GATE_D_EXPECT_AT_STOP_SHA="sha256:$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$at_stop_path")" || exit 3
+  fi
+  export GATE_D_EXPECT_AT_STOP_SHA
+  # The cap is part of the observer identity: a run measured under another cap is not resumed from.
+  GATE_D_EXPECT_AT_STOP_CAP_S="${GATE_D_AT_STOP_CAP_S:-300}"
+  case "$GATE_D_EXPECT_AT_STOP_CAP_S" in ''|0*|*[!0-9]*) echo "error: GATE_D_AT_STOP_CAP_S must be a positive integer of seconds" >&2; exit 3 ;; esac
+  export GATE_D_EXPECT_AT_STOP_CAP_S
+  # One manifest snapshot: the revision, task order and digests this sweep schedules against.
+  SCHEDULE="$(python3 "$CORPUS_TOOL" schedule)" || exit 3
+  CORPUS_REVISION="$(GD_S="$SCHEDULE" python3 -c 'import json,os;print(json.loads(os.environ["GD_S"])["corpusRevision"])')" || exit 3
+  TASKS="$(GD_S="$SCHEDULE" python3 -c 'import json,os;print("\n".join(json.loads(os.environ["GD_S"])["tasks"]))')" || exit 3
+  TASK_REVS="$(GD_S="$SCHEDULE" python3 -c 'import json,os;print(json.dumps(json.loads(os.environ["GD_S"])["digests"],sort_keys=True))')" || exit 3
+  export GATE_D_EXPECT_CORPUS_REVISION="$CORPUS_REVISION"
+fi
 : "${GW:=https://inference.example.com/v1}"
 : "${GW_KEY:?set GW_KEY to a real gateway token (mint via bin/invite)}"
 : "${MODEL:=qwen3-coder-next-80b}"
@@ -58,15 +91,19 @@ if [ -n "$PROMPT_SHA" ]; then export GATE_D_EXPECT_PROMPT_SHA="$PROMPT_SHA"; els
 count_rows() {
   [ -f "$OUT" ] || { echo 0; return; }
   GD_A="$1" GD_M="$2" GD_T="$3" GD_R="$CORPUS_REVISION" GD_OUT="$OUT" \
-    GD_V="$PROMPT_VARIANT" GD_S="$PROMPT_SHA" python3 -c "import json,os
+    GD_V="$PROMPT_VARIANT" GD_S="$PROMPT_SHA" GD_REVS="$TASK_REVS" GD_AS="${GATE_D_EXPECT_AT_STOP_SHA-}" GD_AC="${GATE_D_EXPECT_AT_STOP_CAP_S-}" python3 -c "import json,os
 a=os.environ['GD_A'];m=os.environ['GD_M'];t=os.environ['GD_T'];rev=os.environ['GD_R'];n=0
 want=(os.environ['GD_V'], os.environ['GD_S'] or None)
+taskrev=json.loads(os.environ['GD_REVS']).get(t)
 for l in open(os.environ['GD_OUT']):
     try: r=json.loads(l)
     except: continue
     if not isinstance(r,dict): continue
     rowrev=r.get('corpusRevision','gate-d-r1')
     variant=(r.get('promptVariant','none'), r.get('promptSha256'))
+    if taskrev is not None and r.get('taskRevision')!=taskrev: continue
+    if taskrev is not None and r.get('atStopSha256')!=(os.environ['GD_AS'] or None): continue
+    if taskrev is not None and r.get('atStopCapS')!=(int(os.environ['GD_AC']) if os.environ['GD_AS'] else None): continue
     if rowrev==rev and r.get('arm')==a and r.get('model')==m and r.get('task')==t and variant==want: n+=1
 print(n)"
 }
@@ -88,7 +125,9 @@ for arm in $ARMS; do
     if [ "$need" -le 0 ]; then echo "[skip] $arm/$MODEL/$t (have $have ≥ $SEEDS)" | tee -a "$LOG"; continue; fi
     for i in $(seq 1 "$need"); do
       echo "[run ] $arm/$MODEL/$t (seed $((have+i))/$SEEDS) $(date +%T)" | tee -a "$LOG"
-      bash "$ROOT/run.sh" "$arm" "$t" 2>&1 | tee -a "$LOG"
+      # Pin each child to the digest this sweep scheduled against (empty for in-repo tasks).
+      GATE_D_EXPECT_TASK_REVISION="$(GD_REVS="$TASK_REVS" python3 -c 'import json,os,sys;print(json.loads(os.environ["GD_REVS"]).get(sys.argv[1],""))' "$t")" \
+        bash "$ROOT/run.sh" "$arm" "$t" 2>&1 | tee -a "$LOG"
       rc="${PIPESTATUS[0]}"
       # A failed runner wrote no row for this invocation, so the last row belongs to an earlier run:
       # stop before consulting it rather than acting on stale state.
@@ -98,13 +137,16 @@ for arm in $ARMS; do
   done
 done
 echo "=== SWEEP done $(date) ===" | tee -a "$LOG"
-GD_R="$CORPUS_REVISION" GD_TASKS="$TASKS" GD_OUT="$OUT" python3 -c "import json,collections,os
-rev=os.environ['GD_R']; allowed=set(os.environ['GD_TASKS'].split())
+GD_R="$CORPUS_REVISION" GD_TASKS="$TASKS" GD_OUT="$OUT" GD_REVS="$TASK_REVS" GD_AS="${GATE_D_EXPECT_AT_STOP_SHA-}" GD_AC="${GATE_D_EXPECT_AT_STOP_CAP_S-}" python3 -c "import json,collections,os
+rev=os.environ['GD_R']; allowed=set(os.environ['GD_TASKS'].split()); revs=json.loads(os.environ['GD_REVS'])
 c=collections.Counter(); p=collections.Counter()
 for l in open(os.environ['GD_OUT']):
     try: r=json.loads(l)
     except: continue
     if r.get('corpusRevision','gate-d-r1') != rev or r.get('task') not in allowed: continue
+    if revs and r.get('taskRevision') != revs.get(r.get('task')): continue
+    if revs and r.get('atStopSha256') != (os.environ['GD_AS'] or None): continue
+    if revs and r.get('atStopCapS') != (int(os.environ['GD_AC']) if os.environ['GD_AS'] else None): continue
     digest=r.get('promptSha256') or ''
     k=(r.get('arm') or '',r.get('model') or '',r.get('promptVariant','none') or 'none',digest)
     c[k]+=1; p[k]+= 1 if r.get('pass') else 0

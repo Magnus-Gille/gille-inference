@@ -159,3 +159,70 @@ not be called TTFT or total inference time. Either field remains `null` when its
 observable; `wallS` is never relabelled as model-only time. Raw Pi events, stderr, and tool/model
 content stay inside the throwaway work directory and are deleted after the deterministic grader
 unless `KEEP_WORK=1` is set for bounded diagnosis.
+
+Every row also carries the verification-behaviour fields ported from code-battle's gate-d-r3
+observer (INFER-521): `verificationClass`, `typecheckRuns`, `testRuns`, `typecheckAfterLastEdit`,
+`testsAfterLastEdit`, `lastTypecheckOutcome`, `lastTestOutcome`, `stoppedWithFailingCheck`,
+`ambiguousCheckOutcomes`, `firstEditTurn`, `lastEditTurn` and `edits`. They come from the same pi
+NDJSON stream, hold counters, enums and turn indices only, and are `null` for arms without a
+collector. They classify commands heuristically, so they are the explanatory metric, not the
+primary one (see the external-corpus section below).
+
+## External corpus (`GATE_D_TASKS_ROOT`, INFER-521)
+
+A fresh sealed corpus cannot live in this public repository. `GATE_D_TASKS_ROOT=<dir>` makes
+`run.sh`, `sweep.sh` and `scripts/gate-d-code-loop.py` take their tasks from `<dir>` instead of
+`gate-d/tasks`. `<dir>` holds one directory per task in Gate D format plus the generator's
+`corpus-manifest.json` (`corpusRevision` and `tasks: [{id, digest}]`), as code-battle's
+`gate-d-r3/generate.py --out <dir>` writes it. Grading is the unmodified `check.sh`.
+
+```bash
+python3 ~/src/code-battle/gate-d-r3/generate.py --split validation --out /tmp/r3-validation
+GATE_D_TASKS_ROOT=/tmp/r3-validation GATE_D_AT_STOP=~/src/code-battle/gate-d-r3/at-stop.sh \
+  GATE_D_OUT="$PWD/data/gate-d-r3-validation.jsonl" ARMS=pi SEEDS=1 bash gate-d/sweep.sh
+```
+
+- **Isolation.** The root must lie outside this checkout, and the work root must not overlap it in
+  either direction. Work dirs and the `node_modules` link are unchanged (#172). Arms, `at-stop.sh`
+  and `check.sh` (which executes candidate code) run with every `GATE_D_*` variable removed; for an
+  external corpus the observer and the grader get a fixed allowlisted environment (`PATH`, `HOME`,
+  `LANG`, a validated `TMPDIR`), so the gateway token reaches only the selected arm, so they are not told where the corpus,
+  its solutions or its oracles live. This is not a filesystem sandbox: an arm running as the
+  operator could still find and read the root, which `peek-scan.py`'s `graderPathInTranscript`
+  flags when the transcript shows it. Keep sealed roots in an unpredictable location.
+- **Content guard.** Instead of `git status`, each task directory's digest (sha256 over the sorted
+  `relpath\0sha256(file)\n` entries, byte-compatible with the generator's `tree_digest`) must equal
+  the manifest's before the arm, after the arm and after grading. Any mismatch, added file or
+  symlink aborts with exit 9 and writes no row, and so does a subtree the check cannot read.
+  `exitClass` (and the code-loop `check_gate`) is check.sh's last `FAIL[...]` verdict, kept only when
+  it is a gate id check.sh defines, so oracle output cannot forge it.
+- **Holdouts.** Tasks with `holdout: true` in `meta.json` (r3's sealed split) are refused without
+  `GATE_D_INCLUDE_HOLDOUT=1`, whether selected by `all` or by id.
+- **Row identity.** `corpusRevision` and `holdout` come from `meta.json` (validated against the
+  manifest; a revision that collides with r1/r2 is refused), `taskRevision` is the manifest digest,
+  and `family`, `split` and `trap` are copied so analysis needs no join. Resume counts and summaries
+  scope by `corpusRevision` and by the current digest, so a re-pinned task starts afresh. `sweep.sh`
+  passes each child run the digest it scheduled against (`GATE_D_EXPECT_TASK_REVISION`); a task
+  re-pinned mid-sweep is refused rather than mixed into one study. A single named task needs only
+  its own holdout opt-in, so validation tasks in a mixed manifest run without it.
+- **Grader-derived verification.** After the arm and before `check.sh` stages the hidden oracle,
+  the corpus's `at-stop.sh <TASKDIR> <WORKDIR>` (`GATE_D_AT_STOP`, default `<dir>/at-stop.sh`) runs
+  on a copy of the work dir, so its checks can never change what is graded. Its
+  `atStopTypecheck`, `atStopVisibleTests` and `detectableFailureAtStop` are recorded only when its
+  output is exactly those three fields with their documented values. The script's bytes are
+  snapshotted at start and their digest is recorded as `atStopSha256`, with its time cap
+  `GATE_D_AT_STOP_CAP_S` (a positive integer, default 300 s) as `atStopCapS`; `sweep.sh` resumes only
+  rows of the same observer and cap, counts only those in its summary, and refuses a child whose
+  observer, cap or corpus revision changed. The observer is skipped (`null`) when the arm left a
+  symlink in the work dir. It writes to a private file, not a pipe, in its own process group, which
+  is killed whole when it exits or reaches the cap, so a background child cannot delay grading; a
+  timeout, any other failure or a missing script yields `null` for all three. Pass/fail never depends on it. A relative
+  `GATE_D_AT_STOP` resolves from the caller's directory. The copy shares the read-only-by-convention
+  `node_modules` link with the graded workspace, exactly as the arm itself does; neither is covered
+  by the task digest.
+- **Content-blind code-loop rows.** For an external corpus, `scripts/gate-d-code-loop.py` records
+  only `check_gate` (the failing gate id, or `pass`) instead of `check_tail`, and drops the gateway's
+  `detail`/`summary` text, because a failing hidden oracle can print sealed assertion values.
+- **Metadata.** External tasks must set `holdout` explicitly, and a `split: "sealed"` task must set
+  it to `true`. Relative `GATE_D_TASKS_ROOT`/`GATE_D_AT_STOP` resolve from where `run.sh` or
+  `sweep.sh` was started; digest checks are bound to the exact directory that is seeded and graded.
