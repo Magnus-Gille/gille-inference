@@ -454,6 +454,30 @@ PY
   local PEEK_JSON
   PEEK_JSON="$(python3 "$ROOT/peek-scan.py" "$T" "$TRANSCRIPT" 2>/dev/null)" || PEEK_JSON=""
   [ -n "$PEEK_JSON" ] || PEEK_JSON="{}"
+  # External corpora: gate R3-io and the node hardening (code-battle gate-d-r3 io-gate.mjs, see
+  # harbor/test.sh there; INFER-521; the copy lives under vendor/, see CORPUS.md). check.sh runs
+  # the hidden oracle in the same process as the candidate's modules, so a module that can read
+  # files could read the oracle at import time and tailor its answers. io-gate.mjs is a static,
+  # non-executing import/identifier allowlist; a row passes only if it AND check.sh pass. A
+  # violation is a model outcome (exitClass R3-io); a gate that cannot run (bad arguments, crash, no
+  # typescript) is a runner failure (R3-io-error), never scored as incapability and never counted
+  # by sweep.sh's resume or summary. It runs FIRST, before any candidate code executes (at-stop's
+  # visible tests included; Codex review of INFER-521): a workspace whose modules could reach files,
+  # processes or the module loader is never executed. Every node process that then runs candidate
+  # code (at-stop and check.sh) runs with code generation from strings disabled, which closes
+  # `(() => {}).constructor("…")`, and without the tsx cache. r1/r2 grading is unchanged.
+  local io_failed=""
+  if [ "$EXTERNAL" = 1 ]; then
+    local io_rc=0
+    node "$REPO_ROOT/vendor/code-battle-gate-d-r3/io-gate.mjs" "$REPO_ROOT/node_modules" "$T/repo" "$W" >"$W/.check.log" 2>&1 || io_rc=$?
+    if [ "$io_rc" -ne 0 ]; then
+      if [ "$io_rc" = 1 ] && grep -q '^FAIL\[R3-io\]' "$W/.check.log"; then io_failed="R3-io"
+      else
+        io_failed="R3-io-error"
+        echo "  [warn] $id: the R3-io gate could not run (exit $io_rc); the row is a runner failure, not a model result" >&2
+      fi
+    fi
+  fi
   # Grader-derived verification metric (INFER-521, CBATTLE-14 §3): re-run the checks the agent had
   # (tsc, and tsx --test when the task ships visible tests) on the workspace exactly as the arm left
   # it, BEFORE check.sh stages the hidden oracle. External corpora only, so r1/r2 rows keep their
@@ -468,7 +492,9 @@ PY
   # copy runs with a minimal environment: no inherited credentials or tokens, and a throwaway HOME.
   local AT_STOP_JSON="{}" AT_STOP_W="" AT_STOP_HOME="" at_stop_skip=""
   if [ "$EXTERNAL" = 1 ]; then
-    if ! python3 "$CORPUS_TOOL" scope-check "$T" --work "$W" 2>/dev/null; then
+    if [ -n "$io_failed" ]; then
+      at_stop_skip="gate $io_failed failed, so no candidate code is executed"
+    elif ! python3 "$CORPUS_TOOL" scope-check "$T" --work "$W" 2>/dev/null; then
       at_stop_skip="out-of-scope changes (grading will reject them)"
     elif [ ! -f "$ROOT/at-stop.sh" ]; then
       at_stop_skip="gate-d/at-stop.sh is missing"
@@ -477,7 +503,8 @@ PY
          && cp -R "$W/." "$AT_STOP_W/"; then
       AT_STOP_JSON="$( cd "$AT_STOP_W" && env -i PATH="$PATH" HOME="$AT_STOP_HOME" TMPDIR="$AT_STOP_HOME" \
           LANG="${LANG:-C}" GIT_CEILING_DIRECTORIES="$WORKROOT" AT_STOP_CAP_S="${AT_STOP_CAP_S:-120}" \
-          AT_STOP_TOOLCHAIN="$REPO_ROOT/node_modules" \
+          AT_STOP_TOOLCHAIN="$REPO_ROOT/node_modules" TSX_DISABLE_CACHE=1 \
+          NODE_OPTIONS="--disallow-code-generation-from-strings" \
           "$TIMEOUT_BIN" "${AT_STOP_WALL_S:-300}" bash "$ROOT/at-stop.sh" "$T" "$AT_STOP_W" </dev/null 2>/dev/null )" \
         || AT_STOP_JSON="{}"
     fi
@@ -489,22 +516,6 @@ PY
     fi
   fi
   local pass="false" exitclass="$status"
-  # External corpora: gate R3-io and the node hardening (code-battle gate-d-r3 io-gate.mjs, see
-  # harbor/test.sh there; INFER-521; the copy lives under vendor/, see CORPUS.md). check.sh runs
-  # the hidden oracle in the same process as the candidate's modules, so a module that can read
-  # files could read the oracle at import time and tailor its answers. io-gate.mjs is a static, non-executing import/identifier allowlist; a row
-  # passes only if it AND check.sh pass. A violation is a model outcome (exitClass R3-io); a gate
-  # that cannot run (bad arguments, crash, no typescript) is a runner failure (R3-io-error), never
-  # scored as incapability. check.sh then runs with code generation from strings disabled, which
-  # closes `(() => {}).constructor("…")`, and without the tsx cache. r1/r2 grading is unchanged.
-  local io_failed=""
-  if [ "$EXTERNAL" = 1 ]; then
-    local io_rc=0
-    node "$REPO_ROOT/vendor/code-battle-gate-d-r3/io-gate.mjs" "$REPO_ROOT/node_modules" "$T/repo" "$W" >"$W/.check.log" 2>&1 || io_rc=$?
-    if [ "$io_rc" -ne 0 ]; then
-      if [ "$io_rc" = 1 ] && grep -q '^FAIL\[R3-io\]' "$W/.check.log"; then io_failed="R3-io"; else io_failed="R3-io-error"; fi
-    fi
-  fi
   if [ -n "$io_failed" ]; then
     if [ "$status" = "arm-error" ]; then exitclass="arm-error"; else exitclass="$io_failed"; fi
   elif run_check "$T" "$W"; then pass="true"; exitclass="pass"

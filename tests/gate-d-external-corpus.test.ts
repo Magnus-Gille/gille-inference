@@ -465,6 +465,9 @@ fs.writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\\n");`);
     const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", TASK_A]);
     expect(res.status, res.stderr).toBe(0);
     expect(rows(out)[0]).toMatchObject({ task: TASK_A, pass: false, exitClass: "R3-io" });
+    // The static gate runs before any candidate code, so at-stop never executed this workspace.
+    expect(rows(out)[0]).toMatchObject({ atStopTypecheck: null, atStopVisibleTests: null, detectableFailureAtStop: null });
+    expect(res.stderr).toContain("gate R3-io failed");
   });
 
   it("records an io gate that cannot run as a runner failure, not a model failure", () => {
@@ -489,6 +492,31 @@ fs.writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\\n");`);
     expect(rows(out)[0]).toMatchObject({ task: TASK_A, pass: false });
     // tsc accepts it (G3) and the oracle throws at the Function call (G4), not the static gate.
     expect(rows(out)[0]!.exitClass).toBe("G4-oracle");
+  });
+
+  it("refuses a task whose directory scan is incomplete", () => {
+    const root = corpus();
+    // Simulate an unreadable subtree (chmod cannot stop root): os.walk reports it through onerror.
+    const script = `import os, sys
+sys.path.insert(0, sys.argv[1])
+import gate_d_corpus as g
+from pathlib import Path
+real = os.scandir
+def scandir(path="."):
+    if str(path).endswith("/src"):
+        raise PermissionError(13, "Permission denied", str(path))
+    return real(path)
+os.scandir = scandir
+try:
+    g.tree_digest(Path(sys.argv[2]))
+except g.ExternalCorpusError as error:
+    print("refused:", error)
+    sys.exit(0)
+sys.exit(1)
+`;
+    const res = spawnSync("python3", ["-c", script, join(REAL_ROOT, "gate-d"), join(root, TASK_A)], { encoding: "utf8" });
+    expect(res.status, res.stderr + res.stdout).toBe(0);
+    expect(res.stdout).toContain("cannot scan");
   });
 
   it("refuses a meta.json that is a FIFO without blocking", () => {
@@ -659,6 +687,17 @@ describe("scripts/gate-d-code-loop.py external task root (INFER-521)", { timeout
     expect(r.stdout).toContain('"verdict": "REPORT"');
   });
 
+  it("defaults to the checkout that holds the script", () => {
+    const repo = fixtureRepo();
+    const root = corpus();
+    cpSync(join(REAL_ROOT, "scripts", "gate-d-code-loop.py"), join(repo, "scripts", "gate-d-code-loop.py"));
+    const r = spawnSync("python3", [join(repo, "scripts", "gate-d-code-loop.py"), "--tasks-root", root, "--list-tasks"], {
+      encoding: "utf8", env: cleanEnv({ GATE_D_CL_RESULTS: join(tmp("gd-ext-cl-"), "cl.jsonl") }),
+    });
+    expect(r.status, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout)).toMatchObject({ tasks: [TASK_A, TASK_B] });
+  });
+
   it("refuses sealed tasks without the opt-in and a root inside the checkout", () => {
     const repo = fixtureRepo();
     const sealed = corpus({ split: "sealed" });
@@ -703,6 +742,29 @@ describe("gate-d/sweep.sh external task root (INFER-521)", { timeout: 240_000 },
     expect(calls(log).map((c) => c.task)).toEqual([TASK_A, TASK_B, TASK_B]);
     expect(r.res.stdout).toContain("gate-d-r3 pi/m [prompt=none]: 1/2 pass");
     expect(rows(env.GATE_D_OUT)).toHaveLength(3);
+  });
+
+  it("does not count rows whose R3-io gate could not run, so a repaired sweep finishes", () => {
+    const repo = fixtureRepo();
+    const root = corpus();
+    const { bin, log } = fakeBin(root);
+    const work = tmp("gd-ext-sweep-");
+    const env = {
+      GATE_D_TASKS_ROOT: root, ARMS: "pi", SEEDS: "1",
+      GATE_D_OUT: join(work, "rows.jsonl"), GATE_D_LOG: join(work, "sweep.log"),
+    };
+    const gate = join(repo, "vendor", "code-battle-gate-d-r3", "io-gate.mjs");
+    const original = readFileSync(gate);
+    writeFileSync(gate, "throw new Error('broken gate');\n");
+    let r = runGateD(repo, bin, env, [], "sweep.sh");
+    expect(r.res.status, r.res.stderr).toBe(0);
+    expect(rows(env.GATE_D_OUT).map((x) => x.exitClass)).toEqual(["R3-io-error", "R3-io-error"]);
+    expect(r.res.stdout).not.toContain("pass");
+    writeFileSync(gate, original);
+    r = runGateD(repo, bin, env, [], "sweep.sh");
+    expect(r.res.status, r.res.stderr).toBe(0);
+    expect(calls(log)).toHaveLength(4);
+    expect(r.res.stdout).toContain("gate-d-r3 pi/m [prompt=none]: 1/2 pass");
   });
 
   it("never counts validation rows toward a sealed run of the same task bytes", () => {

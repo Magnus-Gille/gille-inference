@@ -13,7 +13,9 @@
 # for a re-generated task never count toward the new one.
 #
 # RESUMABLE: counts existing rows per (arm,model,task) in the output JSONL and runs only the
-# shortfall — safe to re-launch after an interruption; already-done triples are skipped.
+# shortfall — safe to re-launch after an interruption; already-done triples are skipped. Rows whose
+# R3-io gate could not run (exitClass R3-io-error, a runner failure) stay in the JSONL as
+# diagnostics but count neither as a done seed nor in the summary, so a repaired sweep completes.
 #
 # SEQUENTIAL, NEVER PARALLEL: the box GPU is serial (admission maxParallel=1); concurrent arms
 # would contend and 503. NEVER kill a run mid-stream — see CORRUPTION SAFETY below.
@@ -96,6 +98,7 @@ for l in open(os.environ['GD_OUT']):
     rowrev=r.get('corpusRevision','gate-d-r1')
     variant=(r.get('promptVariant','none'), r.get('promptSha256'))
     if digest is not None and [r.get('taskRevision'),r.get('holdout')]!=digest: continue
+    if r.get('exitClass')=='R3-io-error': continue  # runner failure: a diagnostic row, not a seed
     if rowrev==rev and r.get('arm')==a and r.get('model')==m and r.get('task')==t and variant==want: n+=1
 print(n)"
 }
@@ -135,6 +138,7 @@ for l in open(os.environ['GD_OUT']):
     except: continue
     if r.get('corpusRevision','gate-d-r1') != rev or r.get('task') not in allowed: continue
     if r.get('task') in digests and [r.get('taskRevision'),r.get('holdout')] != digests[r.get('task')]: continue
+    if r.get('exitClass') == 'R3-io-error': continue
     digest=r.get('promptSha256') or ''
     k=(r.get('arm') or '',r.get('model') or '',r.get('promptVariant','none') or 'none',digest)
     c[k]+=1; p[k]+= 1 if r.get('pass') else 0

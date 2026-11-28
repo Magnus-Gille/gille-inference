@@ -1,11 +1,15 @@
 /**
  * Port of code-battle gate-d-r3/telemetry/verification-telemetry.ts (CBATTLE-14, main 88b1a8e,
  * sha256 of the source file d97ece1edacfbf24c2d1fa11994e0ca4fc3b8fb65911d0fbadc081124fcbd5b0),
- * INFER-521. The check+edit semantics are upstream's (mutation position relative to the checks in
- * one command, edits at half-steps). One deliberate deviation, from the Codex review of INFER-521:
- * check patterns match the INVOKED executable of a normalized segment rather than any occurrence of
- * a tool name, so `command -v tsc` or `grep 'npm test' README.md` is not a check run. The CLI block
- * is dropped. Offered back to CBATTLE-14 so the two classifiers converge.
+ * INFER-521. Deviations, all from Codex reviews of INFER-521 and offered back to CBATTLE-14 so the
+ * two classifiers converge:
+ *  - check patterns match the INVOKED executable of a normalized segment rather than any
+ *    occurrence of a tool name, so `command -v tsc` or `grep 'npm test' README.md` is not a check;
+ *  - segments are split outside quotes only, and a command that cannot be segmented reliably
+ *    (unbalanced quotes, heredoc, command substitution) credits no check;
+ *  - each check and mutation inside one command keeps its own segment position, so
+ *    `tsc && sed -i ... && npm test` does not count the typecheck as after the edit.
+ * The CLI block is dropped.
  * gate-d/run.sh feeds pi's NDJSON stream to it through scripts/pi-benchmark-telemetry.ts, so the
  * runner never executes code from an external task root. Re-port it when the corpus changes it, and
  * keep the schema string so rows say which classifier produced them.
@@ -67,15 +71,16 @@ export type Attribution = "exact" | "and-chain" | "none";
 
 interface PendingCheck {
   kinds: CheckKind[];
-  seq: number;
+  /** Position of each check (parallel to kinds), from segmentPosition. */
+  positions: number[];
   attribution: Attribution;
 }
 
 interface PendingMutation {
-  seq: number;
+  /** Position of the command's last mutating segment, from segmentPosition. */
+  position: number;
   /** The command also runs a check, so a non-zero exit does not show that the mutation failed. */
   withChecks: boolean;
-  position: "before-checks" | "after-checks";
 }
 
 interface CheckRecord {
@@ -84,7 +89,51 @@ interface CheckRecord {
   outcome: Outcome;
 }
 
-const SEGMENT_SPLIT = /\s*(?:&&|\|\||;|\n)\s*/;
+/**
+ * Split a shell command into the segments between `&&`, `||`, `;`, `&` and newlines, honouring
+ * quotes and backslash escapes, so `echo "build && npm test"` is one segment (INFER-521 Codex
+ * review). Pipes are recorded but do not split: `npm test | tail` is one check whose status is
+ * hidden. A command it cannot reliably segment (unbalanced quotes, a heredoc, command
+ * substitution) is unparseable: no checks are attributed to it.
+ */
+function splitShell(command: string): { segments: string[]; separators: Set<string>; parseable: boolean } {
+  const segments: string[] = [];
+  const separators = new Set<string>();
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  let parseable = true;
+  const cut = () => { if (current.trim() !== "") segments.push(current.trim()); current = ""; };
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i]!;
+    const next = command[i + 1];
+    if (quote === "'") { current += c; if (c === "'") quote = null; continue; }
+    if (c === "\\") { current += c + (next ?? ""); i++; continue; }
+    if (quote === '"') {
+      if (c === "`" || (c === "$" && next === "(")) parseable = false;
+      current += c; if (c === '"') quote = null; continue;
+    }
+    if (c === "'" || c === '"') { quote = c; current += c; continue; }
+    if (c === "`" || (c === "$" && next === "(")) parseable = false;
+    if (c === "<" && next === "<") parseable = false; // heredoc or here-string
+    if ((c === "&" && next === "&") || (c === "|" && next === "|")) { separators.add(c + next); cut(); i++; continue; }
+    if (c === "|") { separators.add("|"); current += c; continue; }
+    if (c === "&" && command[i - 1] !== ">" && next !== ">") { separators.add("&"); cut(); continue; } // background
+    if (c === ";" || c === "\n") { separators.add(c); cut(); continue; }
+    current += c;
+  }
+  if (quote !== null) parseable = false;
+  cut();
+  return { segments, separators, parseable };
+}
+
+/**
+ * Where segment i of n in the tool call numbered seq sits on the run's timeline: strictly inside
+ * (seq - 0.5, seq + 0.5) and in segment order, so checks and mutations of one command are ordered
+ * against each other and against every other tool call (edit/write tools sit at seq itself).
+ */
+function segmentPosition(seq: number, i: number, n: number): number {
+  return seq - 0.45 + (0.9 * (i + 0.5)) / Math.max(n, 1);
+}
 // Patterns match the INVOKED executable at the start of a normalized segment (INFER-521 Codex
 // review): a tool name merely appearing in a segment (`command -v tsc`, `cat src/tsc.ts`,
 // `echo npm test`) is not a check run.
@@ -126,37 +175,52 @@ function object(v: unknown): JsonObject | null {
 /** Which checks a shell command runs. Exported for the classifier tests. */
 export function classifyCommand(command: string): {
   kinds: CheckKind[];
+  /** Segment index of each entry of kinds. */
+  checkSegments: number[];
+  segmentCount: number;
   attribution: Attribution;
   mutates: boolean;
+  /** Segment index of the last mutating segment (null when nothing mutates). */
+  mutationSegment: number | null;
   /** Where the last mutating segment sits relative to the check segments (null when nothing mutates). */
   mutationPosition: "before-checks" | "after-checks" | null;
 } {
-  const segments = command.trim().split(SEGMENT_SPLIT).filter((s) => s !== "");
+  const split = splitShell(command);
+  if (!split.parseable) {
+    // No check is credited to a command the classifier cannot segment; a mutation anywhere in it
+    // still counts as an edit (`cat > src/a.ts <<EOF ...`), after anything it might have checked.
+    const mutates = MUTATING_BASH.some((re) => re.test(command));
+    return { kinds: [], checkSegments: [], segmentCount: 1, attribution: "none", mutates,
+      mutationSegment: mutates ? 0 : null, mutationPosition: mutates ? "after-checks" : null };
+  }
+  const segments = split.segments;
   const kinds: CheckKind[] = []; // one entry per check segment, so `npm test && … && npm test` counts twice
-  let checkSegments = 0;
+  const checkSegments: number[] = [];
+  let checkSegmentCount = 0;
   let lastCheck = -1;
   let lastMutation = -1;
   segments.forEach((raw, i) => {
     const seg = normalizeSegment(raw);
     let hit = false;
-    if (TYPECHECK.some((re) => re.test(seg))) { kinds.push("typecheck"); hit = true; }
-    if (TESTS.some((re) => re.test(seg))) { kinds.push("tests"); hit = true; }
+    if (TYPECHECK.some((re) => re.test(seg))) { kinds.push("typecheck"); checkSegments.push(i); hit = true; }
+    if (TESTS.some((re) => re.test(seg))) { kinds.push("tests"); checkSegments.push(i); hit = true; }
     if (hit) {
-      checkSegments++;
+      checkSegmentCount++;
       lastCheck = i;
     } else if (!CHECK_TOOL.test(seg) && MUTATING_BASH.some((re) => re.test(seg))) {
       lastMutation = i; // `echo x > src/a.ts` mutates; `npm test > log` is a check, not an edit
     }
   });
-  // A pipe hides the check's exit status (`npm test | tail` exits with tail's status).
-  const piped = /(^|[^|])\|([^|]|$)/.test(command);
-  const otherSeparators = /;|\|\||\n/.test(command.trim());
-  const attribution: Attribution = piped || otherSeparators ? "none" : segments.length > 1 || checkSegments > 1 ? "and-chain" : "exact";
+  // A pipe hides the check's exit status (`npm test | tail` exits with tail's status); so do `;`,
+  // `||`, `&` and newlines. Only separators outside quotes count.
+  const hidden = ["|", "||", ";", "&", "\n"].some((sep) => split.separators.has(sep));
+  const attribution: Attribution = hidden ? "none" : segments.length > 1 || checkSegmentCount > 1 ? "and-chain" : "exact";
   const mutates = lastMutation >= 0;
   // "before-checks": some check runs after the last mutation (`sed && test`, `sed && test && sed && test`);
   // "after-checks": nothing re-checks after it (`test && sed`, or a mutation with no check at all).
   const mutationPosition = !mutates ? null : lastCheck > lastMutation ? "before-checks" : "after-checks";
-  return { kinds, attribution, mutates, mutationPosition };
+  return { kinds, checkSegments, segmentCount: segments.length, attribution, mutates,
+    mutationSegment: mutates ? lastMutation : null, mutationPosition };
 }
 
 /** Outcome of a finished pi bash tool call; pi appends `Command exited with code N` on failure. */
@@ -177,8 +241,9 @@ export function createVerificationTelemetry() {
   let bashMutations = 0;
   let firstEditTurn: number | null = null;
   let lastEditTurn: number | null = null;
-  // Edit positions are half-steps around tool calls: a mutation that precedes the checks in the same
-  // bash command sits just before that command's check records, one that follows them just after.
+  // Positions: edit/write tools sit at their tool-call number; checks and mutations inside a bash
+  // command sit at their own segment's position within it (segmentPosition), so `tsc && sed &&
+  // npm test` puts the typecheck before the edit and the test after it.
   let lastEditSeq = -1;
   let unparseableLines = 0;
   let ambiguousCheckOutcomes = 0;
@@ -207,9 +272,12 @@ export function createVerificationTelemetry() {
           const command = object(ev["args"])?.["command"];
           if (typeof command === "string") {
             const c = classifyCommand(command);
-            if (c.kinds.length > 0) pending.set(id, { kinds: c.kinds, seq, attribution: c.attribution });
-            if (c.mutationPosition !== null) {
-              pendingMutations.set(id, { seq, withChecks: c.kinds.length > 0, position: c.mutationPosition });
+            const at = (i: number) => segmentPosition(seq, i, c.segmentCount);
+            if (c.kinds.length > 0) {
+              pending.set(id, { kinds: c.kinds, positions: c.checkSegments.map(at), attribution: c.attribution });
+            }
+            if (c.mutationSegment !== null) {
+              pendingMutations.set(id, { position: at(c.mutationSegment), withChecks: c.kinds.length > 0 });
             }
           }
         }
@@ -221,7 +289,7 @@ export function createVerificationTelemetry() {
           pendingMutations.delete(id);
           if (ev["isError"] === false || m.withChecks) {
             bashMutations++;
-            noteEdit(m.position === "before-checks" ? m.seq - 0.5 : m.seq + 0.5);
+            noteEdit(m.position);
           }
         }
         const p = pending.get(id);
@@ -233,7 +301,7 @@ export function createVerificationTelemetry() {
             ambiguousCheckOutcomes++;
             outcome = "unknown";
           }
-          for (const kind of p.kinds) checks.push({ kind, seq: p.seq, outcome });
+          p.kinds.forEach((kind, i) => checks.push({ kind, seq: p.positions[i]!, outcome }));
         }
       }
     },

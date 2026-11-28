@@ -164,3 +164,30 @@ test("a check's own log plumbing is not an edit", () => {
   assert.equal(classifyCommand("npm test 2>&1 | tee test.log").mutates, false);
   assert.equal(classifyCommand("echo x > src/a.ts").mutates, true);
 });
+
+// Second Codex review of INFER-521.
+test("each check in one command is ordered against that command's edit", () => {
+  const s = run(start("1", "bash", "npx tsc --noEmit && sed -i 's/x/y/' src/a.ts && npm test"), end("1", "bash", true));
+  assert.equal(s.typecheckAfterLastEdit, false);
+  assert.equal(s.testsAfterLastEdit, true);
+  assert.equal(s.verificationClass, "checked-green-after-last-edit");
+  assert.equal(s.edits, 1);
+});
+
+test("separators inside quotes do not create checks", () => {
+  assert.deepEqual(classifyCommand('echo "Example: build && npm test && deploy"').kinds, []);
+  assert.deepEqual(classifyCommand("echo 'a; npx tsc'").kinds, []);
+  assert.equal(classifyCommand('npm test -- --grep "a|b"').attribution, "exact");
+  assert.equal(classifyCommand("npm test 2>&1").attribution, "exact");
+  assert.equal(classifyCommand("npm test &").attribution, "none");
+  const s = run(start("e", "edit"), end("e", "edit", true), start("1", "bash", 'echo "build && npm test && deploy"'), end("1", "bash", true));
+  assert.equal(s.verificationClass, "never-checked");
+});
+
+test("a command that cannot be segmented credits no check but still counts its edit", () => {
+  assert.deepEqual(classifyCommand('echo "unterminated && npm test').kinds, []);
+  assert.deepEqual(classifyCommand("npm test $(echo x)").kinds, []);
+  const h = classifyCommand("cat > src/a.ts <<'EOF'\nexport const a = 1;\nEOF\nnpm test");
+  assert.deepEqual(h.kinds, []);
+  assert.equal(h.mutates, true);
+});

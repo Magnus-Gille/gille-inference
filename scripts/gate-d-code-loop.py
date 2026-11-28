@@ -21,7 +21,9 @@ from pathlib import Path
 
 # Physical and absolute: check.sh's G0-toolchain gate compares the node_modules link with the
 # physical checkout path, so an alias such as "." or a symlink would fail every task.
-REPO = os.path.realpath(os.environ.get("GATE_D_CL_REPO", "/srv/gille-inference"))
+# Defaults to the checkout holding this script (/srv/gille-inference, the old default, does not
+# exist on the box); GATE_D_CL_REPO still overrides it.
+REPO = os.path.realpath(os.environ.get("GATE_D_CL_REPO", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))
 GW = os.environ.get("GATE_D_CL_GATEWAY", "http://192.0.2.10:8080/mcp")
 TASKS = os.path.join(REPO, "gate-d", "tasks")
 CHECK = os.path.join(REPO, "gate-d", "check.sh")
@@ -104,6 +106,10 @@ if args.list_tasks:
 def current_row(row):
     """A row counts for this run's corpus: same revision, a selected task, and (external) same digest."""
     if row.get("corpusRevision", "gate-d-r1") != corpus_revision or row.get("id") not in task_ids:
+        return False
+    # A gate that could not run is a runner failure: keep the row as a diagnostic, but it neither
+    # completes the task for resume nor enters the score (as gate-d/sweep.sh does for R3-io-error).
+    if row.get("io_gate") == "R3-io-error":
         return False
     return not external or (row.get("taskRevision") == task_revisions.get(row.get("id"))
                             and row.get("holdout") == task_holdout.get(row.get("id")))
@@ -237,7 +243,8 @@ def at_stop(tdir, wdir):
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": home, "TMPDIR": home,
                "LANG": os.environ.get("LANG", "C"), "AT_STOP_CAP_S": os.environ.get("AT_STOP_CAP_S", "120"),
                # Named explicitly, never taken from the candidate-controlled node_modules link.
-               "AT_STOP_TOOLCHAIN": os.path.join(REPO, "node_modules")}
+               "AT_STOP_TOOLCHAIN": os.path.join(REPO, "node_modules"),
+               "NODE_OPTIONS": "--disallow-code-generation-from-strings", "TSX_DISABLE_CACHE": "1"}
         res = subprocess.run(["bash", AT_STOP, tdir, scratch], cwd=scratch, capture_output=True, text=True,
                              timeout=300, stdin=subprocess.DEVNULL, env=env)
         if res.returncode == 0:
@@ -367,12 +374,16 @@ for tid in task_ids:
     else:
         row["applied"] = False
         row["apply_err"] = "empty diff"
-    if external:
-        row.update(at_stop(tdir, wdir))  # before check.sh stages the hidden oracle
-    # External corpora: a row passes only if gate R3-io AND check.sh pass (see gate-d/run.sh).
+    # External corpora: a row passes only if gate R3-io AND check.sh pass (see gate-d/run.sh). The
+    # static gate runs first, so no candidate code (at-stop's visible tests included) executes for a
+    # workspace whose modules could reach files, processes or the module loader.
     io_verdict, io_out = io_gate(tdir, wdir) if external else ("pass", "")
     if external:
         row["io_gate"] = io_verdict
+        if io_verdict == "pass":
+            row.update(at_stop(tdir, wdir))  # before check.sh stages the hidden oracle
+        else:
+            print(f"  [warn] gate {io_verdict}; at-stop.sh not run and its fields are null", flush=True)
     if io_verdict != "pass":
         row["check_exit"] = None
         row["check_tail"] = io_out[-300:]

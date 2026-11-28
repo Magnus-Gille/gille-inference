@@ -125,7 +125,11 @@ def tree_digest(task_dir: Path, capture: dict[str, bytes | None] | None = None) 
     ``capture`` maps relpaths to fill with the exact bytes that were hashed.
     """
     entries: list[tuple[tuple[str, ...], str, Path]] = []
-    for dirpath, dirnames, filenames in os.walk(task_dir, followlinks=False):
+    def unreadable(error: OSError) -> None:
+        # os.walk skips a directory it cannot scan; an incomplete scan must never verify a task.
+        raise ExternalCorpusError(f"cannot scan {error.filename}: {error.strerror}")
+
+    for dirpath, dirnames, filenames in os.walk(task_dir, onerror=unreadable, followlinks=False):
         for name in list(dirnames):
             full = Path(dirpath) / name
             if full.is_symlink():
