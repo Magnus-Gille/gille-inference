@@ -35,6 +35,8 @@ export interface HostMemoryAdmissionConfig {
   modelReclaimBytes: ReadonlyMap<string, number>;
   reserveBytes: number;
   retryAfterSeconds: number;
+  /** GTT allowance not attributed to resident models before an out-of-band tenant is flagged (INFER-355). */
+  gpuUnattributedBaselineBytes?: number;
 }
 
 export type HostMemoryOutcome = "not_needed" | "allow" | "refuse";

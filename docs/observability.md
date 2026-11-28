@@ -259,6 +259,58 @@ unknown/arbitrary string collapses to `unknown` — a raw, user-controlled model
 as a metric label or a log value. The catalogue is read synchronously and refreshed in the
 background, so it never blocks the request hot path.
 
+## GPU memory held outside the model service (INFER-355)
+
+`GET /models/residency` returns a content-blind `gpuAttribution` object next to `hostMemory`.
+It subtracts the operator-declared reclaim estimates (`HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB`,
+the `:reclaimGiB` part) of the resident models from the device-wide GTT counter and reports the
+rest as `unattributedGpuBytes`:
+
+- `status:"nothing_resident"` — llama-swap reports no resident model, so all GTT in use is
+  unattributed; `inUseWhileNothingResident` is true above the baseline allowance.
+- `status:"attributed"` — every resident model has a declared reclaim estimate.
+- `status:"unknown"` with `reason` `gtt_unavailable`, `residency_unknown`, or `estimate_missing`
+  (`residentWithoutEstimate` counts the models, never names them). Until the INFER-352 budgets are
+  declared, any resident model makes attribution unknown; it is never guessed.
+
+The reclaim estimate is a conservative *lower* bound on what a resident model holds, so
+`unattributedGpuBytes` is an *upper* bound (`bound:"upper"`): it can raise a false alarm but
+cannot hide a tenant behind an over-generous estimate. `exceedsBaseline` compares it with
+`HOMESERVER_GPU_UNATTRIBUTED_BASELINE_GIB` (default 4 GiB: the measured idle driver/desktop baseline
+is about 1.5 GiB; the smallest roster model needs about 5.3 GiB; the out-of-band tenant removed on
+2026-10-02 held 17.7 GiB). The object never contains process names, command lines, PIDs, or paths.
+Feeding the unattributed amount into the admission decision is deferred until the INFER-352
+budgets are calibrated.
+
+### Policy for out-of-band GPU tenants (proposed; owner approval pending, gate E)
+
+A process that holds GPU memory on the M5 outside `home-gateway.service` / llama-swap is an
+out-of-band tenant. Such a tenant **either holds the durable GPU lease and is counted against the
+host budget, or does not run**:
+
+1. **Leased and counted.** A transient tenant (benchmark, calibration, controlled-evaluation unit)
+   runs only inside an owner-approved envelope, holds the canonical GPU lease (`gpu` CLI /
+   maintenance window) for its whole lifetime, and declares its peak in the envelope so admission
+   and the operator can count it.
+2. **Long-lived tenants are not allowed.** No always-on model server, embedding daemon, or desktop
+   application may keep GPU memory resident outside the model service. A model it needs is added to
+   the llama-swap roster instead, where admission, budgets, and residency diagnostics cover it.
+3. **Detection and response.** `gpuAttribution.exceedsBaseline=true` (or
+   `inUseWhileNothingResident=true`) outside an active lease or envelope is an incident: the
+   operator identifies the tenant on the host, stops it or brings it under rule 1, and records the
+   resolution in the private operations tracker, not in this repository.
+
+**Why:** the 2026-10-01 host OOM (INFER-350) had two out-of-band tenants — a forgotten model server
+and an application's always-loaded model copy — that no admission decision could see. Memory that
+admission cannot count makes every budget wrong in the unsafe direction.
+
+**Why not:** (a) *subtract the unattributed amount from admission now* — with no calibrated
+budgets the figure is an unbounded upper bound and would refuse fitting starts; it is deferred to
+INFER-352. (b) *expose the tenant's process name or command line* — that leaks host-private detail
+through a monitor-readable surface; the operator already has shell access to identify it. (c)
+*allow long-lived tenants with a static declared budget* — a declaration cannot be verified and
+drifts silently; the roster path gives the same capability with measured evidence.
+
 ## Retention & rotation
 
 `request_log` and `owner_request_log` are unbounded by default. Suggested operator hygiene:

@@ -1,3 +1,4 @@
+import { parseGpuUnattributedBaselineBytes } from "./gpu-attribution.js";
 import { loadEnv } from "../env.js";
 import { loadOAuthConfig, type OAuthConfig } from "./oauth-config.js";
 import { parseStaticKeyKillSwitch, type StaticKeyKillSwitch } from "./static-keys.js";
@@ -638,6 +639,7 @@ function loadHostMemoryAdmissionConfig(): HostMemoryAdmissionConfig {
     modelReclaimBytes: reclaim,
     reserveBytes: Math.round(Math.max(0, reserveGib) * 1024 ** 3),
     retryAfterSeconds: Math.max(1, Math.round(retryAfter)),
+    gpuUnattributedBaselineBytes: parseGpuUnattributedBaselineBytes(process.env["HOMESERVER_GPU_UNATTRIBUTED_BASELINE_GIB"]),
   };
 }
 

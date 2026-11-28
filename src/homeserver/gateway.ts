@@ -1,4 +1,5 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
+import { attributeGpuMemory, type GpuAttribution } from "./gpu-attribution.js";
 import { timingSafeEqual, createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import {
@@ -654,7 +655,7 @@ interface ModelResidencyResponseRow {
 }
 
 type ModelResidencyResponse =
-  | { models: ModelResidencyResponseRow[]; hostMemory: HostMemoryResponse; resourceEvidence: ResourceEvidence; activityEvidence: ActivityEvidence; status?: never }
+  | { models: ModelResidencyResponseRow[]; hostMemory: HostMemoryResponse; gpuAttribution: GpuAttribution; resourceEvidence: ResourceEvidence; activityEvidence: ActivityEvidence; status?: never }
   | { status: "unavailable"; resourceEvidence: ResourceEvidence; models?: never };
 
 /**
@@ -756,6 +757,7 @@ async function readModelResidency(
   admissionMode: HostMemoryAdmissionMode,
   readOom: () => Promise<number | null>,
   readAdmission: () => AdmissionState,
+  attribution: { reclaimBytesByModel: ReadonlyMap<string, number>; baselineBytes?: number },
 ): Promise<ModelResidencyResponse> {
   const resourceEvidence = await readResourceEvidence(admissionMode, readOom);
   let running: Awaited<ReturnType<typeof getRunningSnapshot>>;
@@ -802,6 +804,12 @@ async function readModelResidency(
     };
   });
   const hostMemory = await readHostMemoryForResidency(readMemory);
+  const gpuAttribution = attributeGpuMemory({
+    gttUsedBytes: hostMemory.gttUsedBytes,
+    residentModels: models,
+    reclaimBytesByModel: attribution.reclaimBytesByModel,
+    ...(attribution.baselineBytes === undefined ? {} : { baselineBytes: attribution.baselineBytes }),
+  });
   const admission = readAdmission();
   const activityEvidence: ActivityEvidence = {
     gateway: {
@@ -814,7 +822,7 @@ async function readModelResidency(
     },
     backend: { status: "not_probed" },
   };
-  return { models: modelsOutput, hostMemory, resourceEvidence, activityEvidence };
+  return { models: modelsOutput, hostMemory, gpuAttribution, resourceEvidence, activityEvidence };
 }
 
 // ─── Portal HTML (self-service invite → key page) ──────────────────────────────────
@@ -5962,6 +5970,10 @@ export async function handleRequest(
         cfg.hostMemoryAdmission.mode,
         hostMemoryDeps.readOomKillCount ?? readOomKillCount,
         () => controller.snapshot(),
+        {
+          reclaimBytesByModel: cfg.hostMemoryAdmission.modelReclaimBytes,
+          baselineBytes: cfg.hostMemoryAdmission.gpuUnattributedBaselineBytes,
+        },
       );
       const status = residency.status === "unavailable" ? 503 : 200;
       sendJson(res, status, residency);
