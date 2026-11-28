@@ -1,4 +1,4 @@
-// Ported from code-battle gate-d-r3/telemetry/verification-telemetry.test.ts (commit caae280), INFER-521.
+// Ported from code-battle gate-d-r3/telemetry/verification-telemetry.test.ts (main 88b1a8e), INFER-521.
 import { test } from "vitest";
 import { strict as assert } from "node:assert";
 import { classifyCommand, summarizeNdjson } from "../scripts/pi-verification-telemetry.js";
@@ -103,6 +103,28 @@ test("summary is content-blind", () => {
   assert.ok(!JSON.stringify(s).includes("SECRET"));
 });
 
+test("edit-and-check in one command records the edit before the check (Codex review)", () => {
+  const g = run(start("1", "bash", "sed -i 's/x/y/' src/a.ts && npm test"), end("1", "bash", true));
+  assert.equal(g.bashMutations, 1);
+  assert.equal(g.testsAfterLastEdit, true);
+  assert.equal(g.verificationClass, "checked-green-after-last-edit");
+  // The chain failed: the edit may still have happened and the test outcome is unknown.
+  const r = run(start("1", "bash", "sed -i 's/x/y/' src/a.ts && npm test"), end("1", "bash", false));
+  assert.equal(r.edits, 1);
+  assert.equal(r.verificationClass, "checked-after-last-edit-unknown");
+  // Check first, then edit: the check is before the last edit.
+  const a = run(start("1", "bash", "npm test && sed -i 's/x/y/' src/a.ts"), end("1", "bash", true));
+  assert.equal(a.verificationClass, "checked-before-last-edit-only");
+  assert.deepEqual(classifyCommand("npm test > out.log").mutationPosition, null);
+  // Interleaved: the final test follows the final edit (second Codex review).
+  const i = run(start("1", "bash", "sed -i 's/a/b/' src/a.ts && npm test && sed -i 's/b/c/' src/a.ts && npm test"),
+    end("1", "bash", true));
+  assert.equal(i.verificationClass, "checked-green-after-last-edit");
+  assert.equal(i.testRuns, 2); // repeated checks in one command are each counted (third Codex review)
+  assert.equal(i.bashMutations, 1); // one tool call, one recorded edit
+  assert.equal(classifyCommand("sed -i x a.ts").mutationPosition, "after-checks");
+});
+
 // INFER-521 Codex review: deviations from the code-battle original, pinned here.
 test("classifier: only an invoked check counts", () => {
   assert.deepEqual(classifyCommand("command -v tsc").kinds, []);
@@ -116,7 +138,7 @@ test("classifier: only an invoked check counts", () => {
   assert.equal(classifyCommand("npm test > out.log").mutates, false);
 });
 
-test("a command that checks and then edits is not a check after the last edit", () => {
+test("check then edit in one command: the check is before the last edit (upstream semantics)", () => {
   const s = run(
     turn, start("e1", "edit"), end("e1", "edit", true),
     start("b1", "bash", "npm test && sed -i 's/a/b/' src/x.ts"), end("b1", "bash", true),
@@ -124,7 +146,12 @@ test("a command that checks and then edits is not a check after the last edit", 
   assert.equal(s.edits, 2);
   assert.equal(s.testsAfterLastEdit, false);
   assert.equal(s.verificationClass, "checked-before-last-edit-only");
-  assert.equal(s.ambiguousCheckOutcomes, 1);
+});
+
+test("an anchored check with an env prefix still orders against the edit", () => {
+  const s = run(start("1", "bash", "sed -i 's/x/y/' src/a.ts && CI=1 npx --no-install tsc --noEmit"), end("1", "bash", true));
+  assert.equal(s.typecheckAfterLastEdit, true);
+  assert.equal(s.verificationClass, "checked-green-after-last-edit");
 });
 
 test("`command -v tsc` after an edit is not verification", () => {

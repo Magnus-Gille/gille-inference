@@ -175,7 +175,7 @@ def mcp(tool, args):
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(json.load(r)["result"]["content"][0]["text"])
 
-# Runner configuration never reaches candidate code (at-stop's npm test, check.sh's oracle):
+# Runner configuration never reaches candidate code (at-stop's visible tests, check.sh's oracle):
 # GATE_D_TASKS_ROOT names the directory holding every task's oracle/ and solution/.
 CHILD_ENV = {k: v for k, v in os.environ.items() if not k.startswith("GATE_D_")}
 
@@ -184,6 +184,26 @@ def sh(argv, cwd=None):
     return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=300, env=CHILD_ENV)
 
 AT_STOP = os.path.join(REPO, "gate-d", "at-stop.sh")
+IO_GATE = os.path.join(REPO, "gate-d", "io-gate.mjs")
+# check.sh for external corpora, as gate-d/run.sh runs it (INFER-521): no code generation from
+# strings and no tsx cache in any node process it starts.
+HARDENED_ENV = dict(CHILD_ENV, TSX_DISABLE_CACHE="1", NODE_OPTIONS=" ".join(
+    x for x in ("--disallow-code-generation-from-strings", CHILD_ENV.get("NODE_OPTIONS", "")) if x))
+
+
+def io_gate(tdir, wdir):
+    """Gate R3-io (code-battle gate-d-r3 io-gate.mjs), static and non-executing: "pass", "R3-io" for a
+    violation (a model outcome) or "R3-io-error" when the gate itself cannot run (a runner failure)."""
+    try:
+        res = subprocess.run(["node", IO_GATE, os.path.join(REPO, "node_modules"), os.path.join(tdir, "repo"), wdir],
+                             capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL, env=CHILD_ENV)
+    except (OSError, subprocess.SubprocessError):
+        return "R3-io-error", ""
+    if res.returncode == 0:
+        return "pass", ""
+    if res.returncode == 1 and any(l.startswith("FAIL[R3-io]") for l in res.stdout.splitlines()):
+        return "R3-io", res.stdout
+    return "R3-io-error", res.stdout + res.stderr
 AT_STOP_SPEC = {
     "atStopTypecheck": ("passed", "failed"),
     "atStopVisibleTests": ("passed", "failed", "none"),
@@ -199,7 +219,7 @@ def at_stop(tdir, wdir):
     parsed = {}
     # First the non-executing scope check (check.sh's G0-files allowlist): a patch that grading will
     # reject, such as a rewritten package.json test script, is never executed here. Then a
-    # throwaway copy, so files a candidate's npm test leaves behind never reach check.sh, run with a
+    # throwaway copy, so files a candidate's visible tests leave behind never reach check.sh, run with a
     # minimal environment: no inherited credentials and a throwaway HOME (Codex review, INFER-521).
     try:
         out_of_scope = scope_violations(Path(tdir), Path(wdir))
@@ -215,7 +235,9 @@ def at_stop(tdir, wdir):
         shutil.copytree(wdir, scratch, symlinks=True)
         os.mkdir(home, 0o700)
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": home, "TMPDIR": home,
-               "LANG": os.environ.get("LANG", "C"), "AT_STOP_CAP_S": os.environ.get("AT_STOP_CAP_S", "120")}
+               "LANG": os.environ.get("LANG", "C"), "AT_STOP_CAP_S": os.environ.get("AT_STOP_CAP_S", "120"),
+               # Named explicitly, never taken from the candidate-controlled node_modules link.
+               "AT_STOP_TOOLCHAIN": os.path.join(REPO, "node_modules")}
         res = subprocess.run(["bash", AT_STOP, tdir, scratch], cwd=scratch, capture_output=True, text=True,
                              timeout=300, stdin=subprocess.DEVNULL, env=env)
         if res.returncode == 0:
@@ -286,7 +308,7 @@ for tid in task_ids:
     }
     if external:
         row.update({k: task_meta.get(k) for k in ("family", "split", "trap")})
-        row.update(NULL_AT_STOP)  # stable schema, also on start-refused rows
+        row.update(NULL_AT_STOP, io_gate=None)  # stable schema, also on start-refused rows
     t0 = time.time()
     try:
         start = mcp("code_loop_start", {"instruction": instr, "files": files,
@@ -347,10 +369,20 @@ for tid in task_ids:
         row["apply_err"] = "empty diff"
     if external:
         row.update(at_stop(tdir, wdir))  # before check.sh stages the hidden oracle
-    chk = sh(["bash", CHECK, tdir, wdir])
-    row["check_exit"] = chk.returncode
-    row["check_tail"] = ((chk.stdout or "") + (chk.stderr or ""))[-300:]
-    row["passed"] = row.get("applied", False) and chk.returncode == 0
+    # External corpora: a row passes only if gate R3-io AND check.sh pass (see gate-d/run.sh).
+    io_verdict, io_out = io_gate(tdir, wdir) if external else ("pass", "")
+    if external:
+        row["io_gate"] = io_verdict
+    if io_verdict != "pass":
+        row["check_exit"] = None
+        row["check_tail"] = io_out[-300:]
+        row["passed"] = False
+    else:
+        chk = subprocess.run(["bash", CHECK, tdir, wdir], capture_output=True, text=True, timeout=300,
+                             env=HARDENED_ENV if external else CHILD_ENV)
+        row["check_exit"] = chk.returncode
+        row["check_tail"] = ((chk.stdout or "") + (chk.stderr or ""))[-300:]
+        row["passed"] = row.get("applied", False) and chk.returncode == 0
     row["wall_s"] = round(time.time() - t0, 1)
     if external:
         try:

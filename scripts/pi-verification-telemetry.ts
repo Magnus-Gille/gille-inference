@@ -1,9 +1,11 @@
 /**
- * Port of code-battle gate-d-r3/telemetry/verification-telemetry.ts (CBATTLE-14, commit caae280),
- * INFER-521. Two deliberate deviations from the original, from the Codex review of INFER-521:
- * check patterns match the invoked executable rather than any occurrence of a tool name, and a
- * command that both checks and edits marks its checks ambiguous and its edit as later. The CLI
- * block is dropped. Offer both changes back to CBATTLE-14 so the two classifiers converge.
+ * Port of code-battle gate-d-r3/telemetry/verification-telemetry.ts (CBATTLE-14, main 88b1a8e,
+ * sha256 of the source file d97ece1edacfbf24c2d1fa11994e0ca4fc3b8fb65911d0fbadc081124fcbd5b0),
+ * INFER-521. The check+edit semantics are upstream's (mutation position relative to the checks in
+ * one command, edits at half-steps). One deliberate deviation, from the Codex review of INFER-521:
+ * check patterns match the INVOKED executable of a normalized segment rather than any occurrence of
+ * a tool name, so `command -v tsc` or `grep 'npm test' README.md` is not a check run. The CLI block
+ * is dropped. Offered back to CBATTLE-14 so the two classifiers converge.
  * gate-d/run.sh feeds pi's NDJSON stream to it through scripts/pi-benchmark-telemetry.ts, so the
  * runner never executes code from an external task root. Re-port it when the corpus changes it, and
  * keep the schema string so rows say which classifier produced them.
@@ -11,7 +13,7 @@
 /**
  * Content-blind verification-behaviour telemetry for one pi run (CBATTLE-14 §3).
  *
- * Reads pi's `--mode json` NDJSON events (the same stream
+ * Reads pi's `--mode json` NDJSON events (the same stream gille-inference's
  * scripts/pi-benchmark-telemetry.ts consumes) and answers, per run: did the agent type-check, did it
  * run the tests, did it do so after its last edit, what were the outcomes, and did it stop while a
  * check it ran was red. The summary holds counters, enums and turn indices only: no commands, paths,
@@ -69,6 +71,13 @@ interface PendingCheck {
   attribution: Attribution;
 }
 
+interface PendingMutation {
+  seq: number;
+  /** The command also runs a check, so a non-zero exit does not show that the mutation failed. */
+  withChecks: boolean;
+  position: "before-checks" | "after-checks";
+}
+
 interface CheckRecord {
   kind: CheckKind;
   seq: number;
@@ -91,6 +100,7 @@ const TESTS = [
   /^(vitest|jest)(\s|$)/,
 ];
 const MUTATING_BASH = [/\bsed\s+-i/, /(^|[^>2&])>{1,2}\s*[^&\s]/, /\btee\b/, /\b(mv|cp|rm)\s/, /\bperl\s+-p?i/, /\bpatch\b/];
+
 // Checkers and runtimes whose own redirects (`npm test > out.log`) are not source edits.
 const CHECK_TOOL = /^(npm|npx|pnpm|yarn|tsc|node|tsx|vitest|jest)(\s|$)/;
 
@@ -114,26 +124,39 @@ function object(v: unknown): JsonObject | null {
 }
 
 /** Which checks a shell command runs. Exported for the classifier tests. */
-export function classifyCommand(command: string): { kinds: CheckKind[]; attribution: Attribution; mutates: boolean } {
+export function classifyCommand(command: string): {
+  kinds: CheckKind[];
+  attribution: Attribution;
+  mutates: boolean;
+  /** Where the last mutating segment sits relative to the check segments (null when nothing mutates). */
+  mutationPosition: "before-checks" | "after-checks" | null;
+} {
   const segments = command.trim().split(SEGMENT_SPLIT).filter((s) => s !== "");
-  const kinds = new Set<CheckKind>();
+  const kinds: CheckKind[] = []; // one entry per check segment, so `npm test && … && npm test` counts twice
   let checkSegments = 0;
-  let mutates = false;
-  for (const raw of segments) {
+  let lastCheck = -1;
+  let lastMutation = -1;
+  segments.forEach((raw, i) => {
     const seg = normalizeSegment(raw);
     let hit = false;
-    if (TYPECHECK.some((re) => re.test(seg))) { kinds.add("typecheck"); hit = true; }
-    if (TESTS.some((re) => re.test(seg))) { kinds.add("tests"); hit = true; }
-    if (hit) checkSegments++;
-    // Mutation is judged per segment, so `npm test && sed -i ...` still counts as an edit, while a
-    // check's own log plumbing (`npm test 2>&1 | tee log`) does not, as in the original.
-    if (!CHECK_TOOL.test(seg) && MUTATING_BASH.some((re) => re.test(seg))) mutates = true;
-  }
+    if (TYPECHECK.some((re) => re.test(seg))) { kinds.push("typecheck"); hit = true; }
+    if (TESTS.some((re) => re.test(seg))) { kinds.push("tests"); hit = true; }
+    if (hit) {
+      checkSegments++;
+      lastCheck = i;
+    } else if (!CHECK_TOOL.test(seg) && MUTATING_BASH.some((re) => re.test(seg))) {
+      lastMutation = i; // `echo x > src/a.ts` mutates; `npm test > log` is a check, not an edit
+    }
+  });
   // A pipe hides the check's exit status (`npm test | tail` exits with tail's status).
   const piped = /(^|[^|])\|([^|]|$)/.test(command);
   const otherSeparators = /;|\|\||\n/.test(command.trim());
   const attribution: Attribution = piped || otherSeparators ? "none" : segments.length > 1 || checkSegments > 1 ? "and-chain" : "exact";
-  return { kinds: [...kinds], attribution, mutates };
+  const mutates = lastMutation >= 0;
+  // "before-checks": some check runs after the last mutation (`sed && test`, `sed && test && sed && test`);
+  // "after-checks": nothing re-checks after it (`test && sed`, or a mutation with no check at all).
+  const mutationPosition = !mutates ? null : lastCheck > lastMutation ? "before-checks" : "after-checks";
+  return { kinds, attribution, mutates, mutationPosition };
 }
 
 /** Outcome of a finished pi bash tool call; pi appends `Command exited with code N` on failure. */
@@ -154,17 +177,19 @@ export function createVerificationTelemetry() {
   let bashMutations = 0;
   let firstEditTurn: number | null = null;
   let lastEditTurn: number | null = null;
+  // Edit positions are half-steps around tool calls: a mutation that precedes the checks in the same
+  // bash command sits just before that command's check records, one that follows them just after.
   let lastEditSeq = -1;
   let unparseableLines = 0;
   let ambiguousCheckOutcomes = 0;
   const pending = new Map<string, PendingCheck>();
-  const pendingMutations = new Map<string, true>();
+  const pendingMutations = new Map<string, PendingMutation>();
   const pendingEdits = new Map<string, true>();
   const checks: CheckRecord[] = [];
 
-  function noteEdit() {
+  function noteEdit(at: number = seq) {
     edits++;
-    lastEditSeq = seq;
+    lastEditSeq = Math.max(lastEditSeq, at);
     lastEditTurn = turns;
     if (firstEditTurn === null) firstEditTurn = turns;
   }
@@ -182,23 +207,24 @@ export function createVerificationTelemetry() {
           const command = object(ev["args"])?.["command"];
           if (typeof command === "string") {
             const c = classifyCommand(command);
-            // A command that both checks and edits (`npm test && sed -i ...`) has no reliable
-            // check-vs-edit order: its checks count as ambiguous and its edit as the later event.
-            if (c.kinds.length > 0) {
-              pending.set(id, { kinds: c.kinds, seq, attribution: c.mutates ? "none" : c.attribution });
+            if (c.kinds.length > 0) pending.set(id, { kinds: c.kinds, seq, attribution: c.attribution });
+            if (c.mutationPosition !== null) {
+              pendingMutations.set(id, { seq, withChecks: c.kinds.length > 0, position: c.mutationPosition });
             }
-            if (c.mutates) pendingMutations.set(id, true);
           }
         }
       }
       if (type === "tool_execution_end" && id !== null) {
         if (pendingEdits.delete(id) && ev["isError"] === false) noteEdit();
-        const p = pending.get(id);
-        if (pendingMutations.delete(id) && (ev["isError"] === false || p !== undefined)) {
-          // A mixed check+edit command that exited non-zero may still have edited: assume it did.
-          bashMutations++;
-          noteEdit();
+        const m = pendingMutations.get(id);
+        if (m !== undefined) {
+          pendingMutations.delete(id);
+          if (ev["isError"] === false || m.withChecks) {
+            bashMutations++;
+            noteEdit(m.position === "before-checks" ? m.seq - 0.5 : m.seq + 0.5);
+          }
         }
+        const p = pending.get(id);
         if (p !== undefined) {
           pending.delete(id);
           const raw = outcomeOf(ev);

@@ -92,11 +92,25 @@ Contract:
   when the fields were measured and is `null` otherwise (non-pi arms), because some of those fields
   are legitimately `null` when measured (no check ran, no edit). A check that hits `AT_STOP_CAP_S`
   is unmeasured (`null`), not red. r1/r2 rows are unchanged.
+- **Gate R3-io.** A row passes only if code-battle's `io-gate.mjs` AND `check.sh` pass, as in the
+  corpus's own Harbor verifier. `check.sh` runs the hidden oracle in the same process as the
+  candidate's modules, so a module that can read files could read the oracle at import time and
+  tailor its answers. The gate is static and runs no candidate code: changed modules may import only
+  relative `.ts` modules (tests also `node:test`/`node:assert`) and may not name `process`,
+  `globalThis`, `require`, `eval`, `Function` and the like. A violation records `exitClass: "R3-io"`
+  (a model outcome); a gate that cannot run records `R3-io-error` (a runner failure, never scored as
+  incapability). `check.sh` then runs with `NODE_OPTIONS=--disallow-code-generation-from-strings`
+  and `TSX_DISABLE_CACHE=1`, which closes `(() => {}).constructor("…")`, the one escape a static
+  gate cannot see. Why not run the gate for r1/r2 too: their recorded results were graded without
+  it, and adding it there would change what an r1 pass means. Code-loop rows record it as
+  `io_gate` (`pass`, `R3-io`, `R3-io-error`).
 - **Executing candidate code.** at-stop runs only after a non-executing scope check (the same write
   allowlist as `check.sh`'s G0-files gate) passes, so a workspace grading will reject, such as a
   rewritten `package.json` test script, is never executed for it. It then runs on a throwaway copy
   of the work dir with a minimal environment (`PATH`, a throwaway `HOME`/`TMPDIR`, no inherited
-  tokens), so neither metric can change pass/fail. Residual risk, unchanged from `check.sh`'s own
+  tokens), so neither metric can change pass/fail. at-stop.sh calls the toolchain's own `tsc` and
+  `tsx --test test/*.test.ts` (never the workspace's npm scripts or binaries), and the runner names
+  that toolchain explicitly (`AT_STOP_TOOLCHAIN`) instead of trusting the work dir's link. Residual risk, unchanged from `check.sh`'s own
   oracle run: candidate code runs as the operator's OS user and the `node_modules` link points at
   the checkout's writable dependencies. Only a real sandbox removes that.
 - **Code-loop runner.** `scripts/gate-d-code-loop.py --tasks-root` applies the same enumeration,
@@ -105,6 +119,17 @@ Contract:
   remotely; it now links `node_modules` into the grading dir, which `check.sh`'s G0-toolchain gate
   requires.
 
-Both scripts that produce those fields are pinned copies in this repository (`gate-d/at-stop.sh`,
-`scripts/pi-verification-telemetry.ts`) rather than code loaded from the task root, because the
-manifest pins task directories, not scripts. Re-copy them when CBATTLE-14 changes the originals.
+The three corpus scripts the runners use are pinned copies of code-battle main `88b1a8e` in this
+repository rather than code loaded from the task root, because the manifest pins task directories,
+not scripts. Re-copy them when CBATTLE-14 changes the originals; tests check each provenance claim.
+
+| Copy | Original | Local changes |
+| --- | --- | --- |
+| `gate-d/io-gate.mjs` | `gate-d-r3/io-gate.mjs`, sha256 `b9525b680f1c7a1c3082a7c6fa4ff437e68552d9b43e18e7b67c0f494f279437` | none (byte-identical) |
+| `gate-d/at-stop.sh` | `gate-d-r3/at-stop.sh` (sha256 in its header) | lines marked `# INFER-521-local`: a check that hits the cap is unmeasured, not red |
+| `scripts/pi-verification-telemetry.ts` | `gate-d-r3/telemetry/verification-telemetry.ts` | checks match the invoked program only (`command -v tsc` is not a check run); no CLI block |
+
+The telemetry port takes upstream's check-versus-edit semantics as they are (a command's mutation
+is ordered by its position relative to the checks in the same command). Why not keep this repo's
+earlier rule, which marked any command that both checks and edits as ambiguous: upstream's rule
+keeps more information and the two classifiers should converge on one definition.

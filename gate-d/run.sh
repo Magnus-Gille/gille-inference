@@ -145,6 +145,16 @@ CAP_S="${CAP_S:-600}"
 # Portable wall-clock cap: GNU coreutils ships `timeout` on Linux (the box) and `gtimeout`
 # on macOS via Homebrew. Resolve whichever exists so the same script runs on either host.
 TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
+# check.sh, hardened for external corpora (see gate R3-io below): no code generation from strings
+# and no tsx cache in any node process it starts.
+run_check(){
+  if [ "$EXTERNAL" = 1 ]; then
+    NODE_OPTIONS="--disallow-code-generation-from-strings${NODE_OPTIONS:+ $NODE_OPTIONS}" TSX_DISABLE_CACHE=1 \
+      bash "$ROOT/check.sh" "$1" "$2" >"$2/.check.log" 2>&1
+  else
+    bash "$ROOT/check.sh" "$1" "$2" >"$2/.check.log" 2>&1
+  fi
+}
 [ -n "$TIMEOUT_BIN" ] || { echo "error: need GNU 'timeout' (Linux) or 'gtimeout' (macOS: brew install coreutils) on PATH" >&2; exit 3; }
 OUT="${GATE_D_OUT:-$REPO_ROOT/data/gate-d-results.jsonl}"; mkdir -p "$(dirname "$OUT")"
 # Optional pi-only system-prompt variant (INFER-519). GATE_D_PI_APPEND_SYSTEM names a committed file
@@ -445,12 +455,12 @@ PY
   PEEK_JSON="$(python3 "$ROOT/peek-scan.py" "$T" "$TRANSCRIPT" 2>/dev/null)" || PEEK_JSON=""
   [ -n "$PEEK_JSON" ] || PEEK_JSON="{}"
   # Grader-derived verification metric (INFER-521, CBATTLE-14 §3): re-run the checks the agent had
-  # (tsc, and npm test when the task ships visible tests) on the workspace exactly as the arm left
+  # (tsc, and tsx --test when the task ships visible tests) on the workspace exactly as the arm left
   # it, BEFORE check.sh stages the hidden oracle. External corpora only, so r1/r2 rows keep their
   # schema. Pure observation: it runs with the arm's Git isolation, its output is whitelisted when
   # the row is built, and any failure, timeout or missing script yields '{}' and never changes
   # pass/fail. at-stop.sh is this repository's pinned copy of the corpus script (see its header).
-  # It runs on a throwaway copy of the work dir, so files a candidate's `npm test` leaves behind
+  # It runs on a throwaway copy of the work dir, so files a candidate's visible tests leave behind
   # cannot reach check.sh: "never changes pass/fail" holds structurally, not by convention.
   # Order (Codex review of INFER-521): first the non-executing scope check, the same write
   # allowlist as check.sh's G0-files gate. A workspace that grading will reject anyway (for example
@@ -467,6 +477,7 @@ PY
          && cp -R "$W/." "$AT_STOP_W/"; then
       AT_STOP_JSON="$( cd "$AT_STOP_W" && env -i PATH="$PATH" HOME="$AT_STOP_HOME" TMPDIR="$AT_STOP_HOME" \
           LANG="${LANG:-C}" GIT_CEILING_DIRECTORIES="$WORKROOT" AT_STOP_CAP_S="${AT_STOP_CAP_S:-120}" \
+          AT_STOP_TOOLCHAIN="$REPO_ROOT/node_modules" \
           "$TIMEOUT_BIN" "${AT_STOP_WALL_S:-300}" bash "$ROOT/at-stop.sh" "$T" "$AT_STOP_W" </dev/null 2>/dev/null )" \
         || AT_STOP_JSON="{}"
     fi
@@ -478,7 +489,25 @@ PY
     fi
   fi
   local pass="false" exitclass="$status"
-  if bash "$ROOT/check.sh" "$T" "$W" >"$W/.check.log" 2>&1; then pass="true"; exitclass="pass"
+  # External corpora: gate R3-io and the node hardening (code-battle gate-d-r3 io-gate.mjs, see
+  # harbor/test.sh there; INFER-521). check.sh runs the hidden oracle in the same process as the
+  # candidate's modules, so a module that can read files could read the oracle at import time and
+  # tailor its answers. io-gate.mjs is a static, non-executing import/identifier allowlist; a row
+  # passes only if it AND check.sh pass. A violation is a model outcome (exitClass R3-io); a gate
+  # that cannot run (bad arguments, crash, no typescript) is a runner failure (R3-io-error), never
+  # scored as incapability. check.sh then runs with code generation from strings disabled, which
+  # closes `(() => {}).constructor("…")`, and without the tsx cache. r1/r2 grading is unchanged.
+  local io_failed=""
+  if [ "$EXTERNAL" = 1 ]; then
+    local io_rc=0
+    node "$ROOT/io-gate.mjs" "$REPO_ROOT/node_modules" "$T/repo" "$W" >"$W/.check.log" 2>&1 || io_rc=$?
+    if [ "$io_rc" -ne 0 ]; then
+      if [ "$io_rc" = 1 ] && grep -q '^FAIL\[R3-io\]' "$W/.check.log"; then io_failed="R3-io"; else io_failed="R3-io-error"; fi
+    fi
+  fi
+  if [ -n "$io_failed" ]; then
+    if [ "$status" = "arm-error" ]; then exitclass="arm-error"; else exitclass="$io_failed"; fi
+  elif run_check "$T" "$W"; then pass="true"; exitclass="pass"
   elif [ "$status" = "arm-error" ]; then exitclass="arm-error"
   else
     # Extract the gate id from the `FAIL[G3-tsc]: ...` line (check.sh prints `--- tsc ---`

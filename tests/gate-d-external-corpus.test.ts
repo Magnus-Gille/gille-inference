@@ -120,8 +120,9 @@ interface CorpusOptions { split?: string; holdout?: boolean; revision?: string }
 
 /**
  * Two r1 seeds re-labelled as an r3 corpus. Task A (sum) has no visible tests. Task B (paginate)
- * ships a package.json whose `npm test` runs its oracle, declared as a visible test, so at-stop.sh
- * reports it red on the untouched seed.
+ * ships its oracle again as the visible test test/paginate.test.ts (which at-stop.sh runs with the
+ * toolchain's `tsx --test`, as the r3 seeds' `npm test` does), so at-stop.sh reports it red on the
+ * untouched seed.
  */
 function corpus(opts: CorpusOptions = {}): string {
   const root = tmp("gd-ext-corpus-");
@@ -139,9 +140,10 @@ function corpus(opts: CorpusOptions = {}): string {
     Object.assign(meta, { id: s.id, corpusRevision: revision, holdout, split, family: s.family, trap: s.trap });
     if (s.id === TASK_B) {
       writeFileSync(join(dir, "repo", "package.json"),
-        JSON.stringify({ private: true, scripts: { test: "tsx test/paginate.oracle.ts" } }, null, 2) + "\n");
-      meta.oracleFiles = [...meta.oracleFiles, "package.json"];
-      meta.visibleTests = ["test/paginate.oracle.ts"];
+        JSON.stringify({ private: true, scripts: { test: "tsx --test test/*.test.ts" } }, null, 2) + "\n");
+      cpSync(join(dir, "repo", "test", "paginate.oracle.ts"), join(dir, "repo", "test", "paginate.test.ts"));
+      meta.oracleFiles = [...meta.oracleFiles, "package.json", "test/paginate.test.ts"];
+      meta.visibleTests = ["test/paginate.test.ts"];
     }
     writeFileSync(join(dir, "meta.json"), JSON.stringify(meta, null, 2) + "\n");
   }
@@ -428,8 +430,8 @@ fs.writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\\n");`);
   it("records a check that hits the at-stop cap as unmeasured, not red", () => {
     const repo = fixtureRepo();
     const root = corpus();
-    const pkg = join(root, TASK_B, "repo", "package.json");
-    writeFileSync(pkg, JSON.stringify({ private: true, scripts: { test: "sleep 20" } }, null, 2) + "\n");
+    writeFileSync(join(root, TASK_B, "repo", "test", "paginate.test.ts"),
+      'import { test } from "node:test";\ntest("slow", async () => { await new Promise((resolve) => setTimeout(resolve, 20_000)); });\n');
     writeManifest(root);
     const { bin } = fakeBin(root);
     const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root, AT_STOP_CAP_S: "1" }, ["pi", TASK_B]);
@@ -449,6 +451,43 @@ fs.writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\\n");`);
     expect(env).not.toContain("test-key");
     expect(env).not.toContain("s3cret");
     expect(env).not.toContain("GATE_D_");
+    // The toolchain is named explicitly, never taken from the candidate-controlled node_modules link.
+    expect(env).toContain(`AT_STOP_TOOLCHAIN=${realpathSync(repo)}/node_modules\n`);
+  });
+
+  it("fails a row on gate R3-io when a candidate module reaches the file system", () => {
+    const repo = fixtureRepo();
+    const root = corpus();
+    // A correct sum that also reads files: check.sh alone would pass it.
+    const { bin } = fakeBin(root, `if (task === ${JSON.stringify(TASK_A)}) fs.writeFileSync(path.join(cwd, "src", "sum.ts"),
+  'import { readdirSync } from "node:fs";\\nexport const seen = readdirSync(".").length;\\nexport function sum(xs: number[]): number { return xs.reduce((a, x) => a + x, 0); }\\n');`);
+    const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", TASK_A]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(rows(out)[0]).toMatchObject({ task: TASK_A, pass: false, exitClass: "R3-io" });
+  });
+
+  it("records an io gate that cannot run as a runner failure, not a model failure", () => {
+    const repo = fixtureRepo();
+    writeFileSync(join(repo, "gate-d", "io-gate.mjs"), "throw new Error('broken gate');\n");
+    const root = corpus();
+    const { bin } = fakeBin(root);
+    const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", TASK_A]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(rows(out)[0]).toMatchObject({ task: TASK_A, pass: false, exitClass: "R3-io-error" });
+  });
+
+  it("grades external tasks with code generation from strings disabled", () => {
+    const repo = fixtureRepo();
+    const root = corpus();
+    // The static gate cannot see a Function constructor reached through a property chain; node's
+    // --disallow-code-generation-from-strings must make the oracle fail instead.
+    const { bin } = fakeBin(root, `if (task === ${JSON.stringify(TASK_A)}) fs.writeFileSync(path.join(cwd, "src", "sum.ts"),
+  'const make = (() => 0).constructor as (body: string) => () => number;\\nexport function sum(xs: number[]): number { return xs.reduce((a, x) => a + x, make("return 0")()); }\\n');`);
+    const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", TASK_A]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(rows(out)[0]).toMatchObject({ task: TASK_A, pass: false });
+    // tsc accepts it (G3) and the oracle throws at the Function call (G4), not the static gate.
+    expect(rows(out)[0]!.exitClass).toBe("G4-oracle");
   });
 
   it("refuses a meta.json that is a FIFO without blocking", () => {
@@ -584,6 +623,16 @@ describe("vendored at-stop.sh provenance (INFER-521)", () => {
     expect(bodyStart).toBeGreaterThan(0);
     const original = [lines[0], ...lines.slice(bodyStart).filter((l) => !l.endsWith("# INFER-521-local"))].join("\n");
     expect(createHash("sha256").update(original).digest("hex")).toBe(recorded);
+  });
+});
+
+describe("vendored io-gate.mjs provenance (INFER-521)", () => {
+  it("is byte-identical to the corpus original recorded in CORPUS.md", () => {
+    const doc = readFileSync(join(REAL_ROOT, "gate-d", "CORPUS.md"), "utf8");
+    const recorded = /`gate-d-r3\/io-gate\.mjs`, sha256 `([0-9a-f]{64})`/.exec(doc)?.[1];
+    expect(recorded).toBeDefined();
+    const actual = createHash("sha256").update(readFileSync(join(REAL_ROOT, "gate-d", "io-gate.mjs"))).digest("hex");
+    expect(actual).toBe(recorded);
   });
 });
 
