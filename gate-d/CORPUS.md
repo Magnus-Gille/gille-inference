@@ -80,7 +80,8 @@ Contract:
 - **Identity.** Rows take `corpusRevision`, `holdout`, `family`, `split` and `trap` from the
   digest-verified `meta.json`, and record the manifest digest as `taskRevision`. The external
   revision may not reuse a committed one (`gate-d-r1`, `gate-d-r2`). Resume and summaries key on
-  revision and digest, so a regenerated task never counts toward its predecessor.
+  revision, digest and effective holdout status, so a regenerated task never counts toward its
+  predecessor and a validation row never counts toward a sealed run of the same bytes.
 - **Verification fields.** External rows always carry `atStopTypecheck`, `atStopVisibleTests` and
   `detectableFailureAtStop` from `at-stop.sh` (run after the arm, before `check.sh` stages the hidden
   oracle), and the pi-transcript fields `verificationClass`, `typecheckRuns`, `testRuns`,
@@ -89,8 +90,15 @@ Contract:
   `null` means not measured for the at-stop fields (a failed, timed-out or off-schema script, which
   also prints a warning). For the transcript fields use `verificationSchema`: it names the classifier
   when the fields were measured and is `null` otherwise (non-pi arms), because some of those fields
-  are legitimately `null` when measured (no check ran, no edit). at-stop runs on a throwaway copy of
-  the work dir, so neither metric can change pass/fail. r1/r2 rows are unchanged.
+  are legitimately `null` when measured (no check ran, no edit). A check that hits `AT_STOP_CAP_S`
+  is unmeasured (`null`), not red. r1/r2 rows are unchanged.
+- **Executing candidate code.** at-stop runs only after a non-executing scope check (the same write
+  allowlist as `check.sh`'s G0-files gate) passes, so a workspace grading will reject, such as a
+  rewritten `package.json` test script, is never executed for it. It then runs on a throwaway copy
+  of the work dir with a minimal environment (`PATH`, a throwaway `HOME`/`TMPDIR`, no inherited
+  tokens), so neither metric can change pass/fail. Residual risk, unchanged from `check.sh`'s own
+  oracle run: candidate code runs as the operator's OS user and the `node_modules` link points at
+  the checkout's writable dependencies. Only a real sandbox removes that.
 - **Code-loop runner.** `scripts/gate-d-code-loop.py --tasks-root` applies the same enumeration,
   sealing, digest and identity rules (manifest read once, held in memory) and records the at-stop
   fields, but no transcript fields. It grades inside the checkout as before, since its arm runs

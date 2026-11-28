@@ -410,6 +410,62 @@ fs.writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\\n");`);
     expect(rows(out)[0]).toMatchObject({ pass: true, exitClass: "pass", atStopTypecheck: "passed" });
   });
 
+  it("never executes a workspace whose changes grading will reject (scope check first)", () => {
+    const repo = fixtureRepo();
+    const root = corpus();
+    const marker = join(tmp("gd-ext-marker-"), "ran");
+    // The arm rewrites task B's package.json test script, which is outside its edit targets.
+    const { bin } = fakeBin(root, `if (task === ${JSON.stringify(TASK_B)}) fs.writeFileSync("package.json",
+      JSON.stringify({ private: true, scripts: { test: "touch ${marker}" } }));`);
+    const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", TASK_B]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(existsSync(marker)).toBe(false);
+    const [row] = rows(out);
+    expect(row).toMatchObject({ pass: false, exitClass: "G0-files", atStopTypecheck: null, atStopVisibleTests: null });
+    expect(res.stderr).toContain("out-of-scope");
+  });
+
+  it("records a check that hits the at-stop cap as unmeasured, not red", () => {
+    const repo = fixtureRepo();
+    const root = corpus();
+    const pkg = join(root, TASK_B, "repo", "package.json");
+    writeFileSync(pkg, JSON.stringify({ private: true, scripts: { test: "sleep 20" } }, null, 2) + "\n");
+    writeManifest(root);
+    const { bin } = fakeBin(root);
+    const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root, AT_STOP_CAP_S: "1" }, ["pi", TASK_B]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(rows(out)[0]).toMatchObject({ atStopTypecheck: null, detectableFailureAtStop: null, exitClass: "G2-no-edit" });
+  });
+
+  it("runs at-stop.sh without the runner's credentials", () => {
+    const repo = fixtureRepo();
+    const dump = join(tmp("gd-ext-env-"), "env.txt");
+    writeFileSync(join(repo, "gate-d", "at-stop.sh"), `#!/usr/bin/env bash\nenv > ${dump}\necho '{}'\n`);
+    const root = corpus();
+    const { bin } = fakeBin(root);
+    const { res } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root, SECRET_TOKEN: "s3cret" }, ["pi", TASK_A]);
+    expect(res.status, res.stderr).toBe(0);
+    const env = readFileSync(dump, "utf8");
+    expect(env).not.toContain("test-key");
+    expect(env).not.toContain("s3cret");
+    expect(env).not.toContain("GATE_D_");
+  });
+
+  it("refuses a meta.json that is a FIFO without blocking", () => {
+    const repo = fixtureRepo();
+    const root = corpus();
+    rmSync(join(root, TASK_B, "meta.json"));
+    expect(spawnSync("mkfifo", [join(root, TASK_B, "meta.json")]).status).toBe(0);
+    const { bin, log } = fakeBin(root);
+    let { res } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["--list-tasks"]);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toContain("not a regular file");
+    ({ res } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", "all"]));
+    expect(res.status).toBe(3);
+    expect(res.stderr).toContain("not a regular file");
+    expect(calls(log)).toEqual([]);
+  });
+
   it("aborts without a row when the task changes during grading", () => {
     const repo = fixtureRepo();
     const root = corpus();
@@ -519,13 +575,14 @@ fs.writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\\n");`);
 });
 
 describe("vendored at-stop.sh provenance (INFER-521)", () => {
-  it("still matches the sha256 of the corpus original recorded in its header", () => {
+  it("is the corpus original plus only lines marked INFER-521-local", () => {
     const text = readFileSync(join(REAL_ROOT, "gate-d", "at-stop.sh"), "utf8");
     const lines = text.split("\n");
     const recorded = /sha256 of the source\n# file ([0-9a-f]{64})/.exec(text)?.[1];
     expect(recorded).toMatch(/^[0-9a-f]{64}$/);
-    // The original is the shebang plus everything after the four-line provenance header.
-    const original = [lines[0], ...lines.slice(5)].join("\n");
+    const bodyStart = lines.findIndex((l) => l.startsWith("# Grader-derived"));
+    expect(bodyStart).toBeGreaterThan(0);
+    const original = [lines[0], ...lines.slice(bodyStart).filter((l) => !l.endsWith("# INFER-521-local"))].join("\n");
     expect(createHash("sha256").update(original).digest("hex")).toBe(recorded);
   });
 });
@@ -596,6 +653,26 @@ describe("gate-d/sweep.sh external task root (INFER-521)", { timeout: 240_000 },
     expect(calls(log).map((c) => c.task)).toEqual([TASK_A, TASK_B, TASK_B]);
     expect(r.res.stdout).toContain("gate-d-r3 pi/m [prompt=none]: 1/2 pass");
     expect(rows(env.GATE_D_OUT)).toHaveLength(3);
+  });
+
+  it("never counts validation rows toward a sealed run of the same task bytes", () => {
+    const repo = fixtureRepo();
+    const root = corpus();
+    const { bin, log } = fakeBin(root);
+    const work = tmp("gd-ext-sweep-");
+    const env = {
+      GATE_D_TASKS_ROOT: root, ARMS: "pi", SEEDS: "1",
+      GATE_D_OUT: join(work, "rows.jsonl"), GATE_D_LOG: join(work, "sweep.log"),
+    };
+    let r = runGateD(repo, bin, env, [], "sweep.sh");
+    expect(r.res.status, r.res.stderr).toBe(0);
+    expect(calls(log)).toHaveLength(2);
+    // Same task bytes and digests, now under a sealed manifest.
+    writeManifest(root, "gate-d-r3", "sealed");
+    r = runGateD(repo, bin, { ...env, GATE_D_INCLUDE_HOLDOUT: "1" }, [], "sweep.sh");
+    expect(r.res.status, r.res.stderr).toBe(0);
+    expect(calls(log)).toHaveLength(4);
+    expect(rows(env.GATE_D_OUT).map((x) => x.holdout)).toEqual([false, false, true, true]);
   });
 
   it("aborts without a row when the manifest changes after the sweep pinned it", () => {

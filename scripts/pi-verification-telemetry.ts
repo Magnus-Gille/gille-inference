@@ -1,6 +1,9 @@
 /**
- * Pinned port of code-battle gate-d-r3/telemetry/verification-telemetry.ts (CBATTLE-14, commit
- * caae280), INFER-521. The logic below is unchanged; only this header and the CLI block differ.
+ * Port of code-battle gate-d-r3/telemetry/verification-telemetry.ts (CBATTLE-14, commit caae280),
+ * INFER-521. Two deliberate deviations from the original, from the Codex review of INFER-521:
+ * check patterns match the invoked executable rather than any occurrence of a tool name, and a
+ * command that both checks and edits marks its checks ambiguous and its edit as later. The CLI
+ * block is dropped. Offer both changes back to CBATTLE-14 so the two classifiers converge.
  * gate-d/run.sh feeds pi's NDJSON stream to it through scripts/pi-benchmark-telemetry.ts, so the
  * runner never executes code from an external task root. Re-port it when the corpus changes it, and
  * keep the schema string so rows say which classifier produced them.
@@ -73,18 +76,38 @@ interface CheckRecord {
 }
 
 const SEGMENT_SPLIT = /\s*(?:&&|\|\||;|\n)\s*/;
+// Patterns match the INVOKED executable at the start of a normalized segment (INFER-521 Codex
+// review): a tool name merely appearing in a segment (`command -v tsc`, `cat src/tsc.ts`,
+// `echo npm test`) is not a check run.
 const TYPECHECK = [
-  /(^|[\s/])tsc(\s|$)/, // tsc, npx tsc, ./node_modules/.bin/tsc
-  /\bnpm\s+run\s+(typecheck|type-check|tsc|build)\b/,
-  /\bpnpm\s+(run\s+)?(typecheck|tsc)\b/,
+  /^tsc(\s|$)/, // tsc, npx tsc, ./node_modules/.bin/tsc (prefixes stripped by normalizeSegment)
+  /^npm\s+run\s+(typecheck|type-check|tsc|build)\b/,
+  /^(pnpm|yarn)\s+(run\s+)?(typecheck|type-check|tsc)\b/,
 ];
 const TESTS = [
-  /\bnpm\s+(run\s+)?test\b/, /\bnpm\s+t\b/, /\bpnpm\s+(run\s+)?test\b/, /\byarn\s+test\b/,
-  /\btsx\s+--test\b/, /\bnode\s+(--import\s+tsx\s+)?--test\b/,
-  /\btsx\s+\S*test\S*\.ts\b/, // npx tsx test/foo.test.ts — running a test file directly
-  /\b(vitest|jest)\b/,
+  /^npm\s+(run\s+)?test\b/, /^npm\s+t(\s|$)/, /^(pnpm|yarn)\s+(run\s+)?test\b/,
+  /^tsx\s+--test\b/, /^node\s+(--import[\s=]+tsx\s+)?--test\b/,
+  /^tsx\s+\S*test\S*\.ts\b/, // npx tsx test/foo.test.ts — running a test file directly
+  /^(vitest|jest)(\s|$)/,
 ];
 const MUTATING_BASH = [/\bsed\s+-i/, /(^|[^>2&])>{1,2}\s*[^&\s]/, /\btee\b/, /\b(mv|cp|rm)\s/, /\bperl\s+-p?i/, /\bpatch\b/];
+// Checkers and runtimes whose own redirects (`npm test > out.log`) are not source edits.
+const CHECK_TOOL = /^(npm|npx|pnpm|yarn|tsc|node|tsx|vitest|jest)(\s|$)/;
+
+/** Strip env assignments, `env`/`time`/`timeout N`, `npx` flags and a directory prefix. */
+function normalizeSegment(seg: string): string {
+  let s = seg.trim();
+  for (let previous = ""; previous !== s; ) {
+    previous = s;
+    s = s
+      .replace(/^[A-Za-z_][A-Za-z0-9_]*=\S*\s+/, "")
+      .replace(/^(env|time|command\s+--)\s+/, "")
+      .replace(/^timeout\s+\S+\s+/, "")
+      .replace(/^npx\s+((--no-install|--yes|-y)\s+)*/, "")
+      .replace(/^\S*\/(?=[A-Za-z0-9_.-]+(\s|$))/, ""); // ./node_modules/.bin/tsc -> tsc
+  }
+  return s;
+}
 
 function object(v: unknown): JsonObject | null {
   return v !== null && typeof v === "object" && !Array.isArray(v) ? (v as JsonObject) : null;
@@ -95,18 +118,21 @@ export function classifyCommand(command: string): { kinds: CheckKind[]; attribut
   const segments = command.trim().split(SEGMENT_SPLIT).filter((s) => s !== "");
   const kinds = new Set<CheckKind>();
   let checkSegments = 0;
-  for (const seg of segments) {
-    if (/^\s*(echo|printf|cat|grep|rg|ls)\b/.test(seg)) continue; // `echo npm test` is not a test run
+  let mutates = false;
+  for (const raw of segments) {
+    const seg = normalizeSegment(raw);
     let hit = false;
     if (TYPECHECK.some((re) => re.test(seg))) { kinds.add("typecheck"); hit = true; }
     if (TESTS.some((re) => re.test(seg))) { kinds.add("tests"); hit = true; }
     if (hit) checkSegments++;
+    // Mutation is judged per segment, so `npm test && sed -i ...` still counts as an edit, while a
+    // check's own log plumbing (`npm test 2>&1 | tee log`) does not, as in the original.
+    if (!CHECK_TOOL.test(seg) && MUTATING_BASH.some((re) => re.test(seg))) mutates = true;
   }
   // A pipe hides the check's exit status (`npm test | tail` exits with tail's status).
   const piped = /(^|[^|])\|([^|]|$)/.test(command);
   const otherSeparators = /;|\|\||\n/.test(command.trim());
   const attribution: Attribution = piped || otherSeparators ? "none" : segments.length > 1 || checkSegments > 1 ? "and-chain" : "exact";
-  const mutates = MUTATING_BASH.some((re) => re.test(command)) && !/^\s*(npm|npx|tsc|node|tsx)\b/.test(command);
   return { kinds: [...kinds], attribution, mutates };
 }
 
@@ -156,18 +182,23 @@ export function createVerificationTelemetry() {
           const command = object(ev["args"])?.["command"];
           if (typeof command === "string") {
             const c = classifyCommand(command);
-            if (c.kinds.length > 0) pending.set(id, { kinds: c.kinds, seq, attribution: c.attribution });
-            else if (c.mutates) pendingMutations.set(id, true);
+            // A command that both checks and edits (`npm test && sed -i ...`) has no reliable
+            // check-vs-edit order: its checks count as ambiguous and its edit as the later event.
+            if (c.kinds.length > 0) {
+              pending.set(id, { kinds: c.kinds, seq, attribution: c.mutates ? "none" : c.attribution });
+            }
+            if (c.mutates) pendingMutations.set(id, true);
           }
         }
       }
       if (type === "tool_execution_end" && id !== null) {
         if (pendingEdits.delete(id) && ev["isError"] === false) noteEdit();
-        if (pendingMutations.delete(id) && ev["isError"] === false) {
+        const p = pending.get(id);
+        if (pendingMutations.delete(id) && (ev["isError"] === false || p !== undefined)) {
+          // A mixed check+edit command that exited non-zero may still have edited: assume it did.
           bashMutations++;
           noteEdit();
         }
-        const p = pending.get(id);
         if (p !== undefined) {
           pending.delete(id);
           const raw = outcomeOf(ev);

@@ -215,6 +215,17 @@ def load_external_manifest(root: Path, expect_sha256: str | None = None) -> dict
 
 def _read_meta(task_dir: Path) -> dict[str, Any]:
     path = task_dir / "meta.json"
+    # Vet types before opening: a FIFO would block enumeration forever and a symlink would be
+    # followed before the digest check could refuse it (Codex review of INFER-521).
+    try:
+        dir_mode = os.lstat(task_dir).st_mode
+        meta_mode = os.lstat(path).st_mode
+    except OSError as error:
+        raise ExternalCorpusError(f"cannot read {path}: {error}") from error
+    if not stat.S_ISDIR(dir_mode):
+        raise ExternalCorpusError(f"{task_dir} is not a plain directory")
+    if not stat.S_ISREG(meta_mode):
+        raise ExternalCorpusError(f"{path} is not a regular file")
     try:
         meta = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -288,6 +299,48 @@ def verify_external_task(root: Path, manifest: dict[str, Any], task_id: str,
     return identity
 
 
+HARNESS_FILES = {".arm.log", ".arm.stderr.log", ".arm-telemetry.json", ".check.log"}
+
+
+def _listing(base: Path) -> dict[str, Path]:
+    out: dict[str, Path] = {}
+    for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+        rel_dir = Path(dirpath).relative_to(base)
+        if rel_dir == Path("."):
+            dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules")]
+        for name in filenames + [d for d in dirnames if (Path(dirpath) / d).is_symlink()]:
+            rel = (rel_dir / name).as_posix()
+            out[rel] = Path(dirpath) / name
+    return out
+
+
+def scope_violations(task_dir: Path, work_dir: Path) -> list[str]:
+    """Files changed outside the task's declared edit targets, without executing anything.
+
+    The same write-allowlist rule as check.sh's G0-files gate. Runners call it before at-stop.sh
+    runs candidate code (npm test), so an out-of-scope change such as a rewritten package.json test
+    script is never executed for a run that grading will reject anyway (Codex review, INFER-521).
+    """
+    meta = _read_meta(task_dir)
+    allowed = set(meta.get("edit") or [])
+    if meta.get("hiddenOracle") and meta.get("oracleCmd"):
+        allowed.add(meta["oracleCmd"])
+    seed, work = _listing(task_dir / "repo"), _listing(work_dir)
+    bad = []
+    for rel in sorted(set(seed) | set(work)):
+        if rel in HARNESS_FILES or rel in allowed:
+            continue
+        a, b = seed.get(rel), work.get(rel)
+        if a is None or b is None:
+            bad.append(rel)
+        elif a.is_symlink() or b.is_symlink():
+            if not (a.is_symlink() and b.is_symlink() and os.readlink(a) == os.readlink(b)):
+                bad.append(rel)
+        elif a.read_bytes() != b.read_bytes():
+            bad.append(rel)
+    return bad
+
+
 def manifest_sha256(root: Path) -> str:
     return "sha256:" + hashlib.sha256((root / EXTERNAL_MANIFEST).read_bytes()).hexdigest()
 
@@ -319,6 +372,9 @@ def external_main(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
                 "split": manifest.get("split"),
                 "tasks": tasks,
                 "taskRevisions": {t["id"]: t["digest"] for t in manifest["tasks"] if t["id"] in tasks},
+                # Effective sealing per task: the same bytes can be validation in one manifest and
+                # sealed in another, so resume must match this too, not only the digest.
+                "taskHoldout": {t: _is_holdout(manifest, _read_meta(root / t)) for t in tasks},
             }, sort_keys=True))
     elif args.command == "contains":
         if args.task_id is None:
@@ -354,11 +410,12 @@ def describe(include_holdout: bool) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("describe", "revision", "tasks", "contains", "task-metadata",
-                                            "verify-task", "root", "manifest-sha256"))
+                                            "verify-task", "root", "manifest-sha256", "scope-check"))
     parser.add_argument("task_id", nargs="?")
     parser.add_argument("--include-holdout", action="store_true")
     parser.add_argument("--revision")
     parser.add_argument("--tasks-root", help="external task root with corpus-manifest.json (INFER-521)")
+    parser.add_argument("--work", help="scope-check: the work directory to compare with the task seed")
     parser.add_argument("--expect-manifest-sha", help="refuse unless corpus-manifest.json hashes to this sha256:<hex>")
     args = parser.parse_args()
     if args.tasks_root is not None:
@@ -368,6 +425,18 @@ def main() -> int:
             return external_main(args, parser)
         except (ValueError, OSError) as error:
             parser.exit(2, f"error: {error}\n")
+    if args.command == "scope-check":
+        # scope-check <TASKDIR> --work <WORKDIR>: exit 0 when only declared targets changed.
+        if args.task_id is None or args.work is None:
+            parser.error("scope-check requires a task directory and --work")
+        try:
+            bad = scope_violations(Path(args.task_id), Path(args.work))
+        except (ValueError, OSError) as error:
+            parser.exit(2, f"error: {error}\n")
+        if bad:
+            print(f"{len(bad)} file(s) changed outside the declared edit targets", file=sys.stderr)
+            return 1
+        return 0
     if args.command in ("verify-task", "root", "manifest-sha256"):
         parser.error(f"{args.command} requires --tasks-root")
     try:

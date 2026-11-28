@@ -452,19 +452,30 @@ PY
   # pass/fail. at-stop.sh is this repository's pinned copy of the corpus script (see its header).
   # It runs on a throwaway copy of the work dir, so files a candidate's `npm test` leaves behind
   # cannot reach check.sh: "never changes pass/fail" holds structurally, not by convention.
-  local AT_STOP_JSON="{}" AT_STOP_W=""
+  # Order (Codex review of INFER-521): first the non-executing scope check, the same write
+  # allowlist as check.sh's G0-files gate. A workspace that grading will reject anyway (for example
+  # a rewritten package.json test script) is never executed; its at-stop fields stay null. Then the
+  # copy runs with a minimal environment: no inherited credentials or tokens, and a throwaway HOME.
+  local AT_STOP_JSON="{}" AT_STOP_W="" AT_STOP_HOME="" at_stop_skip=""
   if [ "$EXTERNAL" = 1 ]; then
-    if [ -f "$ROOT/at-stop.sh" ] && AT_STOP_W="$(mktemp -d "$WORKROOT/${id}-atstop-XXXX")" \
-       && cp -R "$W/." "$AT_STOP_W/"; then
-      AT_STOP_JSON="$( cd "$AT_STOP_W" \
-          && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE $GD_RUNNER_VARS \
-          && export GIT_CEILING_DIRECTORIES="$WORKROOT" \
-          && "$TIMEOUT_BIN" "${AT_STOP_WALL_S:-300}" bash "$ROOT/at-stop.sh" "$T" "$AT_STOP_W" </dev/null 2>/dev/null )" \
+    if ! python3 "$CORPUS_TOOL" scope-check "$T" --work "$W" 2>/dev/null; then
+      at_stop_skip="out-of-scope changes (grading will reject them)"
+    elif [ ! -f "$ROOT/at-stop.sh" ]; then
+      at_stop_skip="gate-d/at-stop.sh is missing"
+    elif AT_STOP_W="$(mktemp -d "$WORKROOT/${id}-atstop-XXXX")" \
+         && AT_STOP_HOME="$(mktemp -d "$WORKROOT/${id}-atstop-home-XXXX")" \
+         && cp -R "$W/." "$AT_STOP_W/"; then
+      AT_STOP_JSON="$( cd "$AT_STOP_W" && env -i PATH="$PATH" HOME="$AT_STOP_HOME" TMPDIR="$AT_STOP_HOME" \
+          LANG="${LANG:-C}" GIT_CEILING_DIRECTORIES="$WORKROOT" AT_STOP_CAP_S="${AT_STOP_CAP_S:-120}" \
+          "$TIMEOUT_BIN" "${AT_STOP_WALL_S:-300}" bash "$ROOT/at-stop.sh" "$T" "$AT_STOP_W" </dev/null 2>/dev/null )" \
         || AT_STOP_JSON="{}"
     fi
     [ -n "$AT_STOP_W" ] && rm -rf "$AT_STOP_W"
+    [ -n "$AT_STOP_HOME" ] && rm -rf "$AT_STOP_HOME"
     [ -n "$AT_STOP_JSON" ] || AT_STOP_JSON="{}"
-    [ "$AT_STOP_JSON" = "{}" ] && echo "  [warn] $id: at-stop.sh produced no result; at-stop fields are null for this row" >&2
+    if [ "$AT_STOP_JSON" = "{}" ]; then
+      echo "  [warn] $id: at-stop fields are null for this row (${at_stop_skip:-at-stop.sh failed, timed out or printed nothing})" >&2
+    fi
   fi
   local pass="false" exitclass="$status"
   if bash "$ROOT/check.sh" "$T" "$W" >"$W/.check.log" 2>&1; then pass="true"; exitclass="pass"

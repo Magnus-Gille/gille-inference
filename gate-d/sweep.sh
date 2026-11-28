@@ -52,8 +52,10 @@ CORPUS_REVISION="$(gd_corpus revision)" || exit 3
 TASKS="$(gd_corpus tasks)" || exit 3
 if [ "$EXTERNAL" = 1 ]; then
   GATE_D_EXPECT_MANIFEST_SHA="$MANIFEST_SHA"; export GATE_D_EXPECT_MANIFEST_SHA
-  TASK_REVISIONS="$(gd_corpus describe \
-    | python3 -c 'import json,sys;print(json.dumps(json.load(sys.stdin)["taskRevisions"]))')" || exit 3
+  # id -> [digest, holdout]: the same task bytes can be validation in one manifest and sealed in
+  # another, so a validation row must never count as (or toward) a sealed result.
+  TASK_REVISIONS="$(gd_corpus describe | python3 -c 'import json,sys
+d=json.load(sys.stdin);print(json.dumps({t:[v,d["taskHoldout"][t]] for t,v in d["taskRevisions"].items()}))')" || exit 3
 else
   unset GATE_D_EXPECT_MANIFEST_SHA
 fi
@@ -93,7 +95,7 @@ for l in open(os.environ['GD_OUT']):
     if not isinstance(r,dict): continue
     rowrev=r.get('corpusRevision','gate-d-r1')
     variant=(r.get('promptVariant','none'), r.get('promptSha256'))
-    if digest is not None and r.get('taskRevision')!=digest: continue
+    if digest is not None and [r.get('taskRevision'),r.get('holdout')]!=digest: continue
     if rowrev==rev and r.get('arm')==a and r.get('model')==m and r.get('task')==t and variant==want: n+=1
 print(n)"
 }
@@ -132,7 +134,7 @@ for l in open(os.environ['GD_OUT']):
     try: r=json.loads(l)
     except: continue
     if r.get('corpusRevision','gate-d-r1') != rev or r.get('task') not in allowed: continue
-    if r.get('task') in digests and r.get('taskRevision') != digests[r.get('task')]: continue
+    if r.get('task') in digests and [r.get('taskRevision'),r.get('holdout')] != digests[r.get('task')]: continue
     digest=r.get('promptSha256') or ''
     k=(r.get('arm') or '',r.get('model') or '',r.get('promptVariant','none') or 'none',digest)
     c[k]+=1; p[k]+= 1 if r.get('pass') else 0

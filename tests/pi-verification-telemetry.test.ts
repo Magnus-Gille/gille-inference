@@ -102,3 +102,38 @@ test("summary is content-blind", () => {
   const s = run(start("1", "edit"), end("1", "edit", true), start("2", "bash", "npm test -- --grep SECRET_TOKEN"), end("2", "bash", true));
   assert.ok(!JSON.stringify(s).includes("SECRET"));
 });
+
+// INFER-521 Codex review: deviations from the code-battle original, pinned here.
+test("classifier: only an invoked check counts", () => {
+  assert.deepEqual(classifyCommand("command -v tsc").kinds, []);
+  assert.deepEqual(classifyCommand("which vitest").kinds, []);
+  assert.deepEqual(classifyCommand("grep -r 'npm test' README.md").kinds, []);
+  assert.deepEqual(classifyCommand("./node_modules/.bin/tsc --noEmit").kinds, ["typecheck"]);
+  assert.deepEqual(classifyCommand("CI=1 npm test").kinds, ["tests"]);
+  assert.deepEqual(classifyCommand("timeout 60 npx --no-install tsc -p .").kinds, ["typecheck"]);
+  assert.deepEqual(classifyCommand("cd /w && npx tsc --noEmit").kinds, ["typecheck"]);
+  assert.equal(classifyCommand("npm test && sed -i 's/a/b/' src/x.ts").mutates, true);
+  assert.equal(classifyCommand("npm test > out.log").mutates, false);
+});
+
+test("a command that checks and then edits is not a check after the last edit", () => {
+  const s = run(
+    turn, start("e1", "edit"), end("e1", "edit", true),
+    start("b1", "bash", "npm test && sed -i 's/a/b/' src/x.ts"), end("b1", "bash", true),
+  );
+  assert.equal(s.edits, 2);
+  assert.equal(s.testsAfterLastEdit, false);
+  assert.equal(s.verificationClass, "checked-before-last-edit-only");
+  assert.equal(s.ambiguousCheckOutcomes, 1);
+});
+
+test("`command -v tsc` after an edit is not verification", () => {
+  const s = run(turn, start("e1", "edit"), end("e1", "edit", true), start("b1", "bash", "command -v tsc"), end("b1", "bash", true));
+  assert.equal(s.verificationClass, "never-checked");
+  assert.equal(s.typecheckRuns, 0);
+});
+
+test("a check's own log plumbing is not an edit", () => {
+  assert.equal(classifyCommand("npm test 2>&1 | tee test.log").mutates, false);
+  assert.equal(classifyCommand("echo x > src/a.ts").mutates, true);
+});
