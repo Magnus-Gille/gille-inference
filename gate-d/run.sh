@@ -4,6 +4,15 @@
 #        run.sh --print-workroot        (debug: print WORKROOT and exit — no box/model needed)
 #        run.sh --list-tasks            (default r1; set GATE_D_INCLUDE_HOLDOUT=1 for r2)
 #
+# External task root (INFER-521): GATE_D_TASKS_ROOT=<dir> runs the tasks listed in
+# <dir>/corpus-manifest.json (code-battle's gate-d-r3 generator writes it) instead of gate-d/tasks.
+# The root must live outside this checkout. Each task directory is digest-checked against the
+# manifest before the arm, after the arm and after grading; any mismatch aborts without a row
+# (exit 9). Sealed tasks (holdout) need GATE_D_INCLUDE_HOLDOUT=1, as r2 does, and are refused for
+# local arms until an OS boundary hides the task root from them (see CORPUS.md). Rows take
+# corpusRevision, holdout, family, split and trap from the verified meta.json and record the
+# manifest digest as taskRevision, and gain the at-stop and pi verification-telemetry fields.
+#
 # Per run: copy the task seed → an isolated work dir → invoke the arm (with a wall-clock cap)
 # → check.sh grades deterministically → append a JSONL row to data/gate-d-results.jsonl.
 #
@@ -55,13 +64,64 @@ fi
 mkdir -p "$WORKROOT"
 
 CORPUS_TOOL="$ROOT/gate_d_corpus.py"
-if [ "${1:-}" = "--list-tasks" ]; then python3 "$CORPUS_TOOL" tasks; exit $?; fi
-CORPUS_REVISION="$(python3 "$CORPUS_TOOL" revision)" || exit 3
-TASK_IDS="$(python3 "$CORPUS_TOOL" tasks)" || exit 3
+# External task root (INFER-521). The corpus tool vets it (exists, is a directory, does not overlap
+# this checkout) and prints its physical path; every later call passes that path explicitly.
+EXTERNAL=0; TASKS_DIR="$ROOT/tasks"; MANIFEST_SHA=""
+# The corpus tool, aimed at the external root and pinned to one manifest digest when there is one.
+# A plain function rather than an argument array: an empty "${arr[@]}" is an unbound-variable error
+# under `set -u` in bash < 4.4, which is still macOS's /bin/bash.
+gd_corpus(){
+  if [ "$EXTERNAL" != 1 ]; then python3 "$CORPUS_TOOL" "$@"
+  elif [ -n "$MANIFEST_SHA" ]; then python3 "$CORPUS_TOOL" "$@" --tasks-root "$TASKS_DIR" --expect-manifest-sha "$MANIFEST_SHA"
+  else python3 "$CORPUS_TOOL" "$@" --tasks-root "$TASKS_DIR"; fi
+}
+if [ -n "${GATE_D_TASKS_ROOT+set}" ]; then
+  TASKS_DIR="$(python3 "$CORPUS_TOOL" root --tasks-root "$GATE_D_TASKS_ROOT")" || exit 3
+  EXTERNAL=1
+  # Work dirs stay outside the task root too (#172): an arm must not be able to discover the
+  # oracle/ and solution/ siblings of its seed by walking up. Neither may contain the other.
+  if ! python3 - "$WORKROOT" "$TASKS_DIR" <<'PY'
+import os, sys
+def inside(path, root):
+    target = os.stat(root)
+    while not os.path.exists(path):
+        path = os.path.dirname(path)
+    while True:
+        st = os.stat(path)
+        if (st.st_dev, st.st_ino) == (target.st_dev, target.st_ino):
+            return True
+        parent = os.path.dirname(path)
+        if parent == path:
+            return False
+        path = parent
+work, tasks = sys.argv[1], sys.argv[2]
+sys.exit(1 if inside(work, tasks) or inside(tasks, work) else 0)
+PY
+  then
+    echo "error: WORKROOT ($WORKROOT) and the external task root ($TASKS_DIR) overlap — refusing to run (#172)." >&2
+    exit 3
+  fi
+  # Pin the manifest once: every later corpus-tool call, including the post-arm and post-grading
+  # digest checks, parses exactly these bytes or fails. Without the pin, an arm could rewrite a
+  # task AND its manifest digest and still get a row. A sweep passes the digest it enumerated, so a
+  # manifest replaced mid-sweep cannot mix revisions either.
+  MANIFEST_SHA="${GATE_D_EXPECT_MANIFEST_SHA:-}"
+  [ -n "$MANIFEST_SHA" ] || MANIFEST_SHA="$(gd_corpus manifest-sha256)" || exit 3
+  if ! gd_corpus revision >/dev/null; then
+    echo "error: $TASKS_DIR/corpus-manifest.json changed since the sweep started; refusing to run" >&2
+    exit 3
+  fi
+fi
+if [ "${1:-}" = "--list-tasks" ]; then gd_corpus tasks; exit $?; fi
+CORPUS_REVISION="$(gd_corpus revision)" || exit 3
+TASK_IDS="$(gd_corpus tasks)" || { rc=$?; [ "$rc" = 9 ] || rc=3; exit "$rc"; }  # 9: a task failed its digest check
 
 ARM="${1:?usage: run.sh <pi|aider|opencode|qwen-code> <task-id|all>}"
 SEL="${2:?usage: run.sh <pi|aider|opencode|qwen-code> <task-id|all>}"
-if [ "$SEL" != "all" ] && ! python3 "$CORPUS_TOOL" contains "$SEL"; then
+if [ "$EXTERNAL" = 1 ]; then
+  # The tool prints why (unknown, or sealed without the opt-in).
+  if [ "$SEL" != "all" ] && ! gd_corpus contains "$SEL"; then exit 3; fi
+elif [ "$SEL" != "all" ] && ! python3 "$CORPUS_TOOL" contains "$SEL"; then
   if [ -f "$ROOT/tasks/$SEL/meta.json" ]; then
     echo "error: task '$SEL' is not in $CORPUS_REVISION; holdouts require GATE_D_INCLUDE_HOLDOUT=1" >&2
   else
@@ -76,6 +136,19 @@ CAP_S="${CAP_S:-600}"
 # Portable wall-clock cap: GNU coreutils ships `timeout` on Linux (the box) and `gtimeout`
 # on macOS via Homebrew. Resolve whichever exists so the same script runs on either host.
 TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
+# check.sh, hardened for external corpora (see gate R3-io below): no code generation from strings
+# and no tsx cache in any node process it starts.
+# No network either: fetch and WebSocket are globals, reachable without an import or a name the
+# R3-io gate bans (Codex review, INFER-521).
+GRADING_NODE_OPTIONS="--disallow-code-generation-from-strings --no-experimental-fetch --no-experimental-websocket"
+run_check(){
+  if [ "$EXTERNAL" = 1 ]; then
+    NODE_OPTIONS="$GRADING_NODE_OPTIONS${NODE_OPTIONS:+ $NODE_OPTIONS}" TSX_DISABLE_CACHE=1 \
+      bash "$ROOT/check.sh" "$1" "$2" >"$2/.check.log" 2>&1
+  else
+    bash "$ROOT/check.sh" "$1" "$2" >"$2/.check.log" 2>&1
+  fi
+}
 [ -n "$TIMEOUT_BIN" ] || { echo "error: need GNU 'timeout' (Linux) or 'gtimeout' (macOS: brew install coreutils) on PATH" >&2; exit 3; }
 OUT="${GATE_D_OUT:-$REPO_ROOT/data/gate-d-results.jsonl}"; mkdir -p "$(dirname "$OUT")"
 # Optional pi-only system-prompt variant (INFER-519). GATE_D_PI_APPEND_SYSTEM names a committed file
@@ -123,13 +196,49 @@ elif gd_git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; the
 fi
 # Prints the porcelain status of the fixtures; returns non-zero if Git cannot produce it.
 fixture_dirty(){ gd_git -C "$REPO_ROOT" status --porcelain -- gate-d/tasks gate-d/src; }
+# The committed tree is the expected seed only for committed tasks; an external seed is the
+# digest-verified directory itself, enumerated like a plain deployment.
+SEED_FROM_GIT="$IN_GIT_CHECKOUT"; [ "$EXTERNAL" = 1 ] && SEED_FROM_GIT=0
 metaget(){ python3 -c "import json;v=json.load(open('$1')).get('$2','');print(str(v).lower() if isinstance(v,bool) else v)"; }
 metalist(){ python3 -c "import json;print(' '.join(json.load(open('$1')).get('$2',[])))"; }
 
+# External tasks: digest-check the task directory against the manifest (INFER-521). This replaces
+# the git-status fixture guard for the external root, which is not a checkout. On success it prints
+# the row identity JSON; on any mismatch, missing file, symlink or sealed task without the opt-in it
+# fails, and the caller aborts without writing a row, exactly as the fixture guard does.
+verify_external(){ gd_corpus verify-task "$1"; }
+# Re-verify after the arm or grading: the task must still match the pinned manifest AND yield the
+# identity recorded before the run, so the row can never describe content other than what ran.
+still_verified(){ local now; now="$(verify_external "$1")" && [ "$now" = "$2" ]; }
+EXTERNAL_HINT="Restore the root from the generator (generate.py --check-manifest shows drift) before re-running."
+
+# Runner configuration never reaches an arm: GATE_D_TASKS_ROOT would name the directory that holds
+# the oracle/ and solution/ siblings of the seed.
+GD_RUNNER_VARS="$(compgen -e | grep '^GATE_D_' | tr '\n' ' ')"
+
 run_one() {
-  local T="$1" id task_revision holdout; id=$(basename "$T")
-  task_revision="$(metaget "$T/meta.json" corpusRevision)"; task_revision="${task_revision:-gate-d-r1}"
-  holdout="$(metaget "$T/meta.json" holdout)"; holdout="${holdout:-false}"
+  local T="$1" id task_revision holdout identity=""; id=$(basename "$T")
+  if [ "$EXTERNAL" = 1 ]; then
+    if ! identity="$(verify_external "$id")"; then
+      echo "FATAL[$ARM/$id]: the external task failed its manifest check before the run; no row written" >&2
+      echo "$EXTERNAL_HINT" >&2
+      exit 9
+    fi
+    task_revision=""; holdout=""   # taken from $identity when the row is written
+    # Sealed tasks never run through a local arm without an OS boundary (Codex review, INFER-521).
+    # A local arm runs as the operator, so it could read the task root's oracle/ and solution/ and
+    # no digest check can see a read. Nothing here provides that boundary yet, so a sealed run is
+    # refused unless the owner explicitly accepts an unisolated one for this invocation.
+    if [ "$(printf %s "$identity" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("holdout") is True)')" = True ] \
+       && [ "${GATE_D_ACCEPT_UNISOLATED_SEALED:-}" != 1 ]; then
+      echo "error: $id is sealed, and a local arm could read the sealed corpus (no OS isolation is available)." >&2
+      echo "       Sealed external tasks are refused; set GATE_D_ACCEPT_UNISOLATED_SEALED=1 only on an explicit owner decision (gate-d/CORPUS.md)." >&2
+      exit 3
+    fi
+  else
+    task_revision="$(metaget "$T/meta.json" corpusRevision)"; task_revision="${task_revision:-gate-d-r1}"
+    holdout="$(metaget "$T/meta.json" holdout)"; holdout="${holdout:-false}"
+  fi
   if [ "$IN_GIT_CHECKOUT" = 1 ]; then
     local dirty_before
     if ! dirty_before="$(fixture_dirty)"; then
@@ -162,7 +271,7 @@ run_one() {
   # No sed -z (BSD sed lacks it): the checkout branch lists the task tree relative to itself, and
   # the plain branch strips "./" with python3.
   trap 'rm -f "$seed_expected_f" "$seed_actual_f"; exit 130' INT TERM
-  if [ "$IN_GIT_CHECKOUT" = 1 ]; then
+  if [ "$SEED_FROM_GIT" = 1 ]; then
     if ! gd_git -C "$REPO_ROOT" ls-tree -r -z "HEAD:gate-d/tasks/$id/repo" > "$seed_actual_f" \
        || [ ! -s "$seed_actual_f" ] \
        || ! LC_ALL=C sort -z "$seed_actual_f" > "$seed_expected_f"; then
@@ -211,7 +320,7 @@ open(sys.argv[2], "wb").write(b"".join(r + b"\0" for r in recs))
     seed_ok=0
   else
     # Drop the node_modules link record, then (outside a checkout) the mode/type/blob prefix.
-    if ! python3 - "$seed_actual_f" "$IN_GIT_CHECKOUT" <<'PY'
+    if ! python3 - "$seed_actual_f" "$SEED_FROM_GIT" <<'PY'
 import re, sys
 path, in_git = sys.argv[1], sys.argv[2] == "1"
 recs = open(path, "rb").read().split(b"\0")
@@ -244,16 +353,18 @@ PY
       # a ceiling so git-based root discovery — this arm's or anything it shells out to — cannot
       # climb past $WORKROOT, on top of $W already living outside the repo entirely.
       ( cd "$W" \
-          && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \
+          && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE $GD_RUNNER_VARS \
           && export GIT_CEILING_DIRECTORIES="$WORKROOT" \
           && HS_API_KEY="$GW_KEY" "$TIMEOUT_BIN" "$CAP_S" pi --provider "${PI_PROVIDER:-inference-gille}" --model "$MODEL" \
              --no-session --print --mode json ${PROMPT_FILE:+--append-system-prompt "$PROMPT_FILE"} "$instr" </dev/null 2>"$W/.arm.stderr.log" \
-             | "$REPO_ROOT/node_modules/.bin/tsx" "$REPO_ROOT/scripts/pi-benchmark-telemetry.ts" \
-                 --log "$W/.arm.log" --summary "$W/.arm-telemetry.json" ) || status="arm-error"
+             | ( cd "$REPO_ROOT" && "$REPO_ROOT/node_modules/.bin/tsx" "$REPO_ROOT/scripts/pi-benchmark-telemetry.ts" \
+                 --log "$W/.arm.log" --summary "$W/.arm-telemetry.json" ) ) || status="arm-error"
+      # The recorder runs from the checkout, not from $W: tsx reads ./tsconfig.json, and an arm that
+      # replaces the work dir's tsconfig.json with a FIFO would otherwise hang it (Codex review).
       ;;
     aider)
       ( cd "$W" \
-          && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \
+          && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE $GD_RUNNER_VARS \
           && export GIT_CEILING_DIRECTORIES="$WORKROOT" \
           && OPENAI_API_BASE="$GW" OPENAI_API_KEY="$GW_KEY" "$TIMEOUT_BIN" "$CAP_S" \
              aider --model "openai/$MODEL" --edit-format diff \
@@ -266,7 +377,7 @@ PY
     opencode)
       # provider 'homebox' must exist in opencode.json (see docs/gate-de-evaluation-plan.md)
       ( cd "$W" \
-          && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \
+          && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE $GD_RUNNER_VARS \
           && export GIT_CEILING_DIRECTORIES="$WORKROOT" \
           && HOMEBOX_API_KEY="$GW_KEY" "$TIMEOUT_BIN" "$CAP_S" opencode run -m "homebox/$MODEL" \
              --dir "$W" --format json "$instr" </dev/null >"$W/.arm.log" 2>&1 ) || status="arm-error"
@@ -278,7 +389,7 @@ PY
       # OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL, plus -m explicitly. --max-tool-calls is a
       # defensive inner bound only — the outer `timeout`/CAP_S remains the real wall-clock cap.
       ( cd "$W" \
-          && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \
+          && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE $GD_RUNNER_VARS \
           && export GIT_CEILING_DIRECTORIES="$WORKROOT" \
           && OPENAI_API_KEY="$GW_KEY" OPENAI_BASE_URL="$GW" OPENAI_MODEL="$MODEL" "$TIMEOUT_BIN" "$CAP_S" \
              qwen -m "$MODEL" --yolo --max-tool-calls 100 "$instr" </dev/null >"$W/.arm.log" 2>&1 ) || status="arm-error"
@@ -303,6 +414,11 @@ PY
       rm -rf "$W"
       exit 9
     fi
+  fi
+  if [ "$EXTERNAL" = 1 ] && ! still_verified "$id" "$identity"; then
+    echo "FATAL[$ARM/$id]: the external task changed on disk during this run; no row written (#172, INFER-521)" >&2
+    echo "$EXTERNAL_HINT" >&2
+    rm -rf "$W"; exit 9
   fi
   if ! verify_prompt_snapshot; then
     echo "FATAL[$ARM/$id]: the prompt snapshot changed during the run; no row written" >&2
@@ -344,8 +460,85 @@ PY
   local PEEK_JSON
   PEEK_JSON="$(python3 "$ROOT/peek-scan.py" "$T" "$TRANSCRIPT" 2>/dev/null)" || PEEK_JSON=""
   [ -n "$PEEK_JSON" ] || PEEK_JSON="{}"
+  # External corpora: gate R3-io and the node hardening (code-battle gate-d-r3 io-gate.mjs, see
+  # harbor/test.sh there; INFER-521; the copy lives under vendor/, see CORPUS.md). check.sh runs
+  # the hidden oracle in the same process as the candidate's modules, so a module that can read
+  # files could read the oracle at import time and tailor its answers. io-gate.mjs is a static,
+  # non-executing import/identifier allowlist; a row passes only if it AND check.sh pass. A
+  # violation is a model outcome (exitClass R3-io); a gate that cannot run (bad arguments, crash, no
+  # typescript) is a runner failure (R3-io-error), never scored as incapability and never counted
+  # by sweep.sh's resume or summary. It runs FIRST, before any candidate code executes (at-stop's
+  # visible tests included; Codex review of INFER-521): a workspace whose modules could reach files,
+  # processes or the module loader is never executed. Every node process that then runs candidate
+  # code (at-stop and check.sh) runs with code generation from strings disabled, which closes
+  # `(() => {}).constructor("…")`, and without the tsx cache. r1/r2 grading is unchanged.
+  local io_failed=""
+  if [ "$EXTERNAL" = 1 ]; then
+    local io_rc=0
+    node "$REPO_ROOT/vendor/code-battle-gate-d-r3/io-gate.mjs" "$REPO_ROOT/node_modules" "$T/repo" "$W" >"$W/.check.log" 2>&1 || io_rc=$?
+    if [ "$io_rc" -ne 0 ]; then
+      if [ "$io_rc" = 1 ] && grep -q '^FAIL\[R3-io\]' "$W/.check.log"; then io_failed="R3-io"
+      else
+        io_failed="R3-io-error"
+        echo "  [warn] $id: the R3-io gate could not run (exit $io_rc); the row is a runner failure, not a model result" >&2
+      fi
+    fi
+  fi
+  # Grader-derived verification metric (INFER-521, CBATTLE-14 §3): re-run the checks the agent had
+  # (tsc, and tsx --test when the task ships visible tests) on the workspace exactly as the arm left
+  # it, BEFORE check.sh stages the hidden oracle. External corpora only, so r1/r2 rows keep their
+  # schema. Pure observation: it runs with the arm's Git isolation, its output is whitelisted when
+  # the row is built, and any failure, timeout or missing script yields '{}' and never changes
+  # pass/fail. at-stop.sh is this repository's pinned copy of the corpus script (see its header).
+  # It runs on a throwaway copy of the work dir, so files a candidate's visible tests leave behind
+  # cannot reach check.sh: "never changes pass/fail" holds structurally, not by convention.
+  # Order (Codex review of INFER-521): first the non-executing scope check, the same write
+  # allowlist as check.sh's G0-files gate. A workspace that grading will reject anyway (for example
+  # a rewritten package.json test script) is never executed; its at-stop fields stay null. Then the
+  # copy runs with a minimal environment: no inherited credentials or tokens, and a throwaway HOME.
+  local AT_STOP_JSON="{}" AT_STOP_W="" AT_STOP_HOME="" at_stop_skip="" special_file="" scope_rc=0
+  if [ "$EXTERNAL" = 1 ]; then
+    python3 "$CORPUS_TOOL" scope-check "$T" --work "$W" 2>/dev/null || scope_rc=$?
+    if [ "$scope_rc" = 3 ]; then
+      # A FIFO, socket or device in the workspace: neither at-stop nor check.sh may read it, since
+      # a read could block outside every timeout. The run fails G0-files without being graded.
+      special_file=1
+      at_stop_skip="the workspace holds a special file, so it is not graded"
+    elif [ -n "$io_failed" ]; then
+      at_stop_skip="gate $io_failed failed, so no candidate code is executed"
+    elif [ "$scope_rc" != 0 ]; then
+      at_stop_skip="out-of-scope changes (grading will reject them)"
+    elif [ ! -f "$ROOT/at-stop.sh" ]; then
+      at_stop_skip="gate-d/at-stop.sh is missing"
+    elif AT_STOP_W="$(mktemp -d "$WORKROOT/${id}-atstop-XXXX")" \
+         && AT_STOP_HOME="$(mktemp -d "$WORKROOT/${id}-atstop-home-XXXX")" \
+         && cp -R "$W/." "$AT_STOP_W/" && rm -rf "$AT_STOP_W/.git"; then
+      # No .git in the copy: R3-io and the scope check never inspect it, so a module placed there
+      # could otherwise be imported and executed by the visible tests (Codex review, INFER-521).
+      AT_STOP_JSON="$( cd "$AT_STOP_W" && env -i PATH="$PATH" HOME="$AT_STOP_HOME" TMPDIR="$AT_STOP_HOME" \
+          LANG="${LANG:-C}" GIT_CEILING_DIRECTORIES="$WORKROOT" AT_STOP_CAP_S="${AT_STOP_CAP_S:-120}" \
+          AT_STOP_TOOLCHAIN="$REPO_ROOT/node_modules" TSX_DISABLE_CACHE=1 \
+          NODE_OPTIONS="$GRADING_NODE_OPTIONS" \
+          "$TIMEOUT_BIN" "${AT_STOP_WALL_S:-300}" bash "$ROOT/at-stop.sh" "$T" "$AT_STOP_W" </dev/null 2>/dev/null )" \
+        || AT_STOP_JSON="{}"
+    fi
+    [ -n "$AT_STOP_W" ] && rm -rf "$AT_STOP_W"
+    [ -n "$AT_STOP_HOME" ] && rm -rf "$AT_STOP_HOME"
+    [ -n "$AT_STOP_JSON" ] || AT_STOP_JSON="{}"
+    if [ "$AT_STOP_JSON" = "{}" ]; then
+      echo "  [warn] $id: at-stop fields are null for this row (${at_stop_skip:-at-stop.sh failed, timed out or printed nothing})" >&2
+    fi
+  fi
   local pass="false" exitclass="$status"
-  if bash "$ROOT/check.sh" "$T" "$W" >"$W/.check.log" 2>&1; then pass="true"; exitclass="pass"
+  if [ "$io_failed" = "R3-io-error" ]; then
+    # A grader failure wins over the arm status: the row is ungraded whatever the arm did, and
+    # sweep.sh both resets the model after it and leaves the seed open (Codex review, INFER-521).
+    exitclass="R3-io-error"
+  elif [ -n "$special_file" ]; then
+    if [ "$status" = "arm-error" ]; then exitclass="arm-error"; else exitclass="G0-files"; fi
+  elif [ -n "$io_failed" ]; then
+    if [ "$status" = "arm-error" ]; then exitclass="arm-error"; else exitclass="$io_failed"; fi
+  elif run_check "$T" "$W"; then pass="true"; exitclass="pass"
   elif [ "$status" = "arm-error" ]; then exitclass="arm-error"
   else
     # Extract the gate id from the `FAIL[G3-tsc]: ...` line (check.sh prints `--- tsc ---`
@@ -353,17 +546,25 @@ PY
     exitclass="$(grep -m1 -oE 'FAIL\[[^]]+\]' "$W/.check.log" | sed 's/^FAIL\[//; s/\]$//')"
     [ -n "$exitclass" ] || exitclass="check-fail"
   fi
+  # Grading reads the task directory (hidden oracle, structural check) and at-stop.sh ran candidate
+  # code: re-verify, so a verdict is never recorded against a task that changed underneath it.
+  if [ "$EXTERNAL" = 1 ] && ! still_verified "$id" "$identity"; then
+    echo "FATAL[$ARM/$id]: the external task changed on disk during grading; no row written (INFER-521)" >&2
+    echo "$EXTERNAL_HINT" >&2
+    rm -rf "$W"; [ -n "$TRANSCRIPT" ] && rm -f "$TRANSCRIPT"; exit 9
+  fi
   # Emit the result row via env vars (not shell-interpolation into the Python source): the prior
   # form injected the bash bareword `true`/`false` as a Python name → NameError, dropping the row.
   GD_ARM="$ARM" GD_MODEL="$MODEL" GD_TASK="$id" GD_PASS="$pass" GD_EXIT="$exitclass" GD_WALL="$((t1-t0))" \
     GD_CORPUS_REVISION="$CORPUS_REVISION" GD_TASK_REVISION="$task_revision" GD_HOLDOUT="$holdout" \
     GD_TELEMETRY="$([ "$ARM" = pi ] && printf %s "$W/.arm-telemetry.json")" \
     GD_PEEK="$PEEK_JSON" GD_PROMPT_VARIANT="$PROMPT_VARIANT" GD_PROMPT_SHA="$PROMPT_SHA" \
+    GD_EXTERNAL="$EXTERNAL" GD_IDENTITY="$identity" GD_AT_STOP="$AT_STOP_JSON" \
     python3 -c "import json,os
 row={'arm':os.environ['GD_ARM'],'model':os.environ['GD_MODEL'],'task':os.environ['GD_TASK'],'corpusRevision':os.environ['GD_CORPUS_REVISION'],'taskRevision':os.environ['GD_TASK_REVISION'],'holdout':os.environ['GD_HOLDOUT']=='true','pass':os.environ['GD_PASS']=='true','exitClass':os.environ['GD_EXIT'],'wallS':int(os.environ['GD_WALL'])}
 keys=('turns','toolCalls','promptTokens','completionTokens','modelTurnMs','timedModelTurns','assistantStreamMs','timedAssistantMessages','unparseableLines')
 telemetry={k:None for k in keys}
-p=os.environ.get('GD_TELEMETRY','')
+p=os.environ.get('GD_TELEMETRY',''); raw={}
 if p and os.path.isfile(p) and not os.path.islink(p):
     try: raw=json.load(open(p))
     except Exception: raw={}
@@ -375,6 +576,36 @@ row.update(telemetry)
 peek=json.loads(os.environ.get('GD_PEEK') or '{}')
 row.update({k:bool(v) for k,v in peek.items() if k not in row})
 row['promptVariant']=os.environ['GD_PROMPT_VARIANT']; row['promptSha256']=os.environ['GD_PROMPT_SHA'] or None
+if os.environ.get('GD_EXTERNAL')=='1':
+    # INFER-521: identity from the digest-verified meta.json, then the two verification metrics.
+    # Every field is present on every external row (null = not measured), and only whitelisted
+    # enums, counters and booleans are copied, so the row stays content-blind.
+    ident=json.loads(os.environ['GD_IDENTITY'])
+    for k in ('corpusRevision','taskRevision','holdout','family','split','trap'): row[k]=ident.get(k)
+    def pick(src,spec):
+        out={}
+        for k,allowed in spec.items():
+            v=src.get(k) if isinstance(src,dict) else None
+            if allowed is int: ok=isinstance(v,int) and not isinstance(v,bool) and v>=0
+            elif allowed is bool: ok=isinstance(v,bool)
+            elif allowed=='turn': ok=v is None or (isinstance(v,int) and not isinstance(v,bool) and v>=0)
+            else: ok=isinstance(v,str) and v in allowed
+            out[k]=v if ok else None
+        return out
+    try: at=json.loads(os.environ.get('GD_AT_STOP') or '{}')
+    except Exception: at={}
+    row.update(pick(at,{'atStopTypecheck':('passed','failed'),'atStopVisibleTests':('passed','failed','none'),'detectableFailureAtStop':bool}))
+    outcome=('passed','failed','unknown')
+    vspec={'verificationClass':('no-edit','never-checked','checked-before-last-edit-only','stopped-on-red','checked-green-after-last-edit','checked-after-last-edit-unknown'),
+           'typecheckRuns':int,'testRuns':int,'typecheckAfterLastEdit':bool,'testsAfterLastEdit':bool,
+           'lastTypecheckOutcome':outcome,'lastTestOutcome':outcome,'stoppedWithFailingCheck':bool,
+           'ambiguousCheckOutcomes':int,'firstEditTurn':'turn','lastEditTurn':'turn','edits':int}
+    ver=raw.get('verification') if p and isinstance(raw,dict) else None
+    ok=isinstance(ver,dict) and ver.get('schema')=='gate-d-r3/verification-telemetry@1'
+    # verificationSchema is the measured/not-measured flag: several fields are legitimately null
+    # when measured (no check ran, no edit happened), so null alone cannot say \"not measured\".
+    row['verificationSchema']=ver['schema'] if ok else None
+    row.update(pick(ver if ok else {},vspec))
 print(json.dumps(row))" >>"$OUT"
   local row_status=$?
   if [ "$row_status" -eq 0 ]; then
@@ -395,7 +626,7 @@ print(json.dumps(row))" >>"$OUT"
 }
 
 if [ "$SEL" = "all" ]; then
-  for id in $TASK_IDS; do run_one "$ROOT/tasks/$id"; done
+  for id in $TASK_IDS; do run_one "$TASKS_DIR/$id"; done
 else
-  run_one "$ROOT/tasks/$SEL"
+  run_one "$TASKS_DIR/$SEL"
 fi

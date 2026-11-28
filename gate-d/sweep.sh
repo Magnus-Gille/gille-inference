@@ -8,9 +8,14 @@
 # Knobs: ARMS (default "aider pi"), SEEDS (default 1), CAP_S (per-run wall cap, default 600),
 # GATE_D_OUT (default data/gate-d-results.jsonl).
 # Holdouts are excluded by default; set GATE_D_INCLUDE_HOLDOUT=1 explicitly to select r2.
+# GATE_D_TASKS_ROOT=<dir> sweeps an external corpus (INFER-521, see run.sh); the manifest is pinned
+# for the whole sweep, and resume and the summary also key on each task's manifest digest, so rows
+# for a re-generated task never count toward the new one.
 #
 # RESUMABLE: counts existing rows per (arm,model,task) in the output JSONL and runs only the
-# shortfall — safe to re-launch after an interruption; already-done triples are skipped.
+# shortfall — safe to re-launch after an interruption; already-done triples are skipped. Rows whose
+# R3-io gate could not run (exitClass R3-io-error, a runner failure) stay in the JSONL as
+# diagnostics but count neither as a done seed nor in the summary, so a repaired sweep completes.
 #
 # SEQUENTIAL, NEVER PARALLEL: the box GPU is serial (admission maxParallel=1); concurrent arms
 # would contend and 503. NEVER kill a run mid-stream — see CORRUPTION SAFETY below.
@@ -29,9 +34,33 @@ ROOT="$(cd "$(dirname "$0")" && pwd -P)"
 REPO_ROOT="$(cd "$ROOT/.." && pwd -P)"
 cd "$REPO_ROOT" || exit 3
 CORPUS_TOOL="$ROOT/gate_d_corpus.py"
-if [ "${1:-}" = "--list-tasks" ]; then python3 "$CORPUS_TOOL" tasks; exit $?; fi
-CORPUS_REVISION="$(python3 "$CORPUS_TOOL" revision)" || exit 3
-TASKS="$(python3 "$CORPUS_TOOL" tasks)" || exit 3
+EXTERNAL=0; TASKS_DIR=""; MANIFEST_SHA=""; TASK_REVISIONS="{}"
+# The corpus tool, aimed at the external root and pinned to one manifest digest when there is one.
+# A plain function rather than an argument array: an empty "${arr[@]}" is an unbound-variable error
+# under `set -u` in bash < 4.4, which is still macOS's /bin/bash.
+gd_corpus(){
+  if [ "$EXTERNAL" != 1 ]; then python3 "$CORPUS_TOOL" "$@"
+  elif [ -n "$MANIFEST_SHA" ]; then python3 "$CORPUS_TOOL" "$@" --tasks-root "$TASKS_DIR" --expect-manifest-sha "$MANIFEST_SHA"
+  else python3 "$CORPUS_TOOL" "$@" --tasks-root "$TASKS_DIR"; fi
+}
+if [ -n "${GATE_D_TASKS_ROOT+set}" ]; then
+  TASKS_DIR="$(python3 "$CORPUS_TOOL" root --tasks-root "$GATE_D_TASKS_ROOT")" || exit 3
+  EXTERNAL=1; GATE_D_TASKS_ROOT="$TASKS_DIR"; export GATE_D_TASKS_ROOT
+  # Pinned before enumeration, so every task this sweep lists comes from these manifest bytes.
+  MANIFEST_SHA="$(gd_corpus manifest-sha256)" || exit 3
+fi
+if [ "${1:-}" = "--list-tasks" ]; then gd_corpus tasks; exit $?; fi
+CORPUS_REVISION="$(gd_corpus revision)" || exit 3
+TASKS="$(gd_corpus tasks)" || { rc=$?; [ "$rc" = 9 ] || rc=3; exit "$rc"; }  # 9: a task failed its digest check
+if [ "$EXTERNAL" = 1 ]; then
+  GATE_D_EXPECT_MANIFEST_SHA="$MANIFEST_SHA"; export GATE_D_EXPECT_MANIFEST_SHA
+  # id -> [digest, holdout]: the same task bytes can be validation in one manifest and sealed in
+  # another, so a validation row must never count as (or toward) a sealed result.
+  TASK_REVISIONS="$(gd_corpus describe | python3 -c 'import json,sys
+d=json.load(sys.stdin);print(json.dumps({t:[v,d["taskHoldout"][t]] for t,v in d["taskRevisions"].items()}))')" || exit 3
+else
+  unset GATE_D_EXPECT_MANIFEST_SHA
+fi
 : "${GW:=https://inference.example.com/v1}"
 : "${GW_KEY:?set GW_KEY to a real gateway token (mint via bin/invite)}"
 : "${MODEL:=qwen3-coder-next-80b}"
@@ -57,9 +86,10 @@ if [ -n "$PROMPT_SHA" ]; then export GATE_D_EXPECT_PROMPT_SHA="$PROMPT_SHA"; els
 
 count_rows() {
   [ -f "$OUT" ] || { echo 0; return; }
-  GD_A="$1" GD_M="$2" GD_T="$3" GD_R="$CORPUS_REVISION" GD_OUT="$OUT" \
+  GD_A="$1" GD_M="$2" GD_T="$3" GD_R="$CORPUS_REVISION" GD_OUT="$OUT" GD_TR="$TASK_REVISIONS" \
     GD_V="$PROMPT_VARIANT" GD_S="$PROMPT_SHA" python3 -c "import json,os
 a=os.environ['GD_A'];m=os.environ['GD_M'];t=os.environ['GD_T'];rev=os.environ['GD_R'];n=0
+digest=json.loads(os.environ['GD_TR']).get(t)
 want=(os.environ['GD_V'], os.environ['GD_S'] or None)
 for l in open(os.environ['GD_OUT']):
     try: r=json.loads(l)
@@ -67,6 +97,8 @@ for l in open(os.environ['GD_OUT']):
     if not isinstance(r,dict): continue
     rowrev=r.get('corpusRevision','gate-d-r1')
     variant=(r.get('promptVariant','none'), r.get('promptSha256'))
+    if digest is not None and [r.get('taskRevision'),r.get('holdout')]!=digest: continue
+    if r.get('exitClass')=='R3-io-error': continue  # runner failure: a diagnostic row, not a seed
     if rowrev==rev and r.get('arm')==a and r.get('model')==m and r.get('task')==t and variant==want: n+=1
 print(n)"
 }
@@ -93,18 +125,21 @@ for arm in $ARMS; do
       # A failed runner wrote no row for this invocation, so the last row belongs to an earlier run:
       # stop before consulting it rather than acting on stale state.
       if [ "$rc" -ne 0 ]; then echo "=== SWEEP aborted: run.sh exited $rc on $arm/$MODEL/$t ===" | tee -a "$LOG"; exit "$rc"; fi
-      [ "$(last_exit)" = "arm-error" ] && reset_model
+      # R3-io-error rows can hide an arm-error (the grader failure wins in the row), so reset then too.
+      case "$(last_exit)" in arm-error|R3-io-error) reset_model;; esac
     done
   done
 done
 echo "=== SWEEP done $(date) ===" | tee -a "$LOG"
-GD_R="$CORPUS_REVISION" GD_TASKS="$TASKS" GD_OUT="$OUT" python3 -c "import json,collections,os
-rev=os.environ['GD_R']; allowed=set(os.environ['GD_TASKS'].split())
+GD_R="$CORPUS_REVISION" GD_TASKS="$TASKS" GD_OUT="$OUT" GD_TR="$TASK_REVISIONS" python3 -c "import json,collections,os
+rev=os.environ['GD_R']; allowed=set(os.environ['GD_TASKS'].split()); digests=json.loads(os.environ['GD_TR'])
 c=collections.Counter(); p=collections.Counter()
 for l in open(os.environ['GD_OUT']):
     try: r=json.loads(l)
     except: continue
     if r.get('corpusRevision','gate-d-r1') != rev or r.get('task') not in allowed: continue
+    if r.get('task') in digests and [r.get('taskRevision'),r.get('holdout')] != digests[r.get('task')]: continue
+    if r.get('exitClass') == 'R3-io-error': continue
     digest=r.get('promptSha256') or ''
     k=(r.get('arm') or '',r.get('model') or '',r.get('promptVariant','none') or 'none',digest)
     c[k]+=1; p[k]+= 1 if r.get('pass') else 0

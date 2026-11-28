@@ -61,6 +61,8 @@ GATE_D_INCLUDE_HOLDOUT=1 bash gate-d/run.sh pi all
 # → rows include corpusRevision, taskRevision, and holdout
 # Sweep console output is tee'd here by default; override for an isolated experiment log:
 GATE_D_LOG=/tmp/gate-d-r2.log GATE_D_INCLUDE_HOLDOUT=1 bash gate-d/sweep.sh
+# External corpus (gate-d-r3 from code-battle, outside this checkout; see CORPUS.md):
+GATE_D_TASKS_ROOT=/path/to/r3-validation bash gate-d/sweep.sh
 ```
 
 **pi system-prompt variants.** `GATE_D_PI_APPEND_SYSTEM=<file>` passes a file committed at HEAD in
