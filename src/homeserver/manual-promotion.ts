@@ -313,6 +313,10 @@ export function renderManualEntry(spec: ManualServingSpec): string {
     `      ${spec.runtimeBin}`,
     `      --host 127.0.0.1 --port \${PORT}`,
     `      -m ${spec.gguf}`,
+    // INFER-343: llama-server reports the GGUF file name as `model` unless aliased; under
+    // HOMESERVER_SERVED_MODEL_IDENTITY=enforce that is a served-identity mismatch and every
+    // completion for the new roster entry is withheld. Serve the roster key as the identity.
+    `      --alias ${spec.key}`,
   ];
   if (spec.mmproj !== null) lines.push(`      -mm ${spec.mmproj}`);
   if (spec.imageMinTokens !== null) lines.push(`      --image-min-tokens ${spec.imageMinTokens}`);
