@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createM5Client, M5ClientError } from "../client/m5-client.mjs";
 import { createMcpStdioBridge } from "../client/m5-stdio-bridge.mjs";
 
-// INFER-242 mixed-health regression (Codex session, 2026-09-04): model discovery succeeds, the
+// INFER-242 mixed-health regression: model discovery succeeds, the
 // first `ask` fails at the connector transport before any gateway response, and the prescribed
 // identical retry is refused by gateway admission as busy. Each step must name its own layer, and
 // the busy refusal must keep the gateway's machine-readable cause and correlation id instead of

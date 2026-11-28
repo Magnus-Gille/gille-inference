@@ -223,8 +223,7 @@ describe("m5-network-doctor — credential-free local contract", () => {
   });
 
   it("names both layers in one diagnostic without leaking locators (INFER-242)", () => {
-    // The 2026-09-01 Datagate reproduction: no public base configured and local Tailscale
-    // stopped. One diagnostic must carry both actionable layers; an absent or empty base is
+    // The INFER-242 reproduction: no public base configured and local Tailscale stopped. One diagnostic must carry both actionable layers; an absent or empty base is
     // never treated as configured (no silent loopback fallback).
     for (const env of [cleanEnv(), cleanEnv({ M5_GATEWAY_URL: "" })]) {
       const { result } = injected(validStatus("Stopped"), env);
