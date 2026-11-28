@@ -122,7 +122,11 @@ def tree_digest(tdir: Path) -> str:
     link would let content change without the digest seeing it.
     """
     entries = []
-    for dirpath, dirnames, filenames in os.walk(tdir, followlinks=False):
+    def walk_error(error: OSError) -> None:
+        raise ValueError(f"cannot read external task tree: {error}")
+
+    # onerror: os.walk silently skips unreadable directories, which would let added files hide.
+    for dirpath, dirnames, filenames in os.walk(tdir, followlinks=False, onerror=walk_error):
         for name in dirnames + filenames:
             full = os.path.join(dirpath, name)
             mode = os.lstat(full).st_mode

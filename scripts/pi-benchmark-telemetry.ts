@@ -141,7 +141,11 @@ export function classifyCommand(command: string): { kinds: CheckKind[]; attribut
   // A pipe hides the check's exit status (`npm test | tail` exits with tail's status).
   const piped = /(^|[^|])\|([^|]|$)/.test(command);
   const otherSeparators = /;|\|\||\n/.test(command.trim());
-  const attribution: Attribution = piped || otherSeparators ? "none" : segments.length > 1 || checkSegments > 1 ? "and-chain" : "exact";
+  // `! npm test` succeeds because the tests failed; `npm test &` succeeds without waiting for them
+  // (INFER-521 review). Neither exit status says anything about the check.
+  const negated = segments.some((s) => /^\s*!\s/.test(s));
+  const backgrounded = /(^|[^&>|])&(?![&>])/.test(command);
+  const attribution: Attribution = piped || otherSeparators || negated || backgrounded ? "none" : segments.length > 1 || checkSegments > 1 ? "and-chain" : "exact";
   // Per segment (INFER-521 review): a whole-command test let `npm test && sed -i ...` hide its edit
   // behind the leading `npm`. Pipes are split too, so `cat x | tee y` still counts as a mutation.
   const mutates = command.trim().split(/\s*(?:&&|\|\||;|\n|\|)\s*/).some((seg) =>

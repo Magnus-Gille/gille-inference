@@ -73,12 +73,13 @@ mkdir -p "$WORKROOT"
 
 CORPUS_TOOL="$ROOT/gate_d_corpus.py"
 if [ "${1:-}" = "--list-tasks" ]; then python3 "$CORPUS_TOOL" tasks; exit $?; fi
-CORPUS_REVISION="$(python3 "$CORPUS_TOOL" revision)" || exit 3
 # The task source: gate-d/tasks, or a validated external root outside the checkout (INFER-521).
 EXTERNAL=0; [ -n "${GATE_D_TASKS_ROOT:-}" ] && EXTERNAL=1
 TASKS_DIR="$(python3 "$CORPUS_TOOL" tasks-root)" || exit 3
-# Every later helper call sees the resolved root, never a symlink that could be repointed mid-run.
+# Every later helper call sees the resolved root, never a symlink that could be repointed mid-run;
+# the revision is read only after that, so it describes the same corpus the tasks come from.
 [ "$EXTERNAL" = 1 ] && export GATE_D_TASKS_ROOT="$TASKS_DIR"
+CORPUS_REVISION="$(python3 "$CORPUS_TOOL" revision)" || exit 3
 if [ "$EXTERNAL" = 1 ]; then
   # Work dirs must stay outside the task root, and the task root outside WORKROOT: an arm that can
   # reach either could rewrite the seed or the oracle it is graded against.
@@ -174,8 +175,22 @@ scrub_arm_env(){
 # at-stop.sh, resolved once to an absolute path: it runs from inside the copied workspace, where a
 # relative override would name a different (usually missing) file.
 AT_STOP_SCRIPT=""
+AT_STOP_SHA=""; AT_STOP_DIR=""
 if [ "$EXTERNAL" = 1 ]; then
   AT_STOP_SCRIPT="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "${GATE_D_AT_STOP:-$TASKS_DIR/at-stop.sh}")" || exit 3
+  # The observer is outside the task digest, so its bytes are snapshotted once and their sha256 is
+  # recorded per row (atStopSha256, null when absent); sweep.sh resumes only rows of the same observer.
+  if [ -f "$AT_STOP_SCRIPT" ]; then
+    AT_STOP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gd-atstop.XXXXXXXX")" || exit 3
+    trap 'rm -rf "$PROMPT_DIR" "$AT_STOP_DIR"' EXIT
+    cp "$AT_STOP_SCRIPT" "$AT_STOP_DIR/at-stop.sh" || exit 3
+    AT_STOP_SCRIPT="$AT_STOP_DIR/at-stop.sh"
+    AT_STOP_SHA="sha256:$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$AT_STOP_SCRIPT")" || exit 3
+  fi
+  if [ -n "${GATE_D_EXPECT_AT_STOP_SHA+x}" ] && [ "$GATE_D_EXPECT_AT_STOP_SHA" != "$AT_STOP_SHA" ]; then
+    echo "error: at-stop.sh differs from the one the sweep pinned (${GATE_D_EXPECT_AT_STOP_SHA:-none} != ${AT_STOP_SHA:-none})" >&2
+    exit 3
+  fi
 fi
 # External corpus content guard (INFER-521): replaces the git-status guard for a root that is not
 # under Git. The expected digest is captured once, before the arm, so a manifest edited mid-run
@@ -188,6 +203,9 @@ external_intact(){ python3 "$CORPUS_TOOL" verify-digest "$1" --expect "$2" --dir
 at_stop_json(){
   local T="$1" W="$2" script="$AT_STOP_SCRIPT" cap="${GATE_D_AT_STOP_CAP_S:-300}" copy out=""
   [ -f "$script" ] || { echo "{}"; return 0; }
+  # The snapshot lives in the temp dir; never run it if it no longer has the recorded bytes.
+  [ "sha256:$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$script" 2>/dev/null)" = "$AT_STOP_SHA" ] \
+    || { echo "{}"; return 0; }
   copy="$(mktemp -d "$WORKROOT/atstop-XXXXXXXX" 2>/dev/null)" || { echo "{}"; return 0; }
   if cp -R "$W/." "$copy/" 2>/dev/null; then
     out="$( cd "$copy" && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE && scrub_arm_env \
@@ -216,6 +234,9 @@ run_one() {
     # manifest digest. Sealed tasks need the opt-in even when named one at a time.
     identity="$(python3 "$CORPUS_TOOL" task-metadata "$id")" || { echo "FATAL[$ARM/$id]: invalid external task" >&2; exit 3; }
     task_revision="$(GD_I="$identity" python3 -c 'import json,os;print(json.loads(os.environ["GD_I"])["taskRevision"])')" || exit 3
+    if [ "$(GD_I="$identity" python3 -c 'import json,os;print(json.loads(os.environ["GD_I"])["corpusRevision"])')" != "$CORPUS_REVISION" ]; then
+      echo "FATAL[$ARM/$id]: the corpus revision changed since this run started; no row written" >&2; exit 3
+    fi
     holdout="$(GD_I="$identity" python3 -c 'import json,os;print(str(json.loads(os.environ["GD_I"])["holdout"]).lower())')" || exit 3
     if [ "$holdout" = true ] && [ "${GATE_D_INCLUDE_HOLDOUT:-0}" != 1 ]; then
       echo "error: task '$id' is sealed; holdouts require GATE_D_INCLUDE_HOLDOUT=1" >&2; exit 3
@@ -458,12 +479,23 @@ PY
   local AT_STOP_JSON="{}"
   [ "$EXTERNAL" = 1 ] && AT_STOP_JSON="$(at_stop_json "$T" "$W")"
   local pass="false" exitclass="$status"
-  if bash "$ROOT/check.sh" "$T" "$W" >"$W/.check.log" 2>&1; then pass="true"; exitclass="pass"
+  # The grader executes candidate code, so it too runs without the runner's GATE_D_* configuration;
+  # the task directory reaches it as an argument only.
+  if ( scrub_arm_env; bash "$ROOT/check.sh" "$T" "$W" ) >"$W/.check.log" 2>&1; then pass="true"; exitclass="pass"
   elif [ "$status" = "arm-error" ]; then exitclass="arm-error"
   else
     # Extract the gate id from the `FAIL[G3-tsc]: ...` line (check.sh prints `--- tsc ---`
     # headers BEFORE it, so head -1 would grab the wrong line).
     exitclass="$(grep -m1 -oE 'FAIL\[[^]]+\]' "$W/.check.log" | sed 's/^FAIL\[//; s/\]$//')"
+    if [ "$EXTERNAL" = 1 ]; then
+      # check.sh exits right after its FAIL line, so the verdict is the LAST one; earlier matches can
+      # be candidate or hidden-oracle output. Only gate ids check.sh itself defines are recorded.
+      exitclass="$(python3 -c '
+import re, sys
+known = set(re.findall(r"\bfail (G[0-9]+-[A-Za-z0-9-]+)", open(sys.argv[1]).read()))
+hits = re.findall(r"FAIL\[([^]\n]+)\]", open(sys.argv[2], errors="replace").read())
+print(hits[-1] if hits and hits[-1] in known else "check-fail")' "$ROOT/check.sh" "$W/.check.log" 2>/dev/null)"
+    fi
     [ -n "$exitclass" ] || exitclass="check-fail"
   fi
   if [ "$EXTERNAL" = 1 ] && ! external_intact "$id" "$task_revision" "$T"; then
@@ -476,7 +508,7 @@ PY
     GD_CORPUS_REVISION="$CORPUS_REVISION" GD_TASK_REVISION="$task_revision" GD_HOLDOUT="$holdout" \
     GD_TELEMETRY="$([ "$ARM" = pi ] && printf %s "$W/.arm-telemetry.json")" \
     GD_PEEK="$PEEK_JSON" GD_PROMPT_VARIANT="$PROMPT_VARIANT" GD_PROMPT_SHA="$PROMPT_SHA" \
-    GD_EXTERNAL="$EXTERNAL" GD_IDENTITY="$identity" GD_AT_STOP="$AT_STOP_JSON" \
+    GD_EXTERNAL="$EXTERNAL" GD_IDENTITY="$identity" GD_AT_STOP="$AT_STOP_JSON" GD_AT_STOP_SHA="$AT_STOP_SHA" \
     python3 -c "import json,os
 row={'arm':os.environ['GD_ARM'],'model':os.environ['GD_MODEL'],'task':os.environ['GD_TASK'],'corpusRevision':os.environ['GD_CORPUS_REVISION'],'taskRevision':os.environ['GD_TASK_REVISION'],'holdout':os.environ['GD_HOLDOUT']=='true','pass':os.environ['GD_PASS']=='true','exitClass':os.environ['GD_EXIT'],'wallS':int(os.environ['GD_WALL'])}
 keys=('turns','toolCalls','promptTokens','completionTokens','modelTurnMs','timedModelTurns','assistantStreamMs','timedAssistantMessages','unparseableLines')
@@ -514,6 +546,7 @@ if os.environ.get('GD_EXTERNAL')=='1':
     row.update({'family':ident.get('family'),'split':ident.get('split'),'trap':ident.get('trap')})
     at=json.loads(os.environ.get('GD_AT_STOP') or '{}')
     for k in ('atStopTypecheck','atStopVisibleTests','detectableFailureAtStop'): row[k]=at.get(k)
+    row['atStopSha256']=os.environ.get('GD_AT_STOP_SHA') or None
 peek=json.loads(os.environ.get('GD_PEEK') or '{}')
 row.update({k:bool(v) for k,v in peek.items() if k not in row})
 row['promptVariant']=os.environ['GD_PROMPT_VARIANT']; row['promptSha256']=os.environ['GD_PROMPT_SHA'] or None

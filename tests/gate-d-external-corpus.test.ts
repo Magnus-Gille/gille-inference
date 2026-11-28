@@ -1,5 +1,6 @@
 import { describe, expect, it, afterEach } from "vitest";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   appendFileSync,
   chmodSync,
@@ -485,6 +486,8 @@ sys.stdout.write(r.stdout); sys.stderr.write(r.stderr); sys.exit(r.returncode)
     // Content-blind: an external row keeps the gate id, never check.sh output or gateway text.
     expect(row).toMatchObject({ check_gate: "pass" });
     for (const key of ["check_tail", "detail", "summary"]) expect(row).not.toHaveProperty(key);
+    // Grading happened in a private temp dir, not under the public checkout.
+    expect(existsSync(join(repo, "gate-d", ".work-cl", "r3-test-a"))).toBe(false);
   });
 
   it("rejects missing or contradictory holdout metadata", () => {
@@ -536,5 +539,51 @@ sys.stdout.write(r.stdout); sys.stderr.write(r.stderr); sys.exit(r.returncode)
     });
     expect(res.status, res.stderr).toBe(0);
     expect(rows(out).map((r) => r.task)).toEqual(["r3-test-a", "r3-test-b"]);
+  });
+
+  it("grades without the runner's configuration and records only check.sh's own verdict", () => {
+    const repo = fixtureRepo();
+    const root = externalCorpus(repo);
+    const probe = join(tmp("gd-ext-probe-"), "grader-env.txt");
+    // Candidate code cannot reach process.env (check.sh's G0-runtime gate), so the grader itself is
+    // replaced in this throwaway checkout: it logs the GATE_D_* names it inherited and prints a
+    // forged verdict line (as hidden-oracle output could) before its real one.
+    writeFileSync(join(repo, "gate-d", "check.sh"), [
+      "#!/usr/bin/env bash",
+      `env | sed -n 's/^\\(GATE_D_[A-Za-z0-9_]*\\)=.*/\\1/p' > ${JSON.stringify(probe)}`,
+      'echo "FAIL[G9-forged]: injected"',
+      'echo "FAIL[G3-tsc]: real verdict"',
+      "exit 1",
+      "# gate ids defined here: fail G3-tsc",
+      "",
+    ].join("\n"));
+    const { bin } = fakePi({ root, solve: true });
+    const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", "r3-test-a"]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(rows(out)[0]).toMatchObject({ pass: false, exitClass: "G3-tsc" });
+    expect(readFileSync(probe, "utf8")).toBe("");
+  });
+
+  it("records the at-stop observer's digest and refuses one that differs from the sweep's pin", () => {
+    const repo = fixtureRepo();
+    const root = externalCorpus(repo);
+    const { bin } = fakePi({ root, solve: true });
+    const sha = `sha256:${createHash("sha256").update(readFileSync(join(root, "at-stop.sh"))).digest("hex")}`;
+    let r = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", "r3-test-a"]);
+    expect(r.res.status, r.res.stderr).toBe(0);
+    expect(rows(r.out)[0]).toMatchObject({ atStopSha256: sha });
+    r = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root, GATE_D_EXPECT_AT_STOP_SHA: `sha256:${"0".repeat(64)}` }, ["pi", "r3-test-a"]);
+    expect(r.res.status).toBe(3);
+    expect(r.res.stderr).toContain("differs from the one the sweep pinned");
+
+    // A sweep resumes only rows of the same observer.
+    const out = r.out;
+    const first = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root, GATE_D_OUT: out, ARMS: "pi", SEEDS: "1" }, [], "sweep.sh");
+    expect(first.res.status, first.res.stderr).toBe(0);
+    appendFileSync(join(root, "at-stop.sh"), "# fixed observer\n");
+    const again = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root, GATE_D_OUT: out, ARMS: "pi", SEEDS: "1" }, [], "sweep.sh");
+    expect(again.res.status, again.res.stderr).toBe(0);
+    expect(again.res.stdout).toContain("[run ] pi/qwen3-coder-next-80b/r3-test-a");
+    expect(rows(out)).toHaveLength(4);
   });
 });

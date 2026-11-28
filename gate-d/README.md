@@ -183,15 +183,17 @@ GATE_D_TASKS_ROOT=/tmp/r3-validation GATE_D_AT_STOP=~/src/code-battle/gate-d-r3/
 ```
 
 - **Isolation.** The root must lie outside this checkout, and the work root must not overlap it in
-  either direction. Work dirs and the `node_modules` link are unchanged (#172). Arms (and
-  `at-stop.sh`) run with every `GATE_D_*` variable removed, so they are not told where the corpus,
+  either direction. Work dirs and the `node_modules` link are unchanged (#172). Arms, `at-stop.sh`
+  and `check.sh` (which executes candidate code) run with every `GATE_D_*` variable removed, so they are not told where the corpus,
   its solutions or its oracles live. This is not a filesystem sandbox: an arm running as the
   operator could still find and read the root, which `peek-scan.py`'s `graderPathInTranscript`
   flags when the transcript shows it. Keep sealed roots in an unpredictable location.
 - **Content guard.** Instead of `git status`, each task directory's digest (sha256 over the sorted
   `relpath\0sha256(file)\n` entries, byte-compatible with the generator's `tree_digest`) must equal
   the manifest's before the arm, after the arm and after grading. Any mismatch, added file or
-  symlink aborts with exit 9 and writes no row.
+  symlink aborts with exit 9 and writes no row, and so does a subtree the check cannot read.
+  `exitClass` (and the code-loop `check_gate`) is check.sh's last `FAIL[...]` verdict, kept only when
+  it is a gate id check.sh defines, so oracle output cannot forge it.
 - **Holdouts.** Tasks with `holdout: true` in `meta.json` (r3's sealed split) are refused without
   `GATE_D_INCLUDE_HOLDOUT=1`, whether selected by `all` or by id.
 - **Row identity.** `corpusRevision` and `holdout` come from `meta.json` (validated against the
@@ -205,7 +207,9 @@ GATE_D_TASKS_ROOT=/tmp/r3-validation GATE_D_AT_STOP=~/src/code-battle/gate-d-r3/
   the corpus's `at-stop.sh <TASKDIR> <WORKDIR>` (`GATE_D_AT_STOP`, default `<dir>/at-stop.sh`) runs
   on a copy of the work dir, so its checks can never change what is graded. Its
   `atStopTypecheck`, `atStopVisibleTests` and `detectableFailureAtStop` are recorded only when its
-  output is exactly those three fields with their documented values; anything else, a failure or a
+  output is exactly those three fields with their documented values. The script's bytes are
+  snapshotted at start and their digest is recorded as `atStopSha256`; `sweep.sh` resumes only rows
+  of the same observer and refuses a child whose observer changed; anything else, a failure or a
   missing script yields `null` for all three. Pass/fail never depends on it. A relative
   `GATE_D_AT_STOP` resolves from the caller's directory. The copy shares the read-only-by-convention
   `node_modules` link with the graded workspace, exactly as the arm itself does; neither is covered

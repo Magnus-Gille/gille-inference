@@ -139,3 +139,13 @@ test("a known failure stays flagged when the retry is unattributable", () => {
   assert.equal(s.verificationClass, "stopped-on-red");
   assert.equal(s.lastTestOutcome, "unknown");
 });
+
+test("negated and backgrounded checks are unattributable", () => {
+  assert.equal(classifyCommand("! npm test").attribution, "none");
+  assert.equal(classifyCommand("npm test &").attribution, "none");
+  assert.equal(classifyCommand("npm test 2>&1").attribution, "exact");
+  assert.equal(classifyCommand("npx tsc --noEmit && npm test").attribution, "and-chain");
+  const s = run(turn, start("1", "edit"), end("1", "edit", true), start("2", "bash", "! npm test"), end("2", "bash", true));
+  assert.notEqual(s.verificationClass, "checked-green-after-last-edit");
+  assert.equal(s.lastTestOutcome, "unknown");
+});

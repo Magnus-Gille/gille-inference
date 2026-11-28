@@ -46,6 +46,14 @@ TASKS="$(python3 "$CORPUS_TOOL" tasks)" || exit 3
 # {task: expected taskRevision} for an external corpus; empty ({}) for the in-repo corpus.
 TASK_REVS="{}"
 if [ -n "${GATE_D_TASKS_ROOT:-}" ]; then
+  # Pin the at-stop observer too: rows from another observer (or none) are not resumed from, and a
+  # child refuses to run if the script changes mid-sweep. Empty = no script.
+  at_stop_path="${GATE_D_AT_STOP:-$(python3 "$CORPUS_TOOL" tasks-root)/at-stop.sh}" || exit 3
+  GATE_D_EXPECT_AT_STOP_SHA=""
+  if [ -f "$at_stop_path" ]; then
+    GATE_D_EXPECT_AT_STOP_SHA="sha256:$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$at_stop_path")" || exit 3
+  fi
+  export GATE_D_EXPECT_AT_STOP_SHA
   TASK_REVS="$(python3 -c '
 import json, sys
 sys.path.insert(0, sys.argv[1])
@@ -79,7 +87,7 @@ if [ -n "$PROMPT_SHA" ]; then export GATE_D_EXPECT_PROMPT_SHA="$PROMPT_SHA"; els
 count_rows() {
   [ -f "$OUT" ] || { echo 0; return; }
   GD_A="$1" GD_M="$2" GD_T="$3" GD_R="$CORPUS_REVISION" GD_OUT="$OUT" \
-    GD_V="$PROMPT_VARIANT" GD_S="$PROMPT_SHA" GD_REVS="$TASK_REVS" python3 -c "import json,os
+    GD_V="$PROMPT_VARIANT" GD_S="$PROMPT_SHA" GD_REVS="$TASK_REVS" GD_AS="${GATE_D_EXPECT_AT_STOP_SHA-}" python3 -c "import json,os
 a=os.environ['GD_A'];m=os.environ['GD_M'];t=os.environ['GD_T'];rev=os.environ['GD_R'];n=0
 want=(os.environ['GD_V'], os.environ['GD_S'] or None)
 taskrev=json.loads(os.environ['GD_REVS']).get(t)
@@ -90,6 +98,7 @@ for l in open(os.environ['GD_OUT']):
     rowrev=r.get('corpusRevision','gate-d-r1')
     variant=(r.get('promptVariant','none'), r.get('promptSha256'))
     if taskrev is not None and r.get('taskRevision')!=taskrev: continue
+    if taskrev is not None and r.get('atStopSha256')!=(os.environ['GD_AS'] or None): continue
     if rowrev==rev and r.get('arm')==a and r.get('model')==m and r.get('task')==t and variant==want: n+=1
 print(n)"
 }

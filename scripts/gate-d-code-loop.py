@@ -12,7 +12,7 @@ the battery's own deterministic check.sh (no model in grading). Resumable via JS
 sealed tasks need the holdout opt-in, and resume/scoreboards scope by corpusRevision and digest.
 An external corpus carries no acceptance threshold, so its scoreboard reports counts only.
 """
-import argparse, json, os, re, shutil, subprocess, sys, time, urllib.request
+import argparse, json, os, re, shutil, subprocess, sys, tempfile, time, urllib.request
 
 REPO = os.environ.get("GATE_D_CL_REPO", "/srv/gille-inference")
 GW = os.environ.get("GATE_D_CL_GATEWAY", "http://192.0.2.10:8080/mcp")
@@ -156,8 +156,14 @@ def mcp(tool, args):
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(json.load(r)["result"]["content"][0]["text"])
 
-def sh(argv, cwd=None):
-    return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=300)
+def sh(argv, cwd=None, env=None):
+    return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=300, env=env)
+
+
+# The grader executes candidate code; it gets the task directory as an argument, never the runner's
+# GATE_D_* configuration (which would name the sealed corpus root).
+GRADER_ENV = {k: v for k, v in os.environ.items() if not k.startswith("GATE_D_")}
+KNOWN_GATES = set(re.findall(r"\bfail (G[0-9]+-[A-Za-z0-9-]+)", open(CHECK, encoding="utf-8").read()))
 
 def seed_files(repo_dir):
     out = []
@@ -241,8 +247,13 @@ for tid in task_ids:
     if external is None:
         row.update(detail=(res.get("detail") or "")[:200], summary=(res.get("summary") or "")[:150])
     # grade: pristine seed copy + own git root (run.sh discipline) + apply + check.sh
-    wdir = os.path.join(WORKROOT, tid)
-    shutil.rmtree(wdir, ignore_errors=True)
+    if external is None:
+        wdir = os.path.join(WORKROOT, tid)
+        shutil.rmtree(wdir, ignore_errors=True)
+    else:
+        # External tasks grade in a private temp dir outside the checkout, removed after grading,
+        # so a staged hidden oracle never lingers at a predictable path (INFER-521 review).
+        wdir = os.path.join(tempfile.mkdtemp(prefix="gd-cl-"), tid)
     shutil.copytree(os.path.join(tdir, "repo"), wdir)
     # check.sh G0-toolchain requires exactly this runner-owned link (run.sh discipline).
     os.symlink(os.path.join(os.path.realpath(REPO), "node_modules"), os.path.join(wdir, "node_modules"))
@@ -261,7 +272,11 @@ for tid in task_ids:
     else:
         row["applied"] = False
         row["apply_err"] = "empty diff"
-    chk = sh(["bash", CHECK, tdir, wdir])
+    try:
+        chk = sh(["bash", CHECK, tdir, wdir], env=GRADER_ENV)
+    finally:
+        if external is not None:
+            shutil.rmtree(os.path.dirname(wdir), ignore_errors=True)
     row["check_exit"] = chk.returncode
     check_out = (chk.stdout or "") + (chk.stderr or "")
     if external is None:
@@ -269,8 +284,11 @@ for tid in task_ids:
     else:
         # External (possibly sealed) tasks: hidden-oracle failures can print assertion values and
         # fixture data, so the row keeps only the gate id, never check.sh output (content-blind).
-        gate = re.search(r"FAIL\[([A-Za-z0-9_-]+)\]", check_out)
-        row["check_gate"] = "pass" if chk.returncode == 0 else (gate.group(1) if gate else "check-fail")
+        # check.sh exits right after its FAIL line, so its verdict is the last match; earlier ones
+        # can be candidate or oracle output. Only gate ids check.sh defines are recorded.
+        hits = re.findall(r"FAIL\[([^]\n]+)\]", check_out)
+        gate = hits[-1] if hits and hits[-1] in KNOWN_GATES else "check-fail"
+        row["check_gate"] = "pass" if chk.returncode == 0 else gate
     row["passed"] = row.get("applied", False) and chk.returncode == 0
     row["wall_s"] = round(time.time() - t0, 1)
     if external is not None:
