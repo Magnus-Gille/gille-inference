@@ -52,6 +52,7 @@ const EXPECTED_ENTRY = [
   "      /r/9b05354ec/bin/llama-server",
   "      --host 127.0.0.1 --port ${PORT}",
   "      -m /m/manual-35b.Q4_K_M.gguf",
+  "      --alias manual-35b",
   "      -mm /m/mmproj-BF16.gguf",
   "      --image-min-tokens 1024",
   "      -ngl 999 -ub 512 -c 65536 -np 1 --jinja -fa on",
@@ -109,6 +110,12 @@ describe("manual-promotion spec contract (#217)", () => {
       reasoning: "auto",
       ttl: 1800,
     });
+  });
+
+  it("serves the roster key as the backend model identity (--alias)", () => {
+    const spec = parseManualSpec(FULL_SPEC_TEXT);
+    const entry = renderManualEntry(spec);
+    expect(entry).toContain(`      -m ${spec.gguf}\n      --alias ${spec.key}\n`);
   });
 
   it("parses and renders an optional LoRA adapter next to the model artifacts", () => {
