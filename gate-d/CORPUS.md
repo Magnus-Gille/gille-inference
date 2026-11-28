@@ -74,9 +74,18 @@ Contract:
   aborts. The post-run checks must reproduce the pre-run identity exactly. Empty directories and file
   modes are outside the digest, as in the generator. There is no automatic restore for an external
   root: regenerate it (`generate.py --check-manifest` shows drift).
+- **Enumeration.** Listing the corpus digest-verifies every task first and reads its holdout
+  status from the verified bytes, so a tampered `meta.json` (for example a validation task
+  re-flagged `holdout: true`) aborts with exit 9 instead of silently shrinking the corpus.
 - **Sealing.** A task is sealed when its `meta.json` says `holdout: true` or the manifest's split is
   `sealed`. Sealed tasks need `GATE_D_INCLUDE_HOLDOUT=1` (code-loop: `--include-holdout`), are left
-  out of `all` without it, and are refused by name.
+  out of `all` without it, and are refused by name. **Local arms cannot run sealed tasks yet:** an
+  arm runs as the operator and could read the task root's `oracle/` and `solution/`, which no digest
+  check can detect. Until an OS boundary exists (a separate user or container that sees only the
+  seed), `run.sh` and `sweep.sh` refuse sealed external tasks even with the opt-in;
+  `GATE_D_ACCEPT_UNISOLATED_SEALED=1` overrides that only on an explicit owner decision, and such
+  rows must be reported as unisolated. The code-loop runner is not affected: its arm runs remotely
+  and receives only the seed files.
 - **Identity.** Rows take `corpusRevision`, `holdout`, `family`, `split` and `trap` from the
   digest-verified `meta.json`, and record the manifest digest as `taskRevision`. The external
   revision may not reuse a committed one (`gate-d-r1`, `gate-d-r2`). Resume and summaries key on
@@ -102,26 +111,32 @@ Contract:
   incapability: resume and summaries skip it, so a repaired sweep re-runs that seed). The gate runs
   first, before any candidate code executes, at-stop's visible tests included. `check.sh` then runs
   with `NODE_OPTIONS=--disallow-code-generation-from-strings` and `TSX_DISABLE_CACHE=1`, which
-  closes `(() => {}).constructor("…")`, the one escape a static gate cannot see. Why not run the
+  closes `(() => {}).constructor("…")`, the one escape a static gate cannot see, and with
+  `--no-experimental-fetch --no-experimental-websocket`, since the network globals need no import
+  or banned name. Why not run the
   gate for r1/r2 too: their recorded results were graded without it, and adding it there would
   change what an r1 pass means. Code-loop rows record it as `io_gate` (`pass`, `R3-io`,
   `R3-io-error`).
+- **Special files.** A FIFO, socket or device in the work dir is never read: the run fails
+  `G0-files` without at-stop or `check.sh` (a read could block outside every timeout), and the pi
+  telemetry recorder runs from the checkout rather than the work dir.
 - **Executing candidate code.** at-stop runs only after R3-io passes and after a non-executing scope
   check (the same write allowlist as `check.sh`'s G0-files gate) passes, so a workspace grading will
   reject, such as a rewritten `package.json` test script, is never executed for it. It then runs on
-  a throwaway copy of the work dir with a minimal environment (`PATH`, a throwaway `HOME`/`TMPDIR`,
-  no inherited tokens), so neither metric can change pass/fail. at-stop.sh calls the toolchain's own
-  `tsc` and `tsx --test test/*.test.ts` (never the workspace's npm scripts or binaries), and the
-  runner names that toolchain explicitly (`AT_STOP_TOOLCHAIN`) instead of trusting the work dir's
-  link. It runs with the same node hardening as `check.sh`. Together with R3-io, candidate modules
-  that execute can import only workspace modules (and `node:test`/`node:assert` in tests), cannot
-  name `process`, `require` or the global object, and cannot compile strings, so they have no handle
-  on files, processes or the network. Why not a real sandbox (a separate user or container that
-  cannot see the corpus, as the corpus's Harbor verifier uses): the operator hosts this runs on have
-  no such facility today, and `check.sh` itself already runs the oracle in-process under the same
-  boundary. Residual risk, unchanged from `check.sh`'s own oracle run: candidate code still runs as
-  the operator's OS user, so any gap in the static gate would have the operator's access. Only a
-  real sandbox removes that reliance on the gate.
+  a throwaway copy of the work dir, without its `.git` (which R3-io and the scope check never scan),
+  with a minimal environment (`PATH`, a throwaway `HOME`/`TMPDIR`, no inherited tokens), so neither
+  metric can change pass/fail. at-stop.sh calls the toolchain's own `tsc` and `tsx --test
+  test/*.test.ts` (never the workspace's npm scripts or binaries), and the runner names that
+  toolchain explicitly (`AT_STOP_TOOLCHAIN`) instead of trusting the work dir's link. It runs with
+  the same node hardening as `check.sh`. Together with R3-io, candidate modules that execute can
+  import only workspace modules (and `node:test`/`node:assert` in tests), cannot name `process`,
+  `require` or the global object, and cannot compile strings, so they have no handle on files,
+  processes or the network. Why not a real sandbox (a separate user or container that cannot see the
+  corpus, as the corpus's Harbor verifier uses): the operator hosts this runs on have no such
+  facility today, and `check.sh` itself already runs the oracle in-process under the same boundary.
+  Residual risk, unchanged from `check.sh`'s own oracle run: candidate code still runs as the
+  operator's OS user, so any gap in the static gate would have the operator's access. Only a real
+  sandbox removes that reliance on the gate.
 - **Code-loop runner.** `scripts/gate-d-code-loop.py --tasks-root` applies the same enumeration,
   sealing, digest and identity rules (manifest read once, held in memory) and records the at-stop
   fields, but no transcript fields. It grades inside the checkout as before, since its arm runs
@@ -136,7 +151,7 @@ not scripts. Re-copy them when CBATTLE-14 changes the originals; tests check eac
 | --- | --- | --- |
 | `vendor/code-battle-gate-d-r3/io-gate.mjs` | `gate-d-r3/io-gate.mjs`, sha256 `b9525b680f1c7a1c3082a7c6fa4ff437e68552d9b43e18e7b67c0f494f279437` | none (byte-identical) |
 | `gate-d/at-stop.sh` | `gate-d-r3/at-stop.sh` (sha256 in its header) | lines marked `# INFER-521-local`: a check that hits the cap is unmeasured, not red |
-| `scripts/pi-verification-telemetry.ts` | `gate-d-r3/telemetry/verification-telemetry.ts` | checks match the invoked program only (`command -v tsc` is not a check run); separators count only outside quotes, and an unsegmentable command credits no check; each check keeps its own position in the command; no CLI block |
+| `scripts/pi-verification-telemetry.ts` | `gate-d-r3/telemetry/verification-telemetry.ts` | checks match the invoked program only (`command -v tsc` is not a check run); separators count only outside quotes, and an unsegmentable command credits no check; each check keeps its own position in the command; a failed `&&` chain counts only its first segment; `#` comments and `--version`/`--help` are not checks; no CLI block |
 
 `io-gate.mjs` lives under `vendor/` rather than `gate-d/` because it is third-party code kept
 byte-identical: it loads `typescript` from the toolchain through `createRequire`, which the

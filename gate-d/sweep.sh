@@ -51,7 +51,7 @@ if [ -n "${GATE_D_TASKS_ROOT+set}" ]; then
 fi
 if [ "${1:-}" = "--list-tasks" ]; then gd_corpus tasks; exit $?; fi
 CORPUS_REVISION="$(gd_corpus revision)" || exit 3
-TASKS="$(gd_corpus tasks)" || exit 3
+TASKS="$(gd_corpus tasks)" || { rc=$?; [ "$rc" = 9 ] || rc=3; exit "$rc"; }  # 9: a task failed its digest check
 if [ "$EXTERNAL" = 1 ]; then
   GATE_D_EXPECT_MANIFEST_SHA="$MANIFEST_SHA"; export GATE_D_EXPECT_MANIFEST_SHA
   # id -> [digest, holdout]: the same task bytes can be validation in one manifest and sealed in
@@ -125,7 +125,8 @@ for arm in $ARMS; do
       # A failed runner wrote no row for this invocation, so the last row belongs to an earlier run:
       # stop before consulting it rather than acting on stale state.
       if [ "$rc" -ne 0 ]; then echo "=== SWEEP aborted: run.sh exited $rc on $arm/$MODEL/$t ===" | tee -a "$LOG"; exit "$rc"; fi
-      [ "$(last_exit)" = "arm-error" ] && reset_model
+      # R3-io-error rows can hide an arm-error (the grader failure wins in the row), so reset then too.
+      case "$(last_exit)" in arm-error|R3-io-error) reset_model;; esac
     done
   done
 done

@@ -245,16 +245,24 @@ def _is_holdout(manifest: dict[str, Any], meta: dict[str, Any]) -> bool:
     return meta.get("holdout") is True or manifest.get("split") == "sealed"
 
 
+class TaskIntegrityError(ExternalCorpusError):
+    """A task failed its digest or metadata check while the corpus was enumerated (exit 9)."""
+
+
 def external_tasks(root: Path, manifest: dict[str, Any], include_holdout: bool) -> list[str]:
     """Runnable task ids in manifest order; sealed tasks only with the holdout opt-in.
 
-    Holdout status is read from the unverified meta.json here, for enumeration only; the runner
-    re-derives it from the digest-verified copy before it runs a task.
+    Every task is digest-verified first and its holdout status read from the verified bytes, so a
+    tampered meta.json (for example a validation task re-flagged `holdout: true`) aborts the whole
+    enumeration instead of silently shrinking the corpus (Codex review, INFER-521).
     """
     selected = []
     for entry in manifest["tasks"]:
-        meta = _read_meta(root / entry["id"])
-        if include_holdout or not _is_holdout(manifest, meta):
+        try:
+            identity = verify_external_task(root, manifest, entry["id"], include_holdout=True)
+        except ExternalCorpusError as error:
+            raise TaskIntegrityError(str(error)) from error
+        if include_holdout or not identity["holdout"]:
             selected.append(entry["id"])
     return selected
 
@@ -306,6 +314,10 @@ def verify_external_task(root: Path, manifest: dict[str, Any], task_id: str,
 HARNESS_FILES = {".arm.log", ".arm.stderr.log", ".arm-telemetry.json", ".check.log"}
 
 
+class SpecialWorkspaceFile(ExternalCorpusError):
+    """The workspace holds a FIFO, socket or device: reading it could block grading."""
+
+
 def _listing(base: Path) -> dict[str, Path]:
     out: dict[str, Path] = {}
     for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
@@ -330,6 +342,12 @@ def scope_violations(task_dir: Path, work_dir: Path) -> list[str]:
     if meta.get("hiddenOracle") and meta.get("oracleCmd"):
         allowed.add(meta["oracleCmd"])
     seed, work = _listing(task_dir / "repo"), _listing(work_dir)
+    # Before any content is read: a FIFO swapped in for a protected file would block read_bytes()
+    # (and check.sh's cmp) outside every timeout (Codex review, INFER-521).
+    for rel, path in work.items():
+        mode = os.lstat(path).st_mode
+        if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+            raise SpecialWorkspaceFile(f"{rel} is not a regular file or symlink")
     bad = []
     for rel in sorted(set(seed) | set(work)):
         if rel in HARNESS_FILES or rel in allowed:
@@ -427,6 +445,9 @@ def main() -> int:
             parser.error("--revision selects a committed revision and cannot be combined with --tasks-root")
         try:
             return external_main(args, parser)
+        except TaskIntegrityError as error:
+            # Same exit as a runner's own manifest check: the corpus drifted, nothing may run.
+            parser.exit(9, f"error: {error}\n")
         except (ValueError, OSError) as error:
             parser.exit(2, f"error: {error}\n")
     if args.command == "scope-check":
@@ -435,6 +456,9 @@ def main() -> int:
             parser.error("scope-check requires a task directory and --work")
         try:
             bad = scope_violations(Path(args.task_id), Path(args.work))
+        except SpecialWorkspaceFile as error:
+            # Exit 3: the workspace must not be graded at all (check.sh would block on it).
+            parser.exit(3, f"error: special file in the workspace: {error}\n")
         except (ValueError, OSError) as error:
             parser.exit(2, f"error: {error}\n")
         if bad:

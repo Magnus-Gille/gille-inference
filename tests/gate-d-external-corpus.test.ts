@@ -519,17 +519,77 @@ sys.exit(1)
     expect(res.stdout).toContain("cannot scan");
   });
 
+  it("reports a task re-flagged as holdout as drift instead of dropping it", () => {
+    const repo = fixtureRepo();
+    const root = corpus();
+    const meta = join(root, TASK_B, "meta.json");
+    writeFileSync(meta, JSON.stringify({ ...JSON.parse(readFileSync(meta, "utf8")), holdout: true }, null, 2) + "\n");
+    const { bin, log } = fakeBin(root);
+    let r = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["--list-tasks"]);
+    expect(r.res.status).toBe(9);
+    expect(r.res.stderr).toContain("does not match the manifest");
+    r = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", "all"]);
+    expect(r.res.status).toBe(9);
+    expect(calls(log)).toEqual([]);
+  });
+
+  it("fails a workspace holding a FIFO without reading it", () => {
+    const repo = fixtureRepo();
+    const root = corpus();
+    // The arm swaps a protected file for a FIFO; a read would block forever.
+    const { bin } = fakeBin(root, `if (task === ${JSON.stringify(TASK_B)}) { fs.rmSync(path.join(cwd, "tsconfig.json"));
+  require("child_process").execFileSync("mkfifo", [path.join(cwd, "tsconfig.json")]); }`);
+    const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", TASK_B]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(rows(out)[0]).toMatchObject({ task: TASK_B, pass: false, exitClass: "G0-files", atStopTypecheck: null });
+  });
+
+  it("keeps a module hidden in .git out of at-stop's copy", () => {
+    const repo = fixtureRepo();
+    const root = corpus();
+    const marker = join(tmp("gd-ext-mark-"), "ran");
+    // The visible test imports a module under .git, which R3-io and the scope check never scan.
+    const { bin } = fakeBin(root, `if (task === ${JSON.stringify(TASK_B)}) {
+  fs.writeFileSync(path.join(cwd, ".git", "evil.ts"), 'import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "x");\\n');
+  fs.appendFileSync(path.join(cwd, "src", "paginate.ts"), '\\nimport "../.git/evil.ts";\\n'); }`);
+    const { res } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", TASK_B]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("grades with network globals disabled", () => {
+    const repo = fixtureRepo();
+    const root = corpus();
+    // fetch needs no import and no banned name, so R3-io passes it; the oracle must see no fetch.
+    const { bin } = fakeBin(root, `if (task === ${JSON.stringify(TASK_A)}) fs.writeFileSync(path.join(cwd, "src", "sum.ts"),
+  'export function sum(xs: number[]): number { if (typeof fetch === "function") return -1; return xs.reduce((a, x) => a + x, 0); }\\n');`);
+    const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", TASK_A]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(rows(out)[0]).toMatchObject({ task: TASK_A, pass: true });
+  });
+
+  it("records a grader failure over an arm error", () => {
+    const repo = fixtureRepo();
+    writeFileSync(join(repo, "vendor", "code-battle-gate-d-r3", "io-gate.mjs"), "throw new Error('broken gate');\n");
+    const root = corpus();
+    const { bin } = fakeBin(root, "process.exit(1);");
+    const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", TASK_A]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(rows(out)[0]).toMatchObject({ task: TASK_A, pass: false, exitClass: "R3-io-error" });
+  });
+
   it("refuses a meta.json that is a FIFO without blocking", () => {
     const repo = fixtureRepo();
     const root = corpus();
     rmSync(join(root, TASK_B, "meta.json"));
     expect(spawnSync("mkfifo", [join(root, TASK_B, "meta.json")]).status).toBe(0);
     const { bin, log } = fakeBin(root);
+    // Enumeration digest-verifies every task, so the FIFO is an integrity failure (exit 9).
     let { res } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["--list-tasks"]);
-    expect(res.status).toBe(2);
+    expect(res.status).toBe(9);
     expect(res.stderr).toContain("not a regular file");
     ({ res } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", "all"]));
-    expect(res.status).toBe(3);
+    expect(res.status).toBe(9);
     expect(res.stderr).toContain("not a regular file");
     expect(calls(log)).toEqual([]);
   });
@@ -607,7 +667,14 @@ sys.exit(1)
     expect(r.res.status).toBe(3);
     expect(r.res.stderr).toContain("sealed");
     expect(calls(log)).toEqual([]);
+    // With the opt-in, a local arm is still refused: nothing isolates it from the sealed corpus.
     r = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root, GATE_D_INCLUDE_HOLDOUT: "1" }, ["pi", TASK_A]);
+    expect(r.res.status).toBe(3);
+    expect(r.res.stderr).toContain("could read the sealed corpus");
+    expect(calls(log)).toEqual([]);
+    expect(rows(r.out)).toEqual([]);
+    r = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root, GATE_D_INCLUDE_HOLDOUT: "1", GATE_D_ACCEPT_UNISOLATED_SEALED: "1" },
+      ["pi", TASK_A]);
     expect(r.res.status, r.res.stderr).toBe(0);
     expect(rows(r.out)[0]).toMatchObject({ holdout: true, split: "sealed", pass: true });
   });
@@ -781,7 +848,7 @@ describe("gate-d/sweep.sh external task root (INFER-521)", { timeout: 240_000 },
     expect(calls(log)).toHaveLength(2);
     // Same task bytes and digests, now under a sealed manifest.
     writeManifest(root, "gate-d-r3", "sealed");
-    r = runGateD(repo, bin, { ...env, GATE_D_INCLUDE_HOLDOUT: "1" }, [], "sweep.sh");
+    r = runGateD(repo, bin, { ...env, GATE_D_INCLUDE_HOLDOUT: "1", GATE_D_ACCEPT_UNISOLATED_SEALED: "1" }, [], "sweep.sh");
     expect(r.res.status, r.res.stderr).toBe(0);
     expect(calls(log)).toHaveLength(4);
     expect(rows(env.GATE_D_OUT).map((x) => x.holdout)).toEqual([false, false, true, true]);

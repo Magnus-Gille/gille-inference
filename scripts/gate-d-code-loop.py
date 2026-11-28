@@ -193,8 +193,10 @@ AT_STOP = os.path.join(REPO, "gate-d", "at-stop.sh")
 IO_GATE = os.path.join(REPO, "vendor", "code-battle-gate-d-r3", "io-gate.mjs")
 # check.sh for external corpora, as gate-d/run.sh runs it (INFER-521): no code generation from
 # strings and no tsx cache in any node process it starts.
+# No network either: fetch and WebSocket are globals the R3-io gate cannot ban (Codex review).
+GRADING_NODE_OPTIONS = "--disallow-code-generation-from-strings --no-experimental-fetch --no-experimental-websocket"
 HARDENED_ENV = dict(CHILD_ENV, TSX_DISABLE_CACHE="1", NODE_OPTIONS=" ".join(
-    x for x in ("--disallow-code-generation-from-strings", CHILD_ENV.get("NODE_OPTIONS", "")) if x))
+    x for x in (GRADING_NODE_OPTIONS, CHILD_ENV.get("NODE_OPTIONS", "")) if x))
 
 
 def io_gate(tdir, wdir):
@@ -238,13 +240,15 @@ def at_stop(tdir, wdir):
     try:
         for d in (scratch, home):
             shutil.rmtree(d, ignore_errors=True)
-        shutil.copytree(wdir, scratch, symlinks=True)
+        # No .git in the copy: R3-io and the scope check never inspect it, so a module placed there
+        # could otherwise be imported and executed by the visible tests (Codex review, INFER-521).
+        shutil.copytree(wdir, scratch, symlinks=True, ignore=lambda d, names: [".git"] if d == wdir else [])
         os.mkdir(home, 0o700)
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": home, "TMPDIR": home,
                "LANG": os.environ.get("LANG", "C"), "AT_STOP_CAP_S": os.environ.get("AT_STOP_CAP_S", "120"),
                # Named explicitly, never taken from the candidate-controlled node_modules link.
                "AT_STOP_TOOLCHAIN": os.path.join(REPO, "node_modules"),
-               "NODE_OPTIONS": "--disallow-code-generation-from-strings", "TSX_DISABLE_CACHE": "1"}
+               "NODE_OPTIONS": GRADING_NODE_OPTIONS, "TSX_DISABLE_CACHE": "1"}
         res = subprocess.run(["bash", AT_STOP, tdir, scratch], cwd=scratch, capture_output=True, text=True,
                              timeout=300, stdin=subprocess.DEVNULL, env=env)
         if res.returncode == 0:

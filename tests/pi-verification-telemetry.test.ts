@@ -108,10 +108,12 @@ test("edit-and-check in one command records the edit before the check (Codex rev
   assert.equal(g.bashMutations, 1);
   assert.equal(g.testsAfterLastEdit, true);
   assert.equal(g.verificationClass, "checked-green-after-last-edit");
-  // The chain failed: the edit may still have happened and the test outcome is unknown.
+  // The chain failed: the edit (first segment) surely ran, the test may have been skipped. INFER-521
+  // deviation (third Codex review): an unconfirmed check is not counted as a run.
   const r = run(start("1", "bash", "sed -i 's/x/y/' src/a.ts && npm test"), end("1", "bash", false));
   assert.equal(r.edits, 1);
-  assert.equal(r.verificationClass, "checked-after-last-edit-unknown");
+  assert.equal(r.testRuns, 0);
+  assert.equal(r.verificationClass, "never-checked");
   // Check first, then edit: the check is before the last edit.
   const a = run(start("1", "bash", "npm test && sed -i 's/x/y/' src/a.ts"), end("1", "bash", true));
   assert.equal(a.verificationClass, "checked-before-last-edit-only");
@@ -190,4 +192,32 @@ test("a command that cannot be segmented credits no check but still counts its e
   const h = classifyCommand("cat > src/a.ts <<'EOF'\nexport const a = 1;\nEOF\nnpm test");
   assert.deepEqual(h.kinds, []);
   assert.equal(h.mutates, true);
+});
+
+// Third Codex review of INFER-521.
+test("a failed && chain counts only its first segment as executed", () => {
+  const f = run(start("e", "edit"), end("e", "edit", true), start("1", "bash", "false && npm test"), end("1", "bash", false));
+  assert.equal(f.testRuns, 0);
+  assert.equal(f.ambiguousCheckOutcomes, 1);
+  // The test ran first and failed; the sed after it never ran, so the run stopped on red-or-unknown
+  // after the last edit rather than "checked before the last edit".
+  const t = run(start("e", "edit"), end("e", "edit", true), start("1", "bash", "npm test && sed -i 's/a/b/' src/x.ts"), end("1", "bash", false));
+  assert.equal(t.edits, 1);
+  assert.equal(t.testsAfterLastEdit, true);
+  assert.equal(t.lastTestOutcome, "unknown");
+});
+
+test("version and help queries are not verification", () => {
+  assert.deepEqual(classifyCommand("npx tsc --version").kinds, []);
+  assert.deepEqual(classifyCommand("npm test --help").kinds, []);
+  assert.deepEqual(classifyCommand("tsc -v").kinds, []);
+  const s = run(start("e", "edit"), end("e", "edit", true), start("1", "bash", "npx tsc --version"), end("1", "bash", true));
+  assert.equal(s.verificationClass, "never-checked");
+});
+
+test("separators inside shell comments do not create checks", () => {
+  assert.deepEqual(classifyCommand("true # tests skipped; npm test").kinds, []);
+  assert.deepEqual(classifyCommand("npx tsc --noEmit # then; npm test").kinds, ["typecheck"]);
+  assert.deepEqual(classifyCommand("echo a#b && npm test").kinds, ["tests"]);
+  assert.deepEqual(classifyCommand("# note\nnpm test").kinds, ["tests"]);
 });

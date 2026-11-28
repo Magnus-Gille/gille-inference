@@ -8,7 +8,9 @@
  *  - segments are split outside quotes only, and a command that cannot be segmented reliably
  *    (unbalanced quotes, heredoc, command substitution) credits no check;
  *  - each check and mutation inside one command keeps its own segment position, so
- *    `tsc && sed -i ... && npm test` does not count the typecheck as after the edit.
+ *    `tsc && sed -i ... && npm test` does not count the typecheck as after the edit;
+ *  - a failed `&&` chain counts only its first segment as executed (`false && npm test` is no test
+ *    run), unquoted `#` comments are ignored, and `--version`/`--help` queries are not checks.
  * The CLI block is dropped.
  * gate-d/run.sh feeds pi's NDJSON stream to it through scripts/pi-benchmark-telemetry.ts, so the
  * runner never executes code from an external task root. Re-port it when the corpus changes it, and
@@ -73,12 +75,17 @@ interface PendingCheck {
   kinds: CheckKind[];
   /** Position of each check (parallel to kinds), from segmentPosition. */
   positions: number[];
+  /** Segment index of each check (parallel to kinds). */
+  segments: number[];
   attribution: Attribution;
 }
 
 interface PendingMutation {
   /** Position of the command's last mutating segment, from segmentPosition. */
   position: number;
+  /** Position of the first segment if that segment mutates (the only one a failed `&&` chain surely ran). */
+  firstSegmentPosition: number | null;
+  attribution: Attribution;
   /** The command also runs a check, so a non-zero exit does not show that the mutation failed. */
   withChecks: boolean;
 }
@@ -115,6 +122,11 @@ function splitShell(command: string): { segments: string[]; separators: Set<stri
     if (c === "'" || c === '"') { quote = c; current += c; continue; }
     if (c === "`" || (c === "$" && next === "(")) parseable = false;
     if (c === "<" && next === "<") parseable = false; // heredoc or here-string
+    if (c === "#" && (current === "" || /\s$/.test(current))) {
+      // An unquoted comment runs to the end of the line: nothing in it executes (Codex review).
+      while (i + 1 < command.length && command[i + 1] !== "\n") i++;
+      continue;
+    }
     if ((c === "&" && next === "&") || (c === "|" && next === "|")) { separators.add(c + next); cut(); i++; continue; }
     if (c === "|") { separators.add("|"); current += c; continue; }
     if (c === "&" && command[i - 1] !== ">" && next !== ">") { separators.add("&"); cut(); continue; } // background
@@ -150,6 +162,8 @@ const TESTS = [
 ];
 const MUTATING_BASH = [/\bsed\s+-i/, /(^|[^>2&])>{1,2}\s*[^&\s]/, /\btee\b/, /\b(mv|cp|rm)\s/, /\bperl\s+-p?i/, /\bpatch\b/];
 
+// `tsc --version`, `npm test --help` and the like discover a tool; they check nothing (Codex review).
+const INFO_ONLY = /(^|\s)(--version|-v|-V|--help|-h)(\s|$)/;
 // Checkers and runtimes whose own redirects (`npm test > out.log`) are not source edits.
 const CHECK_TOOL = /^(npm|npx|pnpm|yarn|tsc|node|tsx|vitest|jest)(\s|$)/;
 
@@ -182,6 +196,8 @@ export function classifyCommand(command: string): {
   mutates: boolean;
   /** Segment index of the last mutating segment (null when nothing mutates). */
   mutationSegment: number | null;
+  /** Every mutating segment's index, in order. */
+  mutationSegments: number[];
   /** Where the last mutating segment sits relative to the check segments (null when nothing mutates). */
   mutationPosition: "before-checks" | "after-checks" | null;
 } {
@@ -191,7 +207,8 @@ export function classifyCommand(command: string): {
     // still counts as an edit (`cat > src/a.ts <<EOF ...`), after anything it might have checked.
     const mutates = MUTATING_BASH.some((re) => re.test(command));
     return { kinds: [], checkSegments: [], segmentCount: 1, attribution: "none", mutates,
-      mutationSegment: mutates ? 0 : null, mutationPosition: mutates ? "after-checks" : null };
+      mutationSegment: mutates ? 0 : null, mutationSegments: mutates ? [0] : [],
+      mutationPosition: mutates ? "after-checks" : null };
   }
   const segments = split.segments;
   const kinds: CheckKind[] = []; // one entry per check segment, so `npm test && … && npm test` counts twice
@@ -199,9 +216,11 @@ export function classifyCommand(command: string): {
   let checkSegmentCount = 0;
   let lastCheck = -1;
   let lastMutation = -1;
+  const mutationSegments: number[] = [];
   segments.forEach((raw, i) => {
     const seg = normalizeSegment(raw);
     let hit = false;
+    if (INFO_ONLY.test(seg)) return; // neither a check nor an edit
     if (TYPECHECK.some((re) => re.test(seg))) { kinds.push("typecheck"); checkSegments.push(i); hit = true; }
     if (TESTS.some((re) => re.test(seg))) { kinds.push("tests"); checkSegments.push(i); hit = true; }
     if (hit) {
@@ -209,6 +228,7 @@ export function classifyCommand(command: string): {
       lastCheck = i;
     } else if (!CHECK_TOOL.test(seg) && MUTATING_BASH.some((re) => re.test(seg))) {
       lastMutation = i; // `echo x > src/a.ts` mutates; `npm test > log` is a check, not an edit
+      mutationSegments.push(i);
     }
   });
   // A pipe hides the check's exit status (`npm test | tail` exits with tail's status); so do `;`,
@@ -220,7 +240,7 @@ export function classifyCommand(command: string): {
   // "after-checks": nothing re-checks after it (`test && sed`, or a mutation with no check at all).
   const mutationPosition = !mutates ? null : lastCheck > lastMutation ? "before-checks" : "after-checks";
   return { kinds, checkSegments, segmentCount: segments.length, attribution, mutates,
-    mutationSegment: mutates ? lastMutation : null, mutationPosition };
+    mutationSegment: mutates ? lastMutation : null, mutationSegments, mutationPosition };
 }
 
 /** Outcome of a finished pi bash tool call; pi appends `Command exited with code N` on failure. */
@@ -274,10 +294,12 @@ export function createVerificationTelemetry() {
             const c = classifyCommand(command);
             const at = (i: number) => segmentPosition(seq, i, c.segmentCount);
             if (c.kinds.length > 0) {
-              pending.set(id, { kinds: c.kinds, positions: c.checkSegments.map(at), attribution: c.attribution });
+              pending.set(id, { kinds: c.kinds, positions: c.checkSegments.map(at), segments: c.checkSegments,
+                attribution: c.attribution });
             }
             if (c.mutationSegment !== null) {
-              pendingMutations.set(id, { position: at(c.mutationSegment), withChecks: c.kinds.length > 0 });
+              pendingMutations.set(id, { position: at(c.mutationSegment), withChecks: c.kinds.length > 0,
+                firstSegmentPosition: c.mutationSegments[0] === 0 ? at(0) : null, attribution: c.attribution });
             }
           }
         }
@@ -287,7 +309,18 @@ export function createVerificationTelemetry() {
         const m = pendingMutations.get(id);
         if (m !== undefined) {
           pendingMutations.delete(id);
-          if (ev["isError"] === false || m.withChecks) {
+          if (ev["isError"] === false) {
+            bashMutations++;
+            noteEdit(m.position);
+          } else if (m.attribution === "and-chain") {
+            // A failed `a && b && c` surely ran only `a`; later segments may have been skipped
+            // (Codex review). Count the edit only when the first segment is the mutation.
+            if (m.firstSegmentPosition !== null) {
+              bashMutations++;
+              noteEdit(m.firstSegmentPosition);
+            }
+          } else if (m.withChecks) {
+            // `;`, `||` or pipes: the non-zero status may come from the check; assume the edit ran.
             bashMutations++;
             noteEdit(m.position);
           }
@@ -297,11 +330,17 @@ export function createVerificationTelemetry() {
           pending.delete(id);
           const raw = outcomeOf(ev);
           let outcome: Outcome = raw === "error" ? "unknown" : raw;
-          if (p.attribution === "none" || (p.attribution === "and-chain" && outcome === "failed")) {
+          // A failed `&&` chain surely ran only its first segment: checks after it may never have
+          // run, so they are not counted as runs (Codex review).
+          const unconfirmed = p.attribution === "and-chain" && ev["isError"] !== false;
+          if (p.attribution === "none" || unconfirmed) {
             ambiguousCheckOutcomes++;
             outcome = "unknown";
           }
-          p.kinds.forEach((kind, i) => checks.push({ kind, seq: p.positions[i]!, outcome }));
+          p.kinds.forEach((kind, i) => {
+            if (unconfirmed && p.segments[i] !== 0) return;
+            checks.push({ kind, seq: p.positions[i]!, outcome });
+          });
         }
       }
     },

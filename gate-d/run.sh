@@ -8,7 +8,8 @@
 # <dir>/corpus-manifest.json (code-battle's gate-d-r3 generator writes it) instead of gate-d/tasks.
 # The root must live outside this checkout. Each task directory is digest-checked against the
 # manifest before the arm, after the arm and after grading; any mismatch aborts without a row
-# (exit 9). Sealed tasks (holdout) need GATE_D_INCLUDE_HOLDOUT=1, as r2 does. Rows take
+# (exit 9). Sealed tasks (holdout) need GATE_D_INCLUDE_HOLDOUT=1, as r2 does, and are refused for
+# local arms until an OS boundary hides the task root from them (see CORPUS.md). Rows take
 # corpusRevision, holdout, family, split and trap from the verified meta.json and record the
 # manifest digest as taskRevision, and gain the at-stop and pi verification-telemetry fields.
 #
@@ -123,7 +124,7 @@ PY
 fi
 if [ "${1:-}" = "--list-tasks" ]; then gd_corpus tasks; exit $?; fi
 CORPUS_REVISION="$(gd_corpus revision)" || exit 3
-TASK_IDS="$(gd_corpus tasks)" || exit 3
+TASK_IDS="$(gd_corpus tasks)" || { rc=$?; [ "$rc" = 9 ] || rc=3; exit "$rc"; }  # 9: a task failed its digest check
 
 ARM="${1:?usage: run.sh <pi|aider|opencode|qwen-code> <task-id|all>}"
 SEL="${2:?usage: run.sh <pi|aider|opencode|qwen-code> <task-id|all>}"
@@ -147,9 +148,12 @@ CAP_S="${CAP_S:-600}"
 TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
 # check.sh, hardened for external corpora (see gate R3-io below): no code generation from strings
 # and no tsx cache in any node process it starts.
+# No network either: fetch and WebSocket are globals, reachable without an import or a name the
+# R3-io gate bans (Codex review, INFER-521).
+GRADING_NODE_OPTIONS="--disallow-code-generation-from-strings --no-experimental-fetch --no-experimental-websocket"
 run_check(){
   if [ "$EXTERNAL" = 1 ]; then
-    NODE_OPTIONS="--disallow-code-generation-from-strings${NODE_OPTIONS:+ $NODE_OPTIONS}" TSX_DISABLE_CACHE=1 \
+    NODE_OPTIONS="$GRADING_NODE_OPTIONS${NODE_OPTIONS:+ $NODE_OPTIONS}" TSX_DISABLE_CACHE=1 \
       bash "$ROOT/check.sh" "$1" "$2" >"$2/.check.log" 2>&1
   else
     bash "$ROOT/check.sh" "$1" "$2" >"$2/.check.log" 2>&1
@@ -231,6 +235,16 @@ run_one() {
       exit 9
     fi
     task_revision=""; holdout=""   # taken from $identity when the row is written
+    # Sealed tasks never run through a local arm without an OS boundary (Codex review, INFER-521).
+    # A local arm runs as the operator, so it could read the task root's oracle/ and solution/ and
+    # no digest check can see a read. Nothing here provides that boundary yet, so a sealed run is
+    # refused unless the owner explicitly accepts an unisolated one for this invocation.
+    if [ "$(printf %s "$identity" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("holdout") is True)')" = True ] \
+       && [ "${GATE_D_ACCEPT_UNISOLATED_SEALED:-}" != 1 ]; then
+      echo "error: $id is sealed, and a local arm could read the sealed corpus (no OS isolation is available)." >&2
+      echo "       Sealed external tasks are refused; set GATE_D_ACCEPT_UNISOLATED_SEALED=1 only on an explicit owner decision (gate-d/CORPUS.md)." >&2
+      exit 3
+    fi
   else
     task_revision="$(metaget "$T/meta.json" corpusRevision)"; task_revision="${task_revision:-gate-d-r1}"
     holdout="$(metaget "$T/meta.json" holdout)"; holdout="${holdout:-false}"
@@ -353,8 +367,10 @@ PY
           && export GIT_CEILING_DIRECTORIES="$WORKROOT" \
           && HS_API_KEY="$GW_KEY" "$TIMEOUT_BIN" "$CAP_S" pi --provider "${PI_PROVIDER:-inference-gille}" --model "$MODEL" \
              --no-session --print --mode json ${PROMPT_FILE:+--append-system-prompt "$PROMPT_FILE"} "$instr" </dev/null 2>"$W/.arm.stderr.log" \
-             | "$REPO_ROOT/node_modules/.bin/tsx" "$REPO_ROOT/scripts/pi-benchmark-telemetry.ts" \
-                 --log "$W/.arm.log" --summary "$W/.arm-telemetry.json" ) || status="arm-error"
+             | ( cd "$REPO_ROOT" && "$REPO_ROOT/node_modules/.bin/tsx" "$REPO_ROOT/scripts/pi-benchmark-telemetry.ts" \
+                 --log "$W/.arm.log" --summary "$W/.arm-telemetry.json" ) ) || status="arm-error"
+      # The recorder runs from the checkout, not from $W: tsx reads ./tsconfig.json, and an arm that
+      # replaces the work dir's tsconfig.json with a FIFO would otherwise hang it (Codex review).
       ;;
     aider)
       ( cd "$W" \
@@ -490,21 +506,29 @@ PY
   # allowlist as check.sh's G0-files gate. A workspace that grading will reject anyway (for example
   # a rewritten package.json test script) is never executed; its at-stop fields stay null. Then the
   # copy runs with a minimal environment: no inherited credentials or tokens, and a throwaway HOME.
-  local AT_STOP_JSON="{}" AT_STOP_W="" AT_STOP_HOME="" at_stop_skip=""
+  local AT_STOP_JSON="{}" AT_STOP_W="" AT_STOP_HOME="" at_stop_skip="" special_file="" scope_rc=0
   if [ "$EXTERNAL" = 1 ]; then
-    if [ -n "$io_failed" ]; then
+    python3 "$CORPUS_TOOL" scope-check "$T" --work "$W" 2>/dev/null || scope_rc=$?
+    if [ "$scope_rc" = 3 ]; then
+      # A FIFO, socket or device in the workspace: neither at-stop nor check.sh may read it, since
+      # a read could block outside every timeout. The run fails G0-files without being graded.
+      special_file=1
+      at_stop_skip="the workspace holds a special file, so it is not graded"
+    elif [ -n "$io_failed" ]; then
       at_stop_skip="gate $io_failed failed, so no candidate code is executed"
-    elif ! python3 "$CORPUS_TOOL" scope-check "$T" --work "$W" 2>/dev/null; then
+    elif [ "$scope_rc" != 0 ]; then
       at_stop_skip="out-of-scope changes (grading will reject them)"
     elif [ ! -f "$ROOT/at-stop.sh" ]; then
       at_stop_skip="gate-d/at-stop.sh is missing"
     elif AT_STOP_W="$(mktemp -d "$WORKROOT/${id}-atstop-XXXX")" \
          && AT_STOP_HOME="$(mktemp -d "$WORKROOT/${id}-atstop-home-XXXX")" \
-         && cp -R "$W/." "$AT_STOP_W/"; then
+         && cp -R "$W/." "$AT_STOP_W/" && rm -rf "$AT_STOP_W/.git"; then
+      # No .git in the copy: R3-io and the scope check never inspect it, so a module placed there
+      # could otherwise be imported and executed by the visible tests (Codex review, INFER-521).
       AT_STOP_JSON="$( cd "$AT_STOP_W" && env -i PATH="$PATH" HOME="$AT_STOP_HOME" TMPDIR="$AT_STOP_HOME" \
           LANG="${LANG:-C}" GIT_CEILING_DIRECTORIES="$WORKROOT" AT_STOP_CAP_S="${AT_STOP_CAP_S:-120}" \
           AT_STOP_TOOLCHAIN="$REPO_ROOT/node_modules" TSX_DISABLE_CACHE=1 \
-          NODE_OPTIONS="--disallow-code-generation-from-strings" \
+          NODE_OPTIONS="$GRADING_NODE_OPTIONS" \
           "$TIMEOUT_BIN" "${AT_STOP_WALL_S:-300}" bash "$ROOT/at-stop.sh" "$T" "$AT_STOP_W" </dev/null 2>/dev/null )" \
         || AT_STOP_JSON="{}"
     fi
@@ -516,7 +540,13 @@ PY
     fi
   fi
   local pass="false" exitclass="$status"
-  if [ -n "$io_failed" ]; then
+  if [ "$io_failed" = "R3-io-error" ]; then
+    # A grader failure wins over the arm status: the row is ungraded whatever the arm did, and
+    # sweep.sh both resets the model after it and leaves the seed open (Codex review, INFER-521).
+    exitclass="R3-io-error"
+  elif [ -n "$special_file" ]; then
+    if [ "$status" = "arm-error" ]; then exitclass="arm-error"; else exitclass="G0-files"; fi
+  elif [ -n "$io_failed" ]; then
     if [ "$status" = "arm-error" ]; then exitclass="arm-error"; else exitclass="$io_failed"; fi
   elif run_check "$T" "$W"; then pass="true"; exitclass="pass"
   elif [ "$status" = "arm-error" ]; then exitclass="arm-error"
