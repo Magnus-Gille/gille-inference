@@ -7,7 +7,7 @@ callers must refuse on every non-zero status.
 
 A relative <path> is taken against the current directory. Only a missing suffix may be absent:
 the nearest existing ancestor must be a directory, and any other lookup error (a regular file
-used as a directory, a permission failure) is an error rather than "outside". That ancestor is
+used as a directory, a permission failure, a dangling symlink) is an error rather than "outside". That ancestor is
 resolved to its physical path before its parents are walked, so a symlink pointing anywhere
 inside <dir> is caught. Directory identities (st_dev, st_ino) are compared rather than spellings,
 so a case alias on a case-insensitive volume is caught too.
@@ -28,14 +28,23 @@ try:
     target = os.stat(sys.argv[2])
 except OSError as e:
     fail(f"cannot stat {sys.argv[2]}: {e}")
+if not stat.S_ISDIR(target.st_mode):
+    fail(f"{sys.argv[2]} is not a directory")
 path = sys.argv[1]
 if not os.path.isabs(path):
-    path = os.path.join(os.getcwd(), path)
+    try:
+        path = os.path.join(os.getcwd(), path)
+    except OSError as e:
+        fail(f"cannot resolve the current directory: {e}")
 while True:
     try:
         st = os.stat(path)
         break
     except FileNotFoundError:
+        # A dangling symlink also reports "not found"; dropping its name would walk the link's
+        # parent instead of its destination, so refuse it.
+        if os.path.lexists(path):
+            fail(f"{path} is a dangling symlink")
         parent = os.path.dirname(path)
         if parent == path:
             fail(f"no existing ancestor of {sys.argv[1]}")

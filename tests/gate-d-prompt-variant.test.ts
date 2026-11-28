@@ -580,6 +580,18 @@ describe("gate-d/run.sh pi prompt variants (INFER-519)", { timeout: 120_000 }, (
     // A regular file used as a directory is a lookup error, never "outside".
     expect(inside(join(outside, "plain-file", "work"))).toBe(2);
     expect(inside(join(outside, "plain-file"))).toBe(2);
+    // A dangling symlink whose destination would be inside the checkout is refused, not walked past.
+    const dangling = join(outside, "dangling");
+    symlinkSync(join(repo, "gate-d", "not-created-yet"), dangling);
+    expect(inside(dangling)).toBe(2);
+    expect(inside(join(dangling, "work"))).toBe(2);
+    // A protected "directory" that is a regular file is an invalid invocation.
+    const notDir = spawnSync("python3", [join(repo, "gate-d", "path-inside.py"), outside, join(outside, "plain-file")], {
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    expect(notDir.error).toBeUndefined();
+    expect(notDir.status).toBe(2);
     expect(inside(join(outside, "work"))).toBe(0);
     expect(inside(dirname(repo))).toBe(0);
     // A target that cannot be read is an error, never "outside"; run.sh refuses on any non-zero status.
@@ -590,6 +602,20 @@ describe("gate-d/run.sh pi prompt variants (INFER-519)", { timeout: 120_000 }, (
     expect(bad.error).toBeUndefined();
     expect(bad.signal).toBeNull();
     expect(bad.status).toBe(2);
+  });
+
+  // Built as a string: path.join would normalize the ".." away before run.sh ever sees it.
+  it("refuses a work root whose spelling hides a lookup error that realpath would collapse (INFER-520)", () => {
+    const repo = fixtureRepo();
+    const outside = tmp("gd-spelled-");
+    writeFileSync(join(outside, "plain-file"), "x\n");
+    const { bin, log } = fakeBin();
+    const { res, out } = runGateD(repo, bin, { GATE_D_WORKROOT: `${outside}/plain-file/../work` }, ["pi", TASK]);
+    expect(res.status).toBe(3);
+    expect(res.stderr).toContain("could not be checked");
+    expect(existsSync(join(outside, "work"))).toBe(false);
+    expect(calls(log)).toEqual([]);
+    expect(rows(out)).toEqual([]);
   });
 
   it("aborts when the .git entry points at a bare repository, so rev-parse prints false (INFER-520)", () => {
@@ -615,8 +641,12 @@ describe("gate-d/run.sh pi prompt variants (INFER-519)", { timeout: 120_000 }, (
     writeFileSync(
       join(bin, "git"),
       `#!/usr/bin/env bash
-printf '%s\\n' "$*" >> "$GD_GIT_LOG"
-for a in "$@"; do [ "$a" = --is-inside-work-tree ] && { echo false; exit 0; }; done
+for a in "$@"; do
+  case "$a" in
+    --is-inside-work-tree) echo PROBE >> "$GD_GIT_LOG"; echo false; exit 0 ;;
+    status) echo STATUS >> "$GD_GIT_LOG" ;;
+  esac
+done
 exec "$GD_REAL_GIT" "$@"
 `,
     );
@@ -626,8 +656,7 @@ exec "$GD_REAL_GIT" "$@"
     expect(res.status).toBe(3);
     expect(res.stderr).toContain("Git cannot read it");
     const gitCalls = readFileSync(gitLog, "utf8");
-    expect(gitCalls).toContain("--is-inside-work-tree");
-    expect(gitCalls).not.toMatch(/(^|\s)status(\s|$)/m);
+    expect(gitCalls.split("\n").filter(Boolean)).toEqual(["PROBE"]);
     expect(calls(log)).toEqual([]);
     expect(rows(out)).toEqual([]);
   });
@@ -805,14 +834,13 @@ print(json.dumps({'arm':os.environ['GD_A'],'model':os.environ['MODEL'],'task':os
         .filter((r) => r.promptSha256 === v)
         .map((r) => r.task as string)
         .sort();
-    const r1Tasks = spawnSync("bash", [join(repo, "gate-d", "run.sh"), "--list-tasks"], {
+    const listed = spawnSync("bash", [join(repo, "gate-d", "run.sh"), "--list-tasks"], {
       cwd: repo,
       encoding: "utf8",
       env: cleanEnv({ TMPDIR: work }),
-    })
-      .stdout.split(/\s+/)
-      .filter(Boolean)
-      .sort();
+    });
+    expect(listed.status, listed.stderr).toBe(0);
+    const r1Tasks = listed.stdout.split(/\s+/).filter(Boolean).sort();
     expect(r1Tasks).toHaveLength(10);
     expect(tasksFor(v1)).toEqual(r1Tasks);
     expect(tasksFor(v2)).toEqual(r1Tasks);
