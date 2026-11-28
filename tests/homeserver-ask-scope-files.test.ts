@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, mkdtempSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initDb } from "../src/db.js";
@@ -43,6 +43,16 @@ beforeAll(async () => {
   writeFileSync(join(repoA, "src", "prod.tfstate"), "SECRET-CANARY");
   writeFileSync(join(repoA, "src", "fixture.txt"), "-----BEGIN OPENSSH PRIVATE KEY-----\nSECRET-CANARY\n");
   symlinkSync(join(outside, "passwd"), join(repoA, "src", "escape.txt"));
+  writeFileSync(join(repoA, "src", "token.txt"), "auth = ghp_abcdefghijklmnopqrstuvwxyz0123456789AB\n");
+  writeFileSync(join(repoA, ".env-production"), "SECRET-CANARY");
+  linkSync(join(repoA, ".env"), join(repoA, "src", "innocent.txt"));
+  mkdirSync(join(globalRoot, "mirror", ".git"), { recursive: true });
+  writeFileSync(join(globalRoot, "mirror", ".git", "config"), "SECRET-CANARY");
+  mkdirSync(join(globalRoot, "real-1"));
+  mkdirSync(join(globalRoot, "real-2"));
+  writeFileSync(join(globalRoot, "real-1", "a.txt"), "REAL-1");
+  writeFileSync(join(globalRoot, "real-2", "a.txt"), "REAL-2-CANARY");
+  symlinkSync(join(globalRoot, "real-1"), join(globalRoot, "current"));
   symlinkSync(repoB, join(repoA, "link-to-b"));
 
   upstream = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -91,8 +101,12 @@ beforeAll(async () => {
   keys["escaping"] = mint("ask-escaping", "owner", "ask");
   keys["agent"] = mint("agent-owner", "owner", "agent");
   keys["guest"] = mint("guest-inference", "guest", "inference");
+  keys["gitgrant"] = mint("ask-gitgrant", "owner", "ask");
+  keys["moving"] = mint("ask-moving", "owner", "ask");
   keystore.setKeyFileRoots("ask-granted", [repoA]);
   keystore.setKeyFileRoots("ask-escaping", [outside]);
+  keystore.setKeyFileRoots("ask-gitgrant", [join(globalRoot, "mirror", ".git")]);
+  keystore.setKeyFileRoots("ask-moving", [join(globalRoot, "current")]);
 
   const gw = await import("../src/homeserver/gateway.js");
   const handle = await gw.startGateway();
@@ -172,7 +186,12 @@ describe("INFER-524 enforcement", () => {
     ["a .pem file", () => join(repoA, "deploy.pem"), /never attached/],
     ["a *-credentials file", () => join(repoA, "src", "aws-credentials"), /never attached/],
     ["terraform state", () => join(repoA, "src", "prod.tfstate"), /never attached/],
-    ["private-key content", () => join(repoA, "src", "fixture.txt"), /private-key block/],
+    ["private-key content", () => join(repoA, "src", "fixture.txt"), /private key or credential token/],
+    ["a bearer token in content", () => join(repoA, "src", "token.txt"), /private key or credential token/],
+    [".env-production", () => join(repoA, ".env-production"), /never attached/],
+    ["a hard link to a secret", () => join(repoA, "src", "innocent.txt"), /hard link/],
+    ["a nonexistent path (same message as outside)", () => join(repoA, "src", "missing.txt"), /not an attachable file/],
+    ["a nonexistent path outside the root", () => join(outside, "missing.txt"), /not an attachable file/],,
   ])("refuses %s without an upstream call", async (_label, path, message) => {
     const before = upstreamHits;
     const body = await ask(keys["granted"]!, [path()]);
@@ -203,12 +222,14 @@ describe("INFER-524 grant lifecycle", () => {
     expect(() => keystore.setKeyFileRoots("ask-granted", ["relative/path"])).toThrow(/absolute/);
     expect(() => keystore.setKeyFileRoots("guest-inference", [repoA])).toThrow(/owner-tier/);
     expect(() => keystore.setKeyFileRoots("no-such-key", [repoA])).toThrow(/no active key/);
+    expect(() => keystore.setKeyFileRoots("agent-owner", [repoA])).toThrow(/only to ask-scope/);
+    expect(() => keystore.setKeyFileRoots("ask-granted", [join(repoA, "nope")])).toThrow(/not an existing directory/);
   });
 
   it("clearing the grant revokes file access immediately", async () => {
     keystore.mintKey({ alias: "ask-temp", tier: "owner", scope: "ask" }, DEFAULTS);
-    expect(keystore.setKeyFileRoots("ask-temp", [repoA])).toEqual([repoA]);
-    expect(keystore.getKeyFileRootsByAlias("ask-temp")).toEqual([repoA]);
+    expect(keystore.setKeyFileRoots("ask-temp", [repoA]).map((r) => r.path)).toEqual([repoA]);
+    expect(keystore.getKeyFileRootsByAlias("ask-temp").map((r) => r.path)).toEqual([repoA]);
     expect(keystore.setKeyFileRoots("ask-temp", [])).toEqual([]);
     expect(keystore.getKeyFileRootsByAlias("ask-temp")).toEqual([]);
   });
@@ -218,5 +239,58 @@ describe("INFER-524 grant lifecycle", () => {
     keystore.setKeyFileRoots("ask-rot", [repoA]);
     const rotated = keystore.rotateKey("ask-rot", {}, DEFAULTS);
     expect(keystore.getKeyFileRootsByAlias(rotated.newAlias)).toEqual([]);
+  });
+});
+
+describe("INFER-524 review hardening", () => {
+  it("a grant pointing into a denylisted subtree of the server root is ignored", async () => {
+    const list = await rpc(keys["gitgrant"]!, "tools/call", { name: "list_models", arguments: {} });
+    expect(list.result.structuredContent.ask_capabilities).toMatchObject({ files_enabled: false, files_reason: "no_resolved_roots" });
+    const before = upstreamHits;
+    const body = await ask(keys["gitgrant"]!, [join(globalRoot, "mirror", ".git", "config")]);
+    expect(body.result.isError).toBe(true);
+    expect(JSON.stringify(body)).not.toMatch(/CANARY/);
+    expect(upstreamHits).toBe(before);
+  });
+
+  it("a granted root is bound to its directory identity: a retargeted symlink is dropped", async () => {
+    // Granted through the symlink: stored as the canonical real-1 directory.
+    const ok = await ask(keys["moving"]!, [join(globalRoot, "real-1", "a.txt")]);
+    expect(ok.result.isError).toBe(false);
+    // Replace real-1 with a different directory at the same path: identity changes, grant drops.
+    // (rename keeps both inodes alive, so the replacement is guaranteed a different identity).
+    renameSync(join(globalRoot, "real-1"), join(globalRoot, "old-1"));
+    renameSync(join(globalRoot, "real-2"), join(globalRoot, "real-1"));
+    const before = upstreamHits;
+    const body = await ask(keys["moving"]!, [join(globalRoot, "real-1", "a.txt")]);
+    expect(body.result.isError).toBe(true);
+    expect(JSON.stringify(body)).not.toMatch(/CANARY/);
+    expect(upstreamHits).toBe(before);
+  });
+
+  it("an ask key whose grant resolves to nothing does not get the files input", async () => {
+    const tools = (await rpc(keys["gitgrant"]!, "tools/list")).result.tools;
+    expect(tools.find((t: any) => t.name === "ask").inputSchema.properties).not.toHaveProperty("files");
+  });
+});
+
+describe("INFER-524 descriptor attestation (review H1)", () => {
+  it("refuses when the kernel says the open descriptor lies outside the key's roots", async () => {
+    const { expandBlindContext, identifyKeyFileRoot } = await import("../src/homeserver/blind-context.js");
+    const root = identifyKeyFileRoot(repoA)!;
+    const cfg = { roots: [globalRoot], maxFileBytes: 1 << 20, maxTotalBytes: 1 << 20, keyRoots: [root] };
+    const file = join(repoA, "src", "main.ts");
+    expect(expandBlindContext([file], cfg).ok).toBe(true);
+    const swapped = expandBlindContext([file], { ...cfg, descriptorPath: () => join(outside, "passwd") });
+    expect(swapped.ok).toBe(false);
+    const unattested = expandBlindContext([file], { ...cfg, descriptorPath: () => null });
+    expect(unattested.ok).toBe(false);
+  });
+
+  it("reads at most the cap plus one byte", async () => {
+    const { expandBlindContext } = await import("../src/homeserver/blind-context.js");
+    const r = expandBlindContext([join(repoA, "src", "main.ts")], { roots: [globalRoot], maxFileBytes: 4, maxTotalBytes: 1 << 20 });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.code).toBe("file_too_large");
   });
 });

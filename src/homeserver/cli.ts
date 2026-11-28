@@ -53,6 +53,7 @@ import {
   revokeClient,
   revokeGrant,
   revokeGrantsForKey,
+  countActiveGrantsForKey,
 } from "./oauth.js";
 import { runCli as runDeepResearch } from "./deep-research-cli.js";
 import { acquireGpuLease, gpuLeaseStatus, type HolderSelection } from "./gpu-lease.js";
@@ -587,17 +588,21 @@ export function cmdKeys(args: ParsedArgs): void {
     if (!alias || (clear && rootsFlag !== undefined) || (rootsFlag !== undefined && typeof rootsFlag !== "string")) {
       throw new Error(usage);
     }
+    const oauthClients = countActiveGrantsForKey(alias);
+    const sharedNote = oauthClients > 0
+      ? `\n  note: ${oauthClients} active OAuth grant(s) are backed by '${alias}' and share this file grant.`
+      : "";
     if (!clear && rootsFlag === undefined) {
-      const roots = getKeyFileRootsByAlias(alias);
-      console.log(roots.length === 0 ? `'${alias}' has no file-root grant` : `'${alias}' file roots:\n  ${roots.join("\n  ")}`);
+      const roots = getKeyFileRootsByAlias(alias).map((root) => root.path);
+      console.log((roots.length === 0 ? `'${alias}' has no file-root grant` : `'${alias}' file roots:\n  ${roots.join("\n  ")}`) + sharedNote);
       return;
     }
     const roots = clear ? [] : (rootsFlag as string).split(":").filter((root) => root.length > 0);
     if (!clear && roots.length === 0) throw new Error(usage);
-    const applied = setKeyFileRoots(alias, roots);
-    console.log(applied.length === 0
+    const applied = setKeyFileRoots(alias, roots).map((root) => root.path);
+    console.log((applied.length === 0
       ? `✓ cleared the file-root grant for '${alias}'`
-      : `✓ '${alias}' may now attach files under:\n  ${applied.join("\n  ")}`);
+      : `✓ '${alias}' may now attach files under:\n  ${applied.join("\n  ")}`) + sharedNote);
     return;
   }
 

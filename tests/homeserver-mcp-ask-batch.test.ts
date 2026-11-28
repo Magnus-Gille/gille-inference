@@ -18,6 +18,7 @@ let gatewayPort = 0;
 let stopGateway: (() => Promise<void>) | null = null;
 const keys: Record<string, string> = {};
 let blindFile = "";
+let revokeDoomed: () => void = () => {};
 
 beforeAll(async () => {
   const dir = mkdtempSync(join(tmpdir(), "hs-ask-batch-"));
@@ -46,6 +47,7 @@ beforeAll(async () => {
       maxInflight = Math.max(maxInflight, inflight);
       const body = JSON.parse(Buffer.concat(chunks).toString()) as { messages: Array<{ content: string }> };
       const user = body.messages[body.messages.length - 1]!.content;
+      if (user.includes("REVOKE-NOW")) revokeDoomed();
       setTimeout(() => {
         inflight--;
         if (user.includes("UPSTREAM-FAIL")) {
@@ -85,6 +87,8 @@ beforeAll(async () => {
   keys["wide"] = mint("batch-wide", "owner", "agent", 8);
   keys["serial"] = mint("batch-serial", "owner", "agent", 1);
   keys["guest"] = mint("batch-guest", "guest", "inference", 2);
+  keys["doomed"] = mint("batch-doomed", "owner", "agent", 1);
+  revokeDoomed = () => keystore.revokeKey("batch-doomed");
 
   const gw = await import("../src/homeserver/gateway.js");
   const handle = await gw.startGateway();
@@ -196,5 +200,29 @@ describe("ask_batch", () => {
     expect(guest.result.structuredContent.results[0].error.message).toMatch(/owner-tier/);
     expect(upstreamHits).toBe(before);
     expect(JSON.stringify(ask)).not.toContain("BATCH-FILE-CANARY");
+  });
+
+  it("stops starting tasks once the key is revoked mid-batch (review M4)", async () => {
+    const before = upstreamHits;
+    const body = await batch(keys["doomed"]!, { tasks: [task(0, { prompt: "TASK-0 REVOKE-NOW" }), task(1), task(2)] });
+    const r = body.result.structuredContent.results;
+    expect(r[0].ok).toBe(true);
+    expect(r[1]).toMatchObject({ ok: false, error: { m5_code: "invalid_api_key" } });
+    expect(r[2]).toMatchObject({ ok: false, error: { m5_code: "invalid_api_key" } });
+    expect(upstreamHits - before).toBe(1);
+  });
+
+  it("rejects mistyped item fields on their own (review L5)", async () => {
+    const body = await batch(keys["ask"]!, { tasks: [task(0, { system: 42 }), task(1, { max_tokens: "10" }), task(2)] });
+    const r = body.result.structuredContent.results;
+    expect(r.map((e: any) => e.ok)).toEqual([false, false, true]);
+  });
+
+  it("refuses a batch-level content_capture the gateway cannot honour before running anything (review L3)", async () => {
+    const before = upstreamHits;
+    const body = await batch(keys["ask"]!, { tasks: [task(0)], content_capture: "none" });
+    expect(body.result.isError).toBe(true);
+    expect(body.result._meta?.content_capture).toBeUndefined();
+    expect(upstreamHits).toBe(before);
   });
 });

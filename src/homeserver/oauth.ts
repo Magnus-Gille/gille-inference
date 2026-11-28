@@ -856,3 +856,16 @@ export async function handleOAuthRequest(
   }
   return null;
 }
+
+/** INFER-524/525: true while an OAuth grant (and its client and backing key) is still active. */
+export function isOAuthGrantActive(grantId: string, now: Date = new Date()): boolean {
+  return activeGrant(oauthDb(), grantId, now) !== null;
+}
+
+/** Active OAuth grants bound to one backing key — every one of them shares that key's file grant. */
+export function countActiveGrantsForKey(keyAlias: string): number {
+  const row = oauthDb()
+    .prepare(`SELECT COUNT(*) AS n FROM oauth_grants WHERE key_alias = ? AND revoked_at IS NULL`)
+    .get(keyAlias) as { n: number };
+  return row.n;
+}

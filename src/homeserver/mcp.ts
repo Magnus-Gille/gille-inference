@@ -57,7 +57,9 @@ import {
   type AdoptionEvidenceRetention,
 } from "./adoption-evidence.js";
 import type { HuginRequestStamp, LearningTaskCapabilityEpoch } from "./learning-task-contract.js";
-import { getKeyFileRootsByHash, type KeyScope } from "./keystore.js";
+import { getKeyFileRootsByHash, isKeyHashActive, type KeyScope } from "./keystore.js";
+import { isOAuthGrantActive } from "./oauth.js";
+import type { KeyFileRoot } from "./blind-context.js";
 // #33: reuse PR #32's exact derivation VERBATIM (never fork it) — see orchestrator.ts's
 // deriveEvidenceIdentity doc comment for why this is lane-agnostic and safe to share.
 import { deriveEvidenceIdentity } from "./orchestrator.js";
@@ -100,6 +102,8 @@ export interface McpPrincipal {
   maxParallel: number;
   keyHash: string | null;
   creditLimit: number;
+  /** Set when the credential is an OAuth access token (INFER-518); re-checked between batch items. */
+  oauthGrantId?: string;
 }
 
 interface McpTraceOverride {
@@ -396,7 +400,7 @@ function isAdoptionReporter(principal: McpPrincipal): boolean {
  * Returns the access mode: "global" (agent/admin/inference owner keys: the server's roots),
  * "key" (ask scope with a grant: the key's roots narrowed by the server's roots), or null.
  */
-function askFilesAccess(principal: McpPrincipal): { mode: "global" } | { mode: "key"; roots: string[] } | null {
+function askFilesAccess(principal: McpPrincipal): { mode: "global" } | { mode: "key"; roots: KeyFileRoot[] } | null {
   if (principal.tier !== "owner") return null;
   if (principal.scope !== "ask") return { mode: "global" };
   const roots = getKeyFileRootsByHash(principal.keyHash);
@@ -649,7 +653,7 @@ function toolDefs(principal: McpPrincipal, cfg: HomeserverConfig): McpToolDef[] 
               description: "OWNER-ONLY opt-in: return native reasoning_content separately (up to 16384 UTF-8 bytes). Does not request a generated explanation or change reasoning effort; absent backend data stays null." },
           } : {}),
           // An ask-scope key reads server-side files only with an explicit grant (INFER-524).
-          ...(askFilesAccess(principal) === null && principal.tier === "owner" ? {} : {
+          ...(principal.tier === "owner" && principal.scope === "ask" && !filesCapability.files_enabled ? {} : {
             files: {
               type: "array",
               items: { type: "string" },
@@ -1547,6 +1551,8 @@ interface ToolCallContext {
   inflight: { inc: (alias: string) => void; dec: (alias: string) => void; current: (alias: string) => number };
   /** #487: transport-level `X-Content-Capture: none` on this /mcp POST (validated by the gateway). */
   contentCapture?: ContentCapture;
+  /** Aborted when the client connection closes before the response is written (ask_batch stops starting tasks). */
+  signal?: AbortSignal;
 }
 
 /** A tools/call result: a text content block + isError flag. Never throws for a tool error. */
@@ -1810,6 +1816,8 @@ async function callTool(
 type ToolCallOutcome = Awaited<ReturnType<typeof callTool>>;
 
 interface AskBatchEntry {
+  reasoning_content?: string | null;
+  reasoning_truncated?: boolean | null;
   index: number;
   ok: boolean;
   model: string | null;
@@ -1836,6 +1844,10 @@ function askBatchEntry(index: number, out: ToolCallOutcome): AskBatchEntry {
     finish_reason: typeof structured?.["finish_reason"] === "string" ? structured["finish_reason"] : null,
     truncated: typeof structured?.["truncated"] === "boolean" ? structured["truncated"] : null,
     usage: structured?.["usage"] ?? null,
+    ...(structured !== null && "reasoning_content" in structured ? {
+      reasoning_content: (structured["reasoning_content"] as string | null | undefined) ?? null,
+      reasoning_truncated: (structured["reasoning_truncated"] as boolean | null | undefined) ?? null,
+    } : {}),
     error: out.isError
       ? {
           message: out.text,
@@ -1855,6 +1867,30 @@ function renderAskBatchText(results: readonly AskBatchEntry[]): string {
     const body = entry.ok ? entry.text ?? "" : [entry.error?.message ?? "", entry.text ?? ""].filter((part) => part !== "").join("\n");
     return `${head}\n${body}`;
   }).join("\n\n");
+}
+
+/** Type checks the shared ask normalizer is lenient about; a bad item fails on its own (review L5). */
+function askBatchItemProblem(task: unknown): string | null {
+  if (!isPlainObject(task)) return "Each ask_batch task must be an object of ask arguments.";
+  if (task["system"] !== undefined && typeof task["system"] !== "string") return "'system' must be a string.";
+  const maxTokens = task["max_tokens"];
+  if (maxTokens !== undefined && (typeof maxTokens !== "number" || !Number.isFinite(maxTokens) || maxTokens < 1)) {
+    return "'max_tokens' must be a positive number.";
+  }
+  if (task["files"] !== undefined && (!Array.isArray(task["files"]) || task["files"].some((f) => typeof f !== "string"))) {
+    return "'files' must be an array of strings.";
+  }
+  return null;
+}
+
+/**
+ * Re-check, before each item, that the credential that authenticated the batch is still active
+ * (review M4): a key revoked or rotated mid-batch must not keep spending or reading files.
+ */
+function askBatchCredentialStillValid(principal: McpPrincipal): boolean {
+  if (principal.oauthGrantId !== undefined && !isOAuthGrantActive(principal.oauthGrantId)) return false;
+  if (principal.keyHash !== null && !isKeyHashActive(principal.keyHash)) return false;
+  return true;
 }
 
 /**
@@ -1877,6 +1913,14 @@ async function runAskBatch(args: Record<string, unknown>, ctx: ToolCallContext):
   if (batchCapture !== undefined && batchCapture !== CONTENT_CAPTURE_NONE) {
     return { text: `ask_batch: 'content_capture' must be '${CONTENT_CAPTURE_NONE}' when given.`, isError: true, trace: badRequestTrace() };
   }
+  if (batchCapture === CONTENT_CAPTURE_NONE && !isKeyedExposureFingerprintAvailable()) {
+    return {
+      text: "content_capture 'none' is not available on this gateway (exposure fingerprint key not provisioned); nothing was run.",
+      isError: true,
+      meta: { m5_code: "content_capture_unavailable", retryable: false },
+      trace: badRequestTrace(),
+    };
+  }
 
   const results: AskBatchEntry[] = new Array(tasks.length);
   const traces: Array<McpTraceOverride | undefined> = new Array(tasks.length);
@@ -1887,10 +1931,21 @@ async function runAskBatch(args: Record<string, unknown>, ctx: ToolCallContext):
       const index = next++;
       const task = tasks[index];
       let out: ToolCallOutcome;
-      if (!isPlainObject(task)) {
-        out = { text: "Each ask_batch task must be an object of ask arguments.", isError: true, trace: badRequestTrace() };
+      const invalid = askBatchItemProblem(task);
+      if (ctx.signal?.aborted === true) {
+        // The client is gone: never START another billable task for a response nobody reads.
+        out = { text: "Not started: the client disconnected before this task began.", isError: true,
+          meta: { m5_code: "client_closed", retryable: true }, trace: { traceOutcome: "client_closed" } };
+      } else if (!askBatchCredentialStillValid(ctx.principal)) {
+        out = { text: "Not started: this key or its grant was revoked or expired during the batch.", isError: true,
+          meta: { m5_code: "invalid_api_key", retryable: false },
+          trace: { traceOutcome: "auth_failed", traceErrorClass: "invalid_api_key" } };
+      } else if (invalid !== null) {
+        out = { text: invalid, isError: true, trace: badRequestTrace() };
       } else {
-        const taskArgs = batchCapture === undefined ? task : { ...task, content_capture: batchCapture };
+        const item = task as Record<string, unknown>;
+        // A task's own content_capture is validated by ask itself; the batch value fills the gap.
+        const taskArgs = batchCapture === undefined || "content_capture" in item ? item : { ...item, content_capture: batchCapture };
         try {
           out = await callTool("ask", taskArgs, ctx);
         } catch {
@@ -1989,7 +2044,17 @@ export async function handleMcpPost(rawBody: string, res: ServerResponse, ctx: T
     const params = (msg.params ?? {}) as { name?: unknown; arguments?: unknown };
     const name = typeof params.name === "string" ? params.name : "";
     const toolArgs = (typeof params.arguments === "object" && params.arguments !== null ? params.arguments : {}) as Record<string, unknown>;
-    const out = await callTool(name, toolArgs, ctx);
+    const abort = new AbortController();
+    const onClose = (): void => { if (!res.writableEnded) abort.abort(); };
+    // Minimal response doubles in tests may not be event emitters; then no abort is wired.
+    const canWatch = typeof res.once === "function" && typeof res.off === "function";
+    if (canWatch) res.once("close", onClose);
+    let out: Awaited<ReturnType<typeof callTool>>;
+    try {
+      out = await callTool(name, toolArgs, name === "ask_batch" ? { ...ctx, signal: ctx.signal ?? abort.signal } : ctx);
+    } finally {
+      if (canWatch) res.off("close", onClose);
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(rpcResult(id, { content: [{ type: "text", text: out.text }], isError: out.isError, ...(out.structuredContent === undefined ? {} : { structuredContent: out.structuredContent }), ...(out.meta === undefined ? {} : { _meta: out.meta }) }));
     const trace = out.trace ?? (out.isError ? genericToolErrorTrace() : undefined);
