@@ -544,6 +544,151 @@ describe("gate-d/run.sh pi prompt variants (INFER-519)", { timeout: 120_000 }, (
     expect(calls(log)).toEqual([]);
   });
 
+  // The case-alias test above returns early on a case-sensitive volume (Linux CI), so exercise the
+  // identity walk itself with a symlinked spelling, which a prefix comparison would not catch.
+  it("path-inside.py compares directory identities, not spellings (INFER-520)", () => {
+    const repo = fixtureRepo();
+    const outside = tmp("gd-alias-");
+    const alias = join(outside, "alias");
+    symlinkSync(repo, alias);
+    const subAlias = join(outside, "sub-alias");
+    symlinkSync(join(repo, "gate-d"), subAlias);
+    writeFileSync(join(outside, "plain-file"), "x\n");
+    const guard = (path: string, cwd = outside) => {
+      const r = spawnSync("python3", [join(repo, "gate-d", "path-inside.py"), path, repo], {
+        cwd,
+        encoding: "utf8",
+        timeout: 10_000,
+      });
+      // A spawn failure, timeout or signal must not pass as a status assertion.
+      expect(r.error).toBeUndefined();
+      expect(r.signal).toBeNull();
+      expect(Number.isInteger(r.status)).toBe(true);
+      return r.status as number;
+    };
+    const inside = (path: string, cwd?: string) => guard(path, cwd);
+    expect(inside(repo)).toBe(1);
+    expect(inside(join(repo, "gate-d", "not", "yet", "created"))).toBe(1);
+    expect(inside(join(alias, "work"))).toBe(1);
+    expect(inside(join(alias, "gate-d", "not-yet"))).toBe(1);
+    // A symlink to a directory below the checkout root: its spelled parent is outside the checkout.
+    expect(inside(join(subAlias, "missing"))).toBe(1);
+    expect(inside(subAlias)).toBe(1);
+    // Relative candidates, including missing ones, resolve against the current directory and finish.
+    expect(inside(join("rel", "missing"))).toBe(0);
+    expect(inside(join("rel", "missing"), join(repo, "gate-d"))).toBe(1);
+    // A regular file used as a directory is a lookup error, never "outside".
+    expect(inside(join(outside, "plain-file", "work"))).toBe(2);
+    expect(inside(join(outside, "plain-file"))).toBe(2);
+    // A dangling symlink whose destination would be inside the checkout is refused, not walked past.
+    const dangling = join(outside, "dangling");
+    symlinkSync(join(repo, "gate-d", "not-created-yet"), dangling);
+    expect(inside(dangling)).toBe(2);
+    expect(inside(join(dangling, "work"))).toBe(2);
+    // A protected "directory" that is a regular file is an invalid invocation.
+    const notDir = spawnSync("python3", [join(repo, "gate-d", "path-inside.py"), outside, join(outside, "plain-file")], {
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    expect(notDir.error).toBeUndefined();
+    expect(notDir.status).toBe(2);
+    expect(inside(join(outside, "work"))).toBe(0);
+    expect(inside(dirname(repo))).toBe(0);
+    // A target that cannot be read is an error, never "outside"; run.sh refuses on any non-zero status.
+    const bad = spawnSync("python3", [join(repo, "gate-d", "path-inside.py"), outside, join(outside, "missing")], {
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    expect(bad.error).toBeUndefined();
+    expect(bad.signal).toBeNull();
+    expect(bad.status).toBe(2);
+  });
+
+  // Built as a string: path.join would normalize the ".." away before run.sh ever sees it.
+  it("refuses a work root whose spelling hides a lookup error that realpath would collapse (INFER-520)", () => {
+    const repo = fixtureRepo();
+    const outside = tmp("gd-spelled-");
+    writeFileSync(join(outside, "plain-file"), "x\n");
+    const { bin, log } = fakeBin();
+    for (const spelled of [`${outside}/plain-file/../work`, `${outside}/missing/../plain-file/../work`]) {
+      const { res, out } = runGateD(repo, bin, { GATE_D_WORKROOT: spelled }, ["pi", TASK]);
+      expect(res.status, spelled).toBe(3);
+      expect(res.stderr).toContain("could not be checked");
+      expect(existsSync(join(outside, "work"))).toBe(false);
+      expect(rows(out)).toEqual([]);
+    }
+    expect(calls(log)).toEqual([]);
+  });
+
+  it("aborts when the .git entry points at a bare repository, so rev-parse prints false (INFER-520)", () => {
+    const repo = fixtureRepo();
+    const bare = join(tmp("gd-bare-"), "bare.git");
+    git(dirname(bare), "clone", "-q", "--bare", repo, bare);
+    rmSync(join(repo, ".git"), { recursive: true, force: true });
+    writeFileSync(join(repo, ".git"), `gitdir: ${bare}\n`);
+    const { bin, log } = fakeBin();
+    const { res, out } = runGateD(repo, bin, {}, ["pi", TASK]);
+    expect(res.status).toBe(3);
+    expect(res.stderr).toContain("Git cannot read it");
+    expect(calls(log)).toEqual([]);
+    expect(rows(out)).toEqual([]);
+  });
+
+  // The bare case above would also fail at the later status probe, so pin the output check itself:
+  // a Git that prints "false" with status 0 must stop the runner before it asks for status.
+  it("aborts when rev-parse succeeds but prints false, without consulting status (INFER-520)", () => {
+    const repo = fixtureRepo();
+    const { bin, log } = fakeBin();
+    const gitLog = join(bin, "git-calls.log");
+    writeFileSync(
+      join(bin, "git"),
+      `#!/usr/bin/env bash
+# Skip the -c/-C option pairs gd_git passes, so only the subcommand itself is matched.
+orig=("$@")
+set -- "$@" --gd-end
+sub=""
+while [ "$1" != --gd-end ]; do
+  case "$1" in -c|-C) shift 2 ;; -*) shift ;; *) sub="$1"; break ;; esac
+done
+if [ "$sub" = rev-parse ] && [ "$2" = --is-inside-work-tree ]; then echo PROBE >> "$GD_GIT_LOG"; echo false; exit 0; fi
+[ "$sub" = status ] && echo STATUS >> "$GD_GIT_LOG"
+exec "$GD_REAL_GIT" "\${orig[@]}"
+`,
+    );
+    chmodSync(join(bin, "git"), 0o755);
+    const realGit = spawnSync("bash", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
+    const { res, out } = runGateD(repo, bin, { GD_GIT_LOG: gitLog, GD_REAL_GIT: realGit }, ["pi", TASK]);
+    expect(res.status).toBe(3);
+    expect(res.stderr).toContain("Git cannot read it");
+    const gitCalls = readFileSync(gitLog, "utf8");
+    expect(gitCalls.split("\n").filter(Boolean)).toEqual(["PROBE"]);
+    expect(calls(log)).toEqual([]);
+    expect(rows(out)).toEqual([]);
+  });
+
+  it("aborts on a corrupt index, where rev-parse still prints true but status fails (INFER-520)", () => {
+    const repo = fixtureRepo();
+    writeFileSync(join(repo, ".git", "index"), "garbage\n");
+    expect(git(repo, "rev-parse", "--is-inside-work-tree").trim()).toBe("true");
+    const { bin, log } = fakeBin();
+    const { res, out } = runGateD(repo, bin, {}, ["pi", TASK]);
+    expect(res.status).toBe(3);
+    expect(res.stderr).toContain("Git cannot read it");
+    expect(calls(log)).toEqual([]);
+    expect(rows(out)).toEqual([]);
+  });
+
+  it("aborts without a row when git status fails after the arm runs (INFER-520)", () => {
+    const repo = fixtureRepo();
+    const { bin, log } = fakeBin(`fs.writeFileSync(${JSON.stringify(join(repo, ".git", "index"))}, "garbage\\n");`);
+    const { res, out } = runGateD(repo, bin, {}, ["pi", TASK]);
+    expect(res.status).toBe(9);
+    expect(res.stderr).toContain("git status failed after the run");
+    expect(calls(log).map((c) => c.seeded)).toEqual([true]);
+    expect(rows(out)).toEqual([]);
+    expect(readdirSync(join(dirname(out), "gate-d-work")).filter((n) => n.startsWith(`${TASK}-`))).toEqual([]);
+  });
+
   it("labels baseline rows promptVariant none and passes no prompt flag", () => {
     const repo = fixtureRepo();
     const { bin, log } = fakeBin();
@@ -633,6 +778,96 @@ print(json.dumps({'arm':os.environ['GD_A'],'model':os.environ['MODEL'],'task':os
     expect(r.res.status).toBe(3);
     expect(r.res.stderr).toContain("pi arm only");
     expect(rows(r.out)).toEqual([]);
+  });
+
+  // Portable stand-in for /dev/full (absent on macOS): a python3 shim that fails only the row
+  // writer, so the real run.sh reaches its append step and loses the row (INFER-520).
+  it("aborts the real runner on an append failure instead of resetting on a stale arm-error row", () => {
+    const repo = fixtureRepo();
+    const { bin, log } = fakeBin();
+    const realPython = spawnSync("bash", ["-c", "command -v python3"], { encoding: "utf8" }).stdout.trim();
+    // The interpreter path travels in the environment, so no character in it is expanded by Bash.
+    writeFileSync(
+      join(bin, "python3"),
+      `#!/usr/bin/env bash\nfor a in "$@"; do case "$a" in *"row={"*) echo "write error" >&2; exit 1;; esac; done\nexec "$GD_REAL_PYTHON" "$@"\n`,
+    );
+    chmodSync(join(bin, "python3"), 0o755);
+    const work = tmp("gd-sweep-");
+    const out = join(work, "rows.jsonl");
+    const stale = JSON.stringify({ arm: "pi", model: "m", task: "x", exitClass: "arm-error" }) + "\n";
+    writeFileSync(out, stale);
+    const r = runGateD(
+      repo,
+      bin,
+      { ARMS: "pi", SEEDS: "1", MODEL: "m", GATE_D_OUT: out, GD_REAL_PYTHON: realPython },
+      [],
+      "sweep.sh",
+    );
+    expect(r.res.status).toBe(4);
+    expect(r.res.stdout).toContain("could not append the result row");
+    expect(r.res.stdout).toContain("SWEEP aborted: run.sh exited 4");
+    expect(r.res.stdout).not.toContain("[reset]");
+    expect(calls(log).filter((c) => c.name === "pi")).toHaveLength(1);
+    expect(readFileSync(out, "utf8")).toBe(stale);
+  });
+
+  it("keeps a committed prompt change between two real sweeps apart, and aborts on one made mid-sweep", () => {
+    const repo = fixtureRepo();
+    const promptPath = join(repo, "gate-d", "prompts", VARIANT);
+    const { bin } = fakeBin();
+    const work = tmp("gd-sweep-");
+    const out = join(work, "rows.jsonl");
+    const env = { ARMS: "pi", SEEDS: "1", MODEL: "m", GATE_D_OUT: out, GATE_D_PI_APPEND_SYSTEM: VARIANT };
+
+    const first = runGateD(repo, bin, env, [], "sweep.sh");
+    expect(first.res.status, first.res.stderr).toBe(0);
+    const v1 = sha256(readFileSync(promptPath, "utf8"));
+
+    writeFileSync(promptPath, readFileSync(promptPath, "utf8") + "\nRevised between sweeps.\n");
+    git(repo, "commit", "-q", "-am", "revise prompt");
+    const v2 = sha256(readFileSync(promptPath, "utf8"));
+    expect(v2).not.toBe(v1);
+
+    const second = runGateD(repo, bin, env, [], "sweep.sh");
+    expect(second.res.status, second.res.stderr).toBe(0);
+    // The new digest does not resume from the old rows: every task runs again under its own label.
+    expect(second.res.stdout).not.toContain("[skip]");
+    const all = rows(out);
+    expect(all).toHaveLength(20);
+    const tasksFor = (v: string) =>
+      all
+        .filter((r) => r.promptSha256 === v)
+        .map((r) => r.task as string)
+        .sort();
+    const listed = spawnSync("bash", [join(repo, "gate-d", "run.sh"), "--list-tasks"], {
+      cwd: repo,
+      encoding: "utf8",
+      env: cleanEnv({ TMPDIR: work }),
+    });
+    expect(listed.status, listed.stderr).toBe(0);
+    const r1Tasks = listed.stdout.split(/\s+/).filter(Boolean).sort();
+    expect(r1Tasks).toHaveLength(10);
+    expect(tasksFor(v1)).toEqual(r1Tasks);
+    expect(tasksFor(v2)).toEqual(r1Tasks);
+    const summary = second.res.stdout.split("\n").filter((l) => l.startsWith("gate-d-r1 pi/m"));
+    expect(summary).toHaveLength(2);
+    for (const v of [v1, v2]) {
+      expect(summary.some((l) => l.includes(`@${v.split(":")[1]!.slice(0, 12)}]`))).toBe(true);
+    }
+
+    // A commit during a sweep: the next run.sh sees a different digest than the pinned one.
+    const { bin: bin3 } = fakeBin(
+      `fs.appendFileSync(${JSON.stringify(promptPath)}, "mid-sweep\\n");
+require("child_process").spawnSync("git", ["-C", ${JSON.stringify(repo)}, "-c", "user.email=t@local", "-c", "user.name=t", "commit", "-q", "-am", "mid-sweep"]);`,
+    );
+    const third = runGateD(repo, bin3, { ...env, SEEDS: "2" }, [], "sweep.sh");
+    expect(third.res.status).toBe(3);
+    expect(third.res.stdout).toContain("this sweep started with");
+    expect(third.res.stdout).toContain("SWEEP aborted: run.sh exited 3");
+    // Exactly one row was appended (the run that started before the commit), under the pinned digest.
+    const after = rows(out);
+    expect(after).toHaveLength(21);
+    expect(after[20]!.promptSha256).toBe(v2);
   });
 
   it("aborts on a runner failure instead of acting on a stale previous row", () => {

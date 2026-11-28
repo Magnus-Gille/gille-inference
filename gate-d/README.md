@@ -80,7 +80,7 @@ the arm if the seed commit fails or differs from the committed task tree (paths,
 in a plain deployment, the file list), and aborts if the checkout has a `.git` entry, including a
 dangling symlink, that Git cannot read or whose status it cannot report (such as a shared checkout
 that relied on a global `safe.directory`). The work root is compared with the checkout by
-directory identity, so a case alias on a case-insensitive volume is refused too. The variable is rejected on other arms, and a sweep fails closed if
+directory identity (`path-inside.py`), so a case alias on a case-insensitive volume is refused too. The variable is rejected on other arms, and a sweep fails closed if
 the committed prompt changes while it runs or if any run exits non-zero. The snapshot is protected
 from other users but not from a process running as the same OS user between the post-run checks;
 run sweeps from a dedicated account if that matters. A variant run on tasks that earlier runs
