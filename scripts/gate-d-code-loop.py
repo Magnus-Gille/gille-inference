@@ -31,6 +31,7 @@ from gate_d_corpus import (  # noqa: E402
     include_holdout_from_env,
     load_manifest,
     revision_contract,
+    safe_scratch_parent,
     select_external,
     task_metadata,
     verify_external_digest,
@@ -199,8 +200,14 @@ for tid in task_ids:
         task_meta = task_metadata(tid)
     else:
         tdir = str(external_task_dir(external, tid))
-        task_meta = external_task_metadata(external, tid)
         verify_external_digest(external, tid)  # raises (no row) on a drifted task
+        # Metadata read only after the digest check, and the opt-in re-checked from it: an
+        # enumeration-time metadata slip must never submit a sealed task (INFER-521 review).
+        task_meta = external_task_metadata(external, tid)
+        verify_external_digest(external, tid)
+        if task_meta["holdout"] and not include_holdout:
+            raise SystemExit(f"[{tid}] sealed task without --include-holdout; refusing to submit")
+        scratch_parent = safe_scratch_parent(external)
     instr = open(os.path.join(tdir, "INSTRUCTION.md"), encoding="utf-8").read()
     files = seed_files(os.path.join(tdir, "repo"))
     row = {
@@ -253,7 +260,7 @@ for tid in task_ids:
     else:
         # External tasks grade in a private temp dir outside the checkout, removed after grading,
         # so a staged hidden oracle never lingers at a predictable path (INFER-521 review).
-        wdir = os.path.join(tempfile.mkdtemp(prefix="gd-cl-"), tid)
+        wdir = os.path.join(tempfile.mkdtemp(prefix="gd-cl-", dir=scratch_parent), tid)
     shutil.copytree(os.path.join(tdir, "repo"), wdir)
     # check.sh G0-toolchain requires exactly this runner-owned link (run.sh discipline).
     os.symlink(os.path.join(os.path.realpath(REPO), "node_modules"), os.path.join(wdir, "node_modules"))

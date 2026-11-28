@@ -586,4 +586,42 @@ sys.stdout.write(r.stdout); sys.stderr.write(r.stderr); sys.exit(r.returncode)
     expect(again.res.stdout).toContain("[run ] pi/qwen3-coder-next-80b/r3-test-a");
     expect(rows(out)).toHaveLength(4);
   });
+
+  it("keeps the gateway token and runner configuration out of the observer and the grader", () => {
+    const repo = fixtureRepo();
+    const probeDir = tmp("gd-ext-envprobe-");
+    const root = externalCorpus(repo, {
+      atStop: `#!/usr/bin/env bash\nenv | sed -n 's/^\\(GW[A-Z_]*\\|GATE_D_[A-Z_]*\\)=.*/\\1/p' > ${JSON.stringify(join(probeDir, "at-stop.txt"))}\nprintf '{"atStopTypecheck":"passed","atStopVisibleTests":"none","detectableFailureAtStop":false}\\n'\n`,
+    });
+    writeFileSync(join(repo, "gate-d", "check.sh"), [
+      "#!/usr/bin/env bash",
+      `env | sed -n 's/^\\(GW[A-Z_]*\\|GATE_D_[A-Z_]*\\)=.*/\\1/p' > ${JSON.stringify(join(probeDir, "check.txt"))}`,
+      "exit 0",
+      "",
+    ].join("\n"));
+    const { bin } = fakePi({ root, solve: true });
+    const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", "r3-test-a"]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(rows(out)[0]).toMatchObject({ pass: true, atStopTypecheck: "passed" });
+    expect(readFileSync(join(probeDir, "at-stop.txt"), "utf8")).toBe("");
+    expect(readFileSync(join(probeDir, "check.txt"), "utf8")).toBe("");
+  });
+
+  it("rejects revision names and ids that only match up to a trailing newline", () => {
+    const repo = fixtureRepo();
+    const root = externalCorpus(repo);
+    const path = join(root, "corpus-manifest.json");
+    const manifest = JSON.parse(readFileSync(path, "utf8"));
+    writeFileSync(path, JSON.stringify({ ...manifest, corpusRevision: "gate-d-r1\n" }));
+    expect(corpusTool(repo, { GATE_D_TASKS_ROOT: root }, "tasks").stderr).toContain("invalid corpusRevision");
+  });
+
+  it("gives no observer result when the arm leaves a symlink in the workspace", () => {
+    const repo = fixtureRepo();
+    const root = externalCorpus(repo);
+    const { bin } = fakePi({ root, solve: true, script: `fs.symlinkSync("/etc/hostname", path.join(process.cwd(), "escape"));` });
+    const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", "r3-test-a"]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(rows(out)[0]).toMatchObject({ atStopTypecheck: null, detectableFailureAtStop: null });
+  });
 });

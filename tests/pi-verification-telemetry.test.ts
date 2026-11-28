@@ -149,3 +149,11 @@ test("negated and backgrounded checks are unattributable", () => {
   assert.notEqual(s.verificationClass, "checked-green-after-last-edit");
   assert.equal(s.lastTestOutcome, "unknown");
 });
+
+test("informational modes of check tools are not checks", () => {
+  for (const cmd of ["npx tsc --version", "npx tsc --showConfig", "npx vitest --help"]) {
+    assert.deepEqual(classifyCommand(cmd).kinds, [], cmd);
+  }
+  const s = run(turn, start("1", "edit"), end("1", "edit", true), start("2", "bash", "npx tsc --version"), end("2", "bash", true));
+  assert.equal(s.verificationClass, "never-checked");
+});

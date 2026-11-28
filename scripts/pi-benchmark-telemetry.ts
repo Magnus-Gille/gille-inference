@@ -133,6 +133,8 @@ export function classifyCommand(command: string): { kinds: CheckKind[]; attribut
   let checkSegments = 0;
   for (const seg of segments) {
     if (/^\s*(echo|printf|cat|grep|rg|ls)\b/.test(seg)) continue; // `echo npm test` is not a test run
+    // `tsc --version`, `tsc --showConfig`, `vitest --help` verify nothing (INFER-521 review).
+    if (/(^|\s)(--version|-v|--help|-h|--showConfig|--listFiles(Only)?|--init)(\s|$)/.test(seg)) continue;
     let hit = false;
     if (TYPECHECK.some((re) => re.test(seg))) { kinds.add("typecheck"); hit = true; }
     if (TESTS.some((re) => re.test(seg))) { kinds.add("tests"); hit = true; }

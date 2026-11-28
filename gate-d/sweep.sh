@@ -54,12 +54,12 @@ if [ -n "${GATE_D_TASKS_ROOT:-}" ]; then
     GATE_D_EXPECT_AT_STOP_SHA="sha256:$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$at_stop_path")" || exit 3
   fi
   export GATE_D_EXPECT_AT_STOP_SHA
-  TASK_REVS="$(python3 -c '
-import json, sys
-sys.path.insert(0, sys.argv[1])
-import gate_d_corpus as g
-c = g.external_from_env()
-print(json.dumps(c["digests"], sort_keys=True))' "$ROOT")" || exit 3
+  # One manifest snapshot: the revision, task order and digests this sweep schedules against.
+  SCHEDULE="$(python3 "$CORPUS_TOOL" schedule)" || exit 3
+  CORPUS_REVISION="$(GD_S="$SCHEDULE" python3 -c 'import json,os;print(json.loads(os.environ["GD_S"])["corpusRevision"])')" || exit 3
+  TASKS="$(GD_S="$SCHEDULE" python3 -c 'import json,os;print("\n".join(json.loads(os.environ["GD_S"])["tasks"]))')" || exit 3
+  TASK_REVS="$(GD_S="$SCHEDULE" python3 -c 'import json,os;print(json.dumps(json.loads(os.environ["GD_S"])["digests"],sort_keys=True))')" || exit 3
+  export GATE_D_EXPECT_CORPUS_REVISION="$CORPUS_REVISION"
 fi
 : "${GW:=https://inference.example.com/v1}"
 : "${GW_KEY:?set GW_KEY to a real gateway token (mint via bin/invite)}"
@@ -132,7 +132,7 @@ for arm in $ARMS; do
   done
 done
 echo "=== SWEEP done $(date) ===" | tee -a "$LOG"
-GD_R="$CORPUS_REVISION" GD_TASKS="$TASKS" GD_OUT="$OUT" GD_REVS="$TASK_REVS" python3 -c "import json,collections,os
+GD_R="$CORPUS_REVISION" GD_TASKS="$TASKS" GD_OUT="$OUT" GD_REVS="$TASK_REVS" GD_AS="${GATE_D_EXPECT_AT_STOP_SHA-}" python3 -c "import json,collections,os
 rev=os.environ['GD_R']; allowed=set(os.environ['GD_TASKS'].split()); revs=json.loads(os.environ['GD_REVS'])
 c=collections.Counter(); p=collections.Counter()
 for l in open(os.environ['GD_OUT']):
@@ -140,6 +140,7 @@ for l in open(os.environ['GD_OUT']):
     except: continue
     if r.get('corpusRevision','gate-d-r1') != rev or r.get('task') not in allowed: continue
     if revs and r.get('taskRevision') != revs.get(r.get('task')): continue
+    if revs and r.get('atStopSha256') != (os.environ['GD_AS'] or None): continue
     digest=r.get('promptSha256') or ''
     k=(r.get('arm') or '',r.get('model') or '',r.get('promptVariant','none') or 'none',digest)
     c[k]+=1; p[k]+= 1 if r.get('pass') else 0

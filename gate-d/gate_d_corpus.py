@@ -156,7 +156,7 @@ def load_external(root: Path, in_repo: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(manifest, dict):
         raise ValueError(f"{EXTERNAL_MANIFEST} must be a JSON object")
     revision = manifest.get("corpusRevision")
-    if not isinstance(revision, str) or not TASK_ID_RE.match(revision):
+    if not isinstance(revision, str) or not TASK_ID_RE.fullmatch(revision):
         raise ValueError(f"{EXTERNAL_MANIFEST} has an invalid corpusRevision")
     # Rows are scoped by corpusRevision; an external corpus reusing r1/r2 would pool with them.
     if revision in in_repo.get("revisions", {}):
@@ -171,15 +171,32 @@ def load_external(root: Path, in_repo: dict[str, Any]) -> dict[str, Any]:
     for entry in tasks:
         task_id = entry.get("id") if isinstance(entry, dict) else None
         digest = entry.get("digest") if isinstance(entry, dict) else None
-        if not isinstance(task_id, str) or not TASK_ID_RE.match(task_id):
+        if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
             raise ValueError(f"{EXTERNAL_MANIFEST} has an invalid task id: {task_id!r}")
-        if not isinstance(digest, str) or not DIGEST_RE.match(digest):
+        if not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest):
             raise ValueError(f"{EXTERNAL_MANIFEST} has an invalid digest for {task_id}")
         if task_id in digests:
             raise ValueError(f"{EXTERNAL_MANIFEST} lists {task_id} twice")
         digests[task_id] = digest
         order.append(task_id)
     return {"root": root, "corpusRevision": revision, "tasks": order, "digests": digests}
+
+
+def safe_scratch_parent(corpus: Optional[dict[str, Any]] = None) -> str:
+    """The physical temp directory, refused when it lies inside this checkout or the external root.
+
+    One helper for every scratch location the external path creates (INFER-521 review).
+    """
+    parent = os.path.realpath(os.environ.get("TMPDIR") or "/tmp")
+    if not os.path.isdir(parent):
+        raise ValueError(f"temp directory does not exist: {parent}")
+    roots = [str(REPO_ROOT)] + ([str(corpus["root"])] if corpus is not None else [])
+    for root in roots:
+        # Scratch dirs are fresh mktemp children of ``parent``, so only a parent inside a protected
+        # tree is a problem; a checkout that merely lives under /tmp is not.
+        if same_or_inside(parent, root):
+            raise ValueError(f"temp directory {parent} is inside {root}; set TMPDIR elsewhere")
+    return parent
 
 
 def external_task_dir(corpus: dict[str, Any], task_id: str) -> Path:
@@ -279,7 +296,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=(
         "describe", "revision", "tasks", "contains", "task-metadata",
-        "tasks-root", "task-dir", "verify-digest"))
+        "tasks-root", "task-dir", "verify-digest", "schedule", "scratch-parent"))
     parser.add_argument("task_id", nargs="?")
     parser.add_argument("--include-holdout", action="store_true")
     parser.add_argument("--revision")
@@ -339,6 +356,13 @@ def external_main(parser: argparse.ArgumentParser, args: argparse.Namespace,
         parser.error(f"{command} requires task_id")
     if command == "tasks-root":
         print(corpus["root"])
+    elif command == "scratch-parent":
+        print(safe_scratch_parent(corpus))
+    elif command == "schedule":
+        # One manifest snapshot for a whole sweep: revision, task order and digests together.
+        tasks = select_external(corpus, include)
+        print(json.dumps({"corpusRevision": corpus["corpusRevision"], "tasks": tasks,
+                          "digests": {t: corpus["digests"][t] for t in tasks}}, sort_keys=True))
     elif command == "revision":
         print(corpus["corpusRevision"])
     elif command == "tasks":

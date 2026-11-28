@@ -181,17 +181,31 @@ if [ "$EXTERNAL" = 1 ]; then
   # The observer is outside the task digest, so its bytes are snapshotted once and their sha256 is
   # recorded per row (atStopSha256, null when absent); sweep.sh resumes only rows of the same observer.
   if [ -f "$AT_STOP_SCRIPT" ]; then
-    AT_STOP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gd-atstop.XXXXXXXX")" || exit 3
+    AT_STOP_PARENT="$(python3 "$CORPUS_TOOL" scratch-parent)" || exit 3
+    AT_STOP_DIR="$(mktemp -d "$AT_STOP_PARENT/gd-atstop.XXXXXXXX")" || exit 3
     trap 'rm -rf "$PROMPT_DIR" "$AT_STOP_DIR"' EXIT
     cp "$AT_STOP_SCRIPT" "$AT_STOP_DIR/at-stop.sh" || exit 3
     AT_STOP_SCRIPT="$AT_STOP_DIR/at-stop.sh"
     AT_STOP_SHA="sha256:$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$AT_STOP_SCRIPT")" || exit 3
+  fi
+  if [ -n "${GATE_D_EXPECT_CORPUS_REVISION:-}" ] && [ "$GATE_D_EXPECT_CORPUS_REVISION" != "$CORPUS_REVISION" ]; then
+    echo "error: the corpus revision differs from the one the sweep pinned ($GATE_D_EXPECT_CORPUS_REVISION != $CORPUS_REVISION)" >&2
+    exit 3
   fi
   if [ -n "${GATE_D_EXPECT_AT_STOP_SHA+x}" ] && [ "$GATE_D_EXPECT_AT_STOP_SHA" != "$AT_STOP_SHA" ]; then
     echo "error: at-stop.sh differs from the one the sweep pinned (${GATE_D_EXPECT_AT_STOP_SHA:-none} != ${AT_STOP_SHA:-none})" >&2
     exit 3
   fi
 fi
+# Verification subprocesses of an external corpus (at-stop.sh and check.sh, which both execute
+# candidate code) get a fixed allowlisted environment: no gateway token, no runner configuration,
+# nothing inherited by accident (INFER-521 review). Only the selected arm ever sees GW_KEY.
+VERIFY_TMP=""
+[ "$EXTERNAL" = 1 ] && { VERIFY_TMP="$(python3 "$CORPUS_TOOL" scratch-parent)" || exit 3; }
+verify_env(){
+  env -i PATH="$PATH" HOME="${HOME:-/nonexistent}" LANG="${LANG:-C.UTF-8}" TMPDIR="$VERIFY_TMP" \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CEILING_DIRECTORIES="$WORKROOT" "$@"
+}
 # External corpus content guard (INFER-521): replaces the git-status guard for a root that is not
 # under Git. The expected digest is captured once, before the arm, so a manifest edited mid-run
 # cannot re-bless edited task files.
@@ -206,11 +220,15 @@ at_stop_json(){
   # The snapshot lives in the temp dir; never run it if it no longer has the recorded bytes.
   [ "sha256:$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$script" 2>/dev/null)" = "$AT_STOP_SHA" ] \
     || { echo "{}"; return 0; }
+  # Any symlink the arm left (other than the runner-owned node_modules link) could point the copy
+  # back into the graded workspace; such a run gets no observer result rather than a shared view.
+  if [ -n "$(cd "$W" && find . -type l ! -path ./node_modules -print -quit 2>/dev/null)" ]; then
+    echo "{}"; return 0
+  fi
   copy="$(mktemp -d "$WORKROOT/atstop-XXXXXXXX" 2>/dev/null)" || { echo "{}"; return 0; }
   if cp -R "$W/." "$copy/" 2>/dev/null; then
-    out="$( cd "$copy" && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE && scrub_arm_env \
-            && export GIT_CEILING_DIRECTORIES="$WORKROOT" \
-            && "$TIMEOUT_BIN" "$cap" bash "$script" "$T" "$copy" </dev/null 2>/dev/null )" || out=""
+    # -k: escalate to SIGKILL, so an observer that ignores SIGTERM cannot hang the run.
+    out="$( cd "$copy" && verify_env "$TIMEOUT_BIN" -k 10 "$cap" bash "$script" "$T" "$copy" </dev/null 2>/dev/null )" || out=""
   fi
   rm -rf "$copy"
   GD_AT_STOP_RAW="$out" python3 -c '
@@ -481,7 +499,9 @@ PY
   local pass="false" exitclass="$status"
   # The grader executes candidate code, so it too runs without the runner's GATE_D_* configuration;
   # the task directory reaches it as an argument only.
-  if ( scrub_arm_env; bash "$ROOT/check.sh" "$T" "$W" ) >"$W/.check.log" 2>&1; then pass="true"; exitclass="pass"
+  local grade=(bash "$ROOT/check.sh" "$T" "$W")
+  [ "$EXTERNAL" = 1 ] && grade=(verify_env bash "$ROOT/check.sh" "$T" "$W")
+  if ( scrub_arm_env; "${grade[@]}" ) >"$W/.check.log" 2>&1; then pass="true"; exitclass="pass"
   elif [ "$status" = "arm-error" ]; then exitclass="arm-error"
   else
     # Extract the gate id from the `FAIL[G3-tsc]: ...` line (check.sh prints `--- tsc ---`
