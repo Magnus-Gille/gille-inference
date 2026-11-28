@@ -491,8 +491,8 @@ PY
   local pass="false" exitclass="$status"
   # External corpora: gate R3-io and the node hardening (code-battle gate-d-r3 io-gate.mjs, see
   # harbor/test.sh there; INFER-521; the copy lives under vendor/, see CORPUS.md). check.sh runs
-  # the hidden oracle in the same process as the candidate's modules, so a module that can read files could read the oracle at import time and
-  # tailor its answers. io-gate.mjs is a static, non-executing import/identifier allowlist; a row
+  # the hidden oracle in the same process as the candidate's modules, so a module that can read
+  # files could read the oracle at import time and tailor its answers. io-gate.mjs is a static, non-executing import/identifier allowlist; a row
   # passes only if it AND check.sh pass. A violation is a model outcome (exitClass R3-io); a gate
   # that cannot run (bad arguments, crash, no typescript) is a runner failure (R3-io-error), never
   # scored as incapability. check.sh then runs with code generation from strings disabled, which
