@@ -164,6 +164,14 @@ def sh(argv, cwd=None, env=None):
 # The grader executes candidate code; it gets the task directory as an argument, never the runner's
 # GATE_D_* configuration (which would name the sealed corpus root).
 GRADER_ENV = {k: v for k, v in os.environ.items() if not k.startswith("GATE_D_")}
+
+
+def external_grader_env(scratch_parent, wdir):
+    """A fixed allowlist for grading an external task, as run.sh's verify_env: check.sh runs corpus
+    checks and candidate code, so no gateway token or other caller credential reaches it."""
+    return {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "/nonexistent"),
+            "LANG": os.environ.get("LANG", "C.UTF-8"), "TMPDIR": scratch_parent,
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CEILING_DIRECTORIES": os.path.dirname(wdir)}
 KNOWN_GATES = set(re.findall(r"\bfail (G[0-9]+-[A-Za-z0-9-]+)", open(CHECK, encoding="utf-8").read()))
 
 def seed_files(repo_dir):
@@ -280,7 +288,8 @@ for tid in task_ids:
         row["applied"] = False
         row["apply_err"] = "empty diff"
     try:
-        chk = sh(["bash", CHECK, tdir, wdir], env=GRADER_ENV)
+        chk = sh(["bash", CHECK, tdir, wdir],
+                 env=GRADER_ENV if external is None else external_grader_env(scratch_parent, wdir))
     finally:
         if external is not None:
             shutil.rmtree(os.path.dirname(wdir), ignore_errors=True)
@@ -293,7 +302,7 @@ for tid in task_ids:
         # fixture data, so the row keeps only the gate id, never check.sh output (content-blind).
         # check.sh exits right after its FAIL line, so its verdict is the last match; earlier ones
         # can be candidate or oracle output. Only gate ids check.sh defines are recorded.
-        hits = re.findall(r"FAIL\[([^]\n]+)\]", check_out)
+        hits = re.findall(r"(?m)^FAIL\[([^]\n]+)\]:", check_out)
         gate = hits[-1] if hits and hits[-1] in KNOWN_GATES else "check-fail"
         row["check_gate"] = "pass" if chk.returncode == 0 else gate
     row["passed"] = row.get("applied", False) and chk.returncode == 0

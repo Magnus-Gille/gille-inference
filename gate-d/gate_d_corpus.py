@@ -173,13 +173,18 @@ def load_external(root: Path, in_repo: dict[str, Any]) -> dict[str, Any]:
         digest = entry.get("digest") if isinstance(entry, dict) else None
         if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
             raise ValueError(f"{EXTERNAL_MANIFEST} has an invalid task id: {task_id!r}")
+        if task_id == "all":  # run.sh reads `all` as the whole-corpus selector
+            raise ValueError(f"{EXTERNAL_MANIFEST} uses the reserved task id 'all'")
         if not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest):
             raise ValueError(f"{EXTERNAL_MANIFEST} has an invalid digest for {task_id}")
         if task_id in digests:
             raise ValueError(f"{EXTERNAL_MANIFEST} lists {task_id} twice")
         digests[task_id] = digest
         order.append(task_id)
-    return {"root": root, "corpusRevision": revision, "tasks": order, "digests": digests}
+    split = manifest.get("split")
+    if split is not None and not isinstance(split, str):
+        raise ValueError(f"{EXTERNAL_MANIFEST} split must be a string")
+    return {"root": root, "corpusRevision": revision, "tasks": order, "digests": digests, "split": split}
 
 
 def safe_scratch_parent(corpus: Optional[dict[str, Any]] = None) -> str:
@@ -228,6 +233,9 @@ def external_task_metadata(corpus: dict[str, Any], task_id: str) -> dict[str, An
         raise ValueError(f"external task {task_id} must set holdout to true or false")
     if meta.get("split") == "sealed" and holdout is not True:
         raise ValueError(f"external task {task_id} is in the sealed split but does not set holdout: true")
+    # A manifest that declares itself sealed binds every task, whatever its own metadata omits.
+    if corpus.get("split") == "sealed" and holdout is not True:
+        raise ValueError(f"external task {task_id} is in a sealed manifest but does not set holdout: true")
 
     def opt_str(key: str) -> Optional[str]:
         value = meta.get(key)

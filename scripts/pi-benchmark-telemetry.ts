@@ -122,7 +122,9 @@ const TESTS = [
   /\bnpm\s+(run\s+)?test\b/, /\bnpm\s+t\b/, /\bpnpm\s+(run\s+)?test\b/, /\byarn\s+test\b/,
   /\btsx\s+--test\b/, /\bnode\s+(--import\s+tsx\s+)?--test\b/,
   /\btsx\s+\S*test\S*\.ts\b/, // npx tsx test/foo.test.ts — running a test file directly
-  /\b(vitest|jest)\b/,
+  // vitest/jest as the executable (bare, a path to it, or via npx/pnpm/yarn exec), never as an
+  // argument: `git diff -- test/vitest.config.ts` runs no test (INFER-521 review).
+  /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:(?:npx|pnpm(?:\s+exec)?|yarn|bunx)\s+(?:--?\S+\s+)*)?(?:\S*\/)?(?:vitest|jest)(?:\s|$)/,
 ];
 const MUTATING_BASH = [/\bsed\s+-i/, /(^|[^>2&])>{1,2}\s*[^&\s]/, /\btee\b/, /\b(mv|cp|rm)\s/, /\bperl\s+-p?i/, /\bpatch\b/];
 

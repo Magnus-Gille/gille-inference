@@ -183,6 +183,32 @@ function runGateD(repo: string, bin: string, env: Record<string, string>, args: 
   return { res, out };
 }
 
+/** A stand-in code_loop gateway that returns the reference solution as the diff, then runs the runner. */
+const CODE_LOOP_HARNESS = `
+import http.server, json, os, shutil, subprocess, sys, tempfile, threading
+task = sys.argv[1]
+seed = tempfile.mkdtemp()
+shutil.copytree(os.path.join(task, "repo"), seed, dirs_exist_ok=True)
+g = lambda *a: subprocess.run(["git", "-c", "user.email=t@l", "-c", "user.name=t", *a], cwd=seed, check=True, capture_output=True, text=True).stdout
+g("init", "-q"); g("add", "-A"); g("commit", "-qm", "seed")
+shutil.copytree(os.path.join(task, "solution"), seed, dirs_exist_ok=True)
+diff = g("diff")
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        tool = body["params"]["name"]
+        out = {"code_loop_start": {"work_id": "w1"}, "code_loop_status": {"status": "done"},
+               "code_loop_result": {"status": "done", "diff": diff}}[tool]
+        data = json.dumps({"result": {"content": [{"text": json.dumps(out)}]}}).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+env = dict(os.environ, GATE_D_CL_GATEWAY=f"http://127.0.0.1:{srv.server_port}/mcp")
+r = subprocess.run([sys.executable, sys.argv[2], "r3-test-a"], env=env, capture_output=True, text=True)
+sys.stdout.write(r.stdout); sys.stderr.write(r.stderr); sys.exit(r.returncode)
+`;
+
 const VERIFICATION_KEYS = [
   "verificationClass", "typecheckRuns", "testRuns", "typecheckAfterLastEdit", "testsAfterLastEdit",
   "lastTypecheckOutcome", "lastTestOutcome", "stoppedWithFailingCheck", "ambiguousCheckOutcomes",
@@ -448,34 +474,9 @@ require("fs").writeFileSync(".arm-telemetry.json", JSON.stringify({ verification
     const home = tmp("gd-ext-home-");
     writeFileSync(join(home, ".scout-maintenance.env"), "KEY=hs_owner_test_key\n");
     const results = join(tmp("gd-ext-cl-"), "cl.jsonl");
-    // A stand-in code_loop gateway that returns the reference solution as the diff.
-    const harness = `
-import http.server, json, os, shutil, subprocess, sys, tempfile, threading
-task = sys.argv[1]
-seed = tempfile.mkdtemp()
-shutil.copytree(os.path.join(task, "repo"), seed, dirs_exist_ok=True)
-g = lambda *a: subprocess.run(["git", "-c", "user.email=t@l", "-c", "user.name=t", *a], cwd=seed, check=True, capture_output=True, text=True).stdout
-g("init", "-q"); g("add", "-A"); g("commit", "-qm", "seed")
-shutil.copytree(os.path.join(task, "solution"), seed, dirs_exist_ok=True)
-diff = g("diff")
-class H(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *a): pass
-    def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        tool = body["params"]["name"]
-        out = {"code_loop_start": {"work_id": "w1"}, "code_loop_status": {"status": "done"},
-               "code_loop_result": {"status": "done", "diff": diff}}[tool]
-        data = json.dumps({"result": {"content": [{"text": json.dumps(out)}]}}).encode()
-        self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
-srv = http.server.HTTPServer(("127.0.0.1", 0), H)
-threading.Thread(target=srv.serve_forever, daemon=True).start()
-env = dict(os.environ, GATE_D_CL_GATEWAY=f"http://127.0.0.1:{srv.server_port}/mcp")
-r = subprocess.run([sys.executable, sys.argv[2], "r3-test-a"], env=env, capture_output=True, text=True)
-sys.stdout.write(r.stdout); sys.stderr.write(r.stderr); sys.exit(r.returncode)
-`;
     mkdirSync(join(repo, "scripts"), { recursive: true });
     cpSync(join(REAL_ROOT, "scripts", "gate-d-code-loop.py"), join(repo, "scripts", "gate-d-code-loop.py"));
-    const res = spawnSync("python3", ["-c", harness, join(root, "r3-test-a"), join(repo, "scripts", "gate-d-code-loop.py")], {
+    const res = spawnSync("python3", ["-c", CODE_LOOP_HARNESS, join(root, "r3-test-a"), join(repo, "scripts", "gate-d-code-loop.py")], {
       encoding: "utf8",
       env: cleanEnv({ HOME: home, GATE_D_CL_REPO: repo, GATE_D_CL_RESULTS: results, GATE_D_TASKS_ROOT: root, NO_PROXY: "127.0.0.1", no_proxy: "127.0.0.1" }),
       timeout: 120_000,
@@ -623,5 +624,90 @@ sys.stdout.write(r.stdout); sys.stderr.write(r.stderr); sys.exit(r.returncode)
     const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", "r3-test-a"]);
     expect(res.status, res.stderr).toBe(0);
     expect(rows(out)[0]).toMatchObject({ atStopTypecheck: null, detectableFailureAtStop: null });
+  });
+
+  it("grades an external code-loop task with an allowlisted environment and a line-leading verdict", () => {
+    const repo = fixtureRepo();
+    const root = externalCorpus(repo);
+    const home = tmp("gd-ext-home-");
+    writeFileSync(join(home, ".scout-maintenance.env"), "KEY=hs_owner_test_key\n");
+    const probe = join(tmp("gd-ext-clprobe-"), "env.txt");
+    writeFileSync(join(repo, "gate-d", "check.sh"), [
+      "#!/usr/bin/env bash",
+      `env | sed -n 's/^\\(GW[A-Z_]*\\|GATE_D_[A-Z_]*\\|SECRET_[A-Z_]*\\)=.*/\\1/p' > ${JSON.stringify(probe)}`,
+      'echo "FAIL[G3-tsc]: src/FAIL[G5-oracle].ts broke"',
+      "exit 1",
+      "# gate ids defined here: fail G3-tsc fail G5-oracle",
+      "",
+    ].join("\n"));
+    const results = join(tmp("gd-ext-cl-"), "cl.jsonl");
+    mkdirSync(join(repo, "scripts"), { recursive: true });
+    cpSync(join(REAL_ROOT, "scripts", "gate-d-code-loop.py"), join(repo, "scripts", "gate-d-code-loop.py"));
+    const res = spawnSync("python3", ["-c", CODE_LOOP_HARNESS, join(root, "r3-test-a"), join(repo, "scripts", "gate-d-code-loop.py")], {
+      encoding: "utf8",
+      env: cleanEnv({
+        HOME: home, GATE_D_CL_REPO: repo, GATE_D_CL_RESULTS: results, GATE_D_TASKS_ROOT: root,
+        GW_KEY: "gw-secret", SECRET_TOKEN: "s", NO_PROXY: "127.0.0.1", no_proxy: "127.0.0.1",
+      }),
+      timeout: 120_000,
+    });
+    expect(res.status, res.stdout + res.stderr).toBe(0);
+    expect(readFileSync(probe, "utf8")).toBe("");
+    expect(rows(results)[0]).toMatchObject({ passed: false, check_gate: "G3-tsc" });
+  });
+
+  it("binds every task to a sealed manifest and reserves the id all", () => {
+    const repo = fixtureRepo();
+    const root = externalCorpus(repo);
+    const path = join(root, "corpus-manifest.json");
+    const manifest = JSON.parse(readFileSync(path, "utf8"));
+    // Task metadata omits split and says holdout: false, but the manifest is sealed.
+    const metaPath = join(root, "r3-test-a", "meta.json");
+    const { split: _s, ...meta } = JSON.parse(readFileSync(metaPath, "utf8"));
+    writeFileSync(metaPath, JSON.stringify({ ...meta, holdout: false }));
+    manifest.tasks[0].digest = digestOf(repo, join(root, "r3-test-a"));
+    writeFileSync(path, JSON.stringify({ ...manifest, split: "sealed" }));
+    expect(corpusTool(repo, { GATE_D_TASKS_ROOT: root }, "tasks").stderr).toContain("sealed manifest but does not set holdout");
+    writeFileSync(path, JSON.stringify({ ...manifest, tasks: [{ ...manifest.tasks[0], id: "all" }, manifest.tasks[1]] }));
+    expect(corpusTool(repo, { GATE_D_TASKS_ROOT: root }, "tasks").stderr).toContain("reserved task id 'all'");
+  });
+
+  it("does not let a background child of the observer delay grading", () => {
+    const repo = fixtureRepo();
+    const root = externalCorpus(repo, {
+      atStop: `#!/usr/bin/env bash\n( sleep 60 ) &\nprintf '{"atStopTypecheck":"passed","atStopVisibleTests":"none","detectableFailureAtStop":false}\\n'\n`,
+    });
+    const { bin } = fakePi({ root, solve: true });
+    const t0 = Date.now();
+    const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root, GATE_D_AT_STOP_CAP_S: "30" }, ["pi", "r3-test-a"]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(Date.now() - t0).toBeLessThan(25_000);
+    expect(rows(out)[0]).toMatchObject({ pass: true, atStopTypecheck: "passed", atStopCapS: 30 });
+  });
+
+  it("does not resume from rows measured under another observer cap", () => {
+    const repo = fixtureRepo();
+    const root = externalCorpus(repo);
+    const { bin } = fakePi({ root, solve: true });
+    const out = join(tmp("gd-ext-cap-"), "rows.jsonl");
+    const first = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root, GATE_D_OUT: out, ARMS: "pi", SEEDS: "1" }, [], "sweep.sh");
+    expect(first.res.status, first.res.stderr).toBe(0);
+    expect(rows(out).map((r) => r.atStopCapS)).toEqual([300, 300]);
+    const again = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root, GATE_D_OUT: out, ARMS: "pi", SEEDS: "1", GATE_D_AT_STOP_CAP_S: "600" }, [], "sweep.sh");
+    expect(again.res.status, again.res.stderr).toBe(0);
+    expect(rows(out)).toHaveLength(4);
+    const bad = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root, GATE_D_AT_STOP_CAP_S: "0" }, ["pi", "r3-test-a"]);
+    expect(bad.res.status).toBe(3);
+  });
+
+  it("refuses an overlapping work root without creating it inside the corpus", () => {
+    const repo = fixtureRepo();
+    const root = externalCorpus(repo);
+    const { bin, log } = fakePi();
+    const r = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root, GATE_D_WORKROOT: join(root, "new", "work") }, ["pi", "all"]);
+    expect(r.res.status).toBe(3);
+    expect(r.res.stderr).toContain("overlap");
+    expect(existsSync(join(root, "new"))).toBe(false);
+    expect(calls(log)).toEqual([]);
   });
 });

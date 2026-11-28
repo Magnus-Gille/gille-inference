@@ -157,3 +157,14 @@ test("informational modes of check tools are not checks", () => {
   const s = run(turn, start("1", "edit"), end("1", "edit", true), start("2", "bash", "npx tsc --version"), end("2", "bash", true));
   assert.equal(s.verificationClass, "never-checked");
 });
+
+test("vitest and jest count only as the command, not as an argument or filename", () => {
+  for (const cmd of ["npx vitest run", "vitest", "pnpm exec vitest run x", "./node_modules/.bin/jest --ci", "CI=1 npx vitest run", "yarn jest"]) {
+    assert.deepEqual(classifyCommand(cmd).kinds, ["tests"], cmd);
+  }
+  for (const cmd of ["git diff -- test/vitest.config.ts", "head vitest.config.ts", "git log -- jest.setup.js"]) {
+    assert.deepEqual(classifyCommand(cmd).kinds, [], cmd);
+  }
+  const s = run(turn, start("1", "edit"), end("1", "edit", true), start("2", "bash", "git diff -- test/vitest.config.ts"), end("2", "bash", true));
+  assert.equal(s.verificationClass, "never-checked");
+});

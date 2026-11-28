@@ -59,7 +59,6 @@ if ! python3 "$ROOT/path-inside.py" "$WORKROOT_SPELLED" "$REPO_ROOT" \
   echo "       set TMPDIR or GATE_D_WORKROOT to a path outside the checkout." >&2
   exit 3
 fi
-mkdir -p "$WORKROOT"
 
 CORPUS_TOOL="$ROOT/gate_d_corpus.py"
 if [ "${1:-}" = "--list-tasks" ]; then python3 "$CORPUS_TOOL" tasks; exit $?; fi
@@ -77,13 +76,18 @@ if [ "$EXTERNAL" = 1 ]; then
 import sys
 sys.path.insert(0, sys.argv[3])
 from gate_d_corpus import same_or_inside
+import os
 work, tasks = sys.argv[1], sys.argv[2]
-sys.exit(1 if same_or_inside(work, tasks) or same_or_inside(tasks, work) else 0)
+# Checked before WORKROOT exists: a refused run must not create directories inside the corpus.
+inside = same_or_inside(work, tasks) or (os.path.exists(work) and same_or_inside(tasks, work))
+sys.exit(1 if inside else 0)
 ' "$WORKROOT" "$TASKS_DIR" "$ROOT"; then
     echo "error: WORKROOT ($WORKROOT) and GATE_D_TASKS_ROOT ($TASKS_DIR) overlap — refusing to run (#172)." >&2
     exit 3
   fi
 fi
+
+mkdir -p "$WORKROOT" || exit 3
 
 ARM="${1:?usage: run.sh <pi|aider|opencode|qwen-code> <task-id|all>}"
 SEL="${2:?usage: run.sh <pi|aider|opencode|qwen-code> <task-id|all>}"
@@ -165,8 +169,12 @@ scrub_arm_env(){
 # at-stop.sh, resolved once to an absolute path: it runs from inside the copied workspace, where a
 # relative override would name a different (usually missing) file.
 AT_STOP_SCRIPT=""
-AT_STOP_SHA=""; AT_STOP_DIR=""
+AT_STOP_SHA=""; AT_STOP_DIR=""; AT_STOP_CAP_S=""
 if [ "$EXTERNAL" = 1 ]; then
+  # The observer's time cap is part of what a row measured (a timeout leaves nulls), so it is
+  # validated once and recorded per row as atStopCapS; sweep.sh resumes only rows of the same cap.
+  AT_STOP_CAP_S="${GATE_D_AT_STOP_CAP_S:-300}"
+  case "$AT_STOP_CAP_S" in ''|0*|*[!0-9]*) echo "error: GATE_D_AT_STOP_CAP_S must be a positive integer of seconds" >&2; exit 3 ;; esac
   AT_STOP_SCRIPT="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "${GATE_D_AT_STOP:-$TASKS_DIR/at-stop.sh}")" || exit 3
   # The observer is outside the task digest, so its bytes are snapshotted once and their sha256 is
   # recorded per row (atStopSha256, null when absent); sweep.sh resumes only rows of the same observer.
@@ -180,6 +188,10 @@ if [ "$EXTERNAL" = 1 ]; then
   fi
   if [ -n "${GATE_D_EXPECT_CORPUS_REVISION:-}" ] && [ "$GATE_D_EXPECT_CORPUS_REVISION" != "$CORPUS_REVISION" ]; then
     echo "error: the corpus revision differs from the one the sweep pinned ($GATE_D_EXPECT_CORPUS_REVISION != $CORPUS_REVISION)" >&2
+    exit 3
+  fi
+  if [ -n "${GATE_D_EXPECT_AT_STOP_CAP_S:-}" ] && [ "$GATE_D_EXPECT_AT_STOP_CAP_S" != "$AT_STOP_CAP_S" ]; then
+    echo "error: the at-stop time cap differs from the one the sweep pinned" >&2
     exit 3
   fi
   if [ -n "${GATE_D_EXPECT_AT_STOP_SHA+x}" ] && [ "$GATE_D_EXPECT_AT_STOP_SHA" != "$AT_STOP_SHA" ]; then
@@ -205,7 +217,7 @@ external_intact(){ python3 "$CORPUS_TOOL" verify-digest "$1" --expect "$2" --dir
 # Content-blind and fail-open: a missing or failing script, or output that is not exactly the three
 # documented fields with their documented values, yields {}.
 at_stop_json(){
-  local T="$1" W="$2" script="$AT_STOP_SCRIPT" cap="${GATE_D_AT_STOP_CAP_S:-300}" copy out=""
+  local T="$1" W="$2" script="$AT_STOP_SCRIPT" cap="$AT_STOP_CAP_S" copy capture out=""
   [ -f "$script" ] || { echo "{}"; return 0; }
   # The snapshot lives in the temp dir; never run it if it no longer has the recorded bytes.
   [ "sha256:$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$script" 2>/dev/null)" = "$AT_STOP_SHA" ] \
@@ -216,11 +228,32 @@ at_stop_json(){
     echo "{}"; return 0
   fi
   copy="$(mktemp -d "$WORKROOT/atstop-XXXXXXXX" 2>/dev/null)" || { echo "{}"; return 0; }
+  capture="$(mktemp -d "$VERIFY_TMP/gd-atstop-out.XXXXXXXX" 2>/dev/null)" || { rm -rf "$copy"; echo "{}"; return 0; }
   if cp -R "$W/." "$copy/" 2>/dev/null; then
-    # -k: escalate to SIGKILL, so an observer that ignores SIGTERM cannot hang the run.
-    out="$( cd "$copy" && verify_env "$TIMEOUT_BIN" -k 10 "$cap" bash "$script" "$T" "$copy" </dev/null 2>/dev/null )" || out=""
+    # Output goes to a private regular file, never a pipe a background child could hold open, and
+    # the observer runs in its own process group, which is killed whole once it exits or times
+    # out: no descendant can delay grading or the row (INFER-521 review).
+    ( cd "$copy" && verify_env python3 -c '
+import os, signal, subprocess, sys
+cap, out, script, task, work = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+with open(out, "wb") as fh:
+    p = subprocess.Popen(["bash", script, task, work], stdin=subprocess.DEVNULL, stdout=fh,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        p.wait(timeout=cap)
+    except subprocess.TimeoutExpired:
+        fh.truncate(0)
+    finally:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        p.wait()
+    sys.exit(0 if p.returncode == 0 else 1)
+' "$cap" "$capture/out" "$script" "$T" "$copy" </dev/null >/dev/null 2>&1 ) \
+      && out="$(head -c 65536 "$capture/out" 2>/dev/null)" || out=""
   fi
-  rm -rf "$copy"
+  rm -rf "$copy" "$capture"
   GD_AT_STOP_RAW="$out" python3 -c '
 import json, os
 allowed = {"atStopTypecheck": {"passed", "failed"}, "atStopVisibleTests": {"passed", "failed", "none"},
@@ -503,7 +536,7 @@ PY
       exitclass="$(python3 -c '
 import re, sys
 known = set(re.findall(r"\bfail (G[0-9]+-[A-Za-z0-9-]+)", open(sys.argv[1]).read()))
-hits = re.findall(r"FAIL\[([^]\n]+)\]", open(sys.argv[2], errors="replace").read())
+hits = re.findall(r"(?m)^FAIL\[([^]\n]+)\]:", open(sys.argv[2], errors="replace").read())
 print(hits[-1] if hits and hits[-1] in known else "check-fail")' "$ROOT/check.sh" "$W/.check.log" 2>/dev/null)"
     fi
     [ -n "$exitclass" ] || exitclass="check-fail"
@@ -518,7 +551,7 @@ print(hits[-1] if hits and hits[-1] in known else "check-fail")' "$ROOT/check.sh
     GD_CORPUS_REVISION="$CORPUS_REVISION" GD_TASK_REVISION="$task_revision" GD_HOLDOUT="$holdout" \
     GD_TELEMETRY="$([ "$ARM" = pi ] && printf %s "$W/.arm-telemetry.json")" \
     GD_PEEK="$PEEK_JSON" GD_PROMPT_VARIANT="$PROMPT_VARIANT" GD_PROMPT_SHA="$PROMPT_SHA" \
-    GD_EXTERNAL="$EXTERNAL" GD_IDENTITY="$identity" GD_AT_STOP="$AT_STOP_JSON" GD_AT_STOP_SHA="$AT_STOP_SHA" \
+    GD_EXTERNAL="$EXTERNAL" GD_IDENTITY="$identity" GD_AT_STOP="$AT_STOP_JSON" GD_AT_STOP_SHA="$AT_STOP_SHA" GD_AT_STOP_CAP="$AT_STOP_CAP_S" \
     python3 -c "import json,os
 row={'arm':os.environ['GD_ARM'],'model':os.environ['GD_MODEL'],'task':os.environ['GD_TASK'],'corpusRevision':os.environ['GD_CORPUS_REVISION'],'taskRevision':os.environ['GD_TASK_REVISION'],'holdout':os.environ['GD_HOLDOUT']=='true','pass':os.environ['GD_PASS']=='true','exitClass':os.environ['GD_EXIT'],'wallS':int(os.environ['GD_WALL'])}
 keys=('turns','toolCalls','promptTokens','completionTokens','modelTurnMs','timedModelTurns','assistantStreamMs','timedAssistantMessages','unparseableLines')
@@ -557,6 +590,7 @@ if os.environ.get('GD_EXTERNAL')=='1':
     at=json.loads(os.environ.get('GD_AT_STOP') or '{}')
     for k in ('atStopTypecheck','atStopVisibleTests','detectableFailureAtStop'): row[k]=at.get(k)
     row['atStopSha256']=os.environ.get('GD_AT_STOP_SHA') or None
+    row['atStopCapS']=int(os.environ['GD_AT_STOP_CAP']) if row['atStopSha256'] else None
 peek=json.loads(os.environ.get('GD_PEEK') or '{}')
 row.update({k:bool(v) for k,v in peek.items() if k not in row})
 row['promptVariant']=os.environ['GD_PROMPT_VARIANT']; row['promptSha256']=os.environ['GD_PROMPT_SHA'] or None

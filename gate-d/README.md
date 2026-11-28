@@ -210,11 +210,13 @@ GATE_D_TASKS_ROOT=/tmp/r3-validation GATE_D_AT_STOP=~/src/code-battle/gate-d-r3/
   on a copy of the work dir, so its checks can never change what is graded. Its
   `atStopTypecheck`, `atStopVisibleTests` and `detectableFailureAtStop` are recorded only when its
   output is exactly those three fields with their documented values. The script's bytes are
-  snapshotted at start and their digest is recorded as `atStopSha256`; `sweep.sh` resumes only rows
-  of the same observer, counts only those in its summary, and refuses a child whose observer or
-  corpus revision changed. The observer is skipped (`null`) when the arm left a symlink in the work
-  dir, and is killed 10 s after its `GATE_D_AT_STOP_CAP_S` (default 300 s); anything else, a failure or a
-  missing script yields `null` for all three. Pass/fail never depends on it. A relative
+  snapshotted at start and their digest is recorded as `atStopSha256`, with its time cap
+  `GATE_D_AT_STOP_CAP_S` (a positive integer, default 300 s) as `atStopCapS`; `sweep.sh` resumes only
+  rows of the same observer and cap, counts only those in its summary, and refuses a child whose
+  observer, cap or corpus revision changed. The observer is skipped (`null`) when the arm left a
+  symlink in the work dir. It writes to a private file, not a pipe, in its own process group, which
+  is killed whole when it exits or reaches the cap, so a background child cannot delay grading; a
+  timeout, any other failure or a missing script yields `null` for all three. Pass/fail never depends on it. A relative
   `GATE_D_AT_STOP` resolves from the caller's directory. The copy shares the read-only-by-convention
   `node_modules` link with the graded workspace, exactly as the arm itself does; neither is covered
   by the task digest.
