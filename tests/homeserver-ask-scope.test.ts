@@ -174,7 +174,7 @@ describe("ask scope: MCP", () => {
   it("lists exactly the ask tool plus read-only helpers, and no file-reading input", async () => {
     const body = await rpc(keys["ask"]!, "tools/list");
     const tools = body.result.tools as Array<{ name: string; inputSchema: { properties: Record<string, unknown> }; _meta?: Record<string, any> }>;
-    expect(tools.map((t) => t.name).sort()).toEqual(["ask", "list_models", "model_status", "tokenize"]);
+    expect(tools.map((t) => t.name).sort()).toEqual(["ask", "ask_batch", "list_models", "model_status", "tokenize"]);
     const ask = tools.find((t) => t.name === "ask")!;
     expect(ask.inputSchema.properties).not.toHaveProperty("files");
     expect(ask._meta?.["gille-inference/ask_capabilities"]).toMatchObject({ files_enabled: false });
@@ -309,7 +309,7 @@ describe("regression: existing scopes are unchanged", () => {
   it("owner inference and guest inference never see code_loop and keep their ask schema", async () => {
     for (const k of ["ownerInference", "guestInference"]) {
       const names = await toolNames(keys[k]!);
-      expect(names.sort()).toEqual(["ask", "list_models", "model_status", "tokenize"]);
+      expect(names.sort()).toEqual(["ask", "ask_batch", "list_models", "model_status", "tokenize"]);
     }
     const owner = (await rpc(keys["ownerInference"]!, "tools/list")).result.tools.find((t: any) => t.name === "ask");
     expect(owner.inputSchema.properties).toHaveProperty("files");
@@ -444,7 +444,7 @@ describe("ask scope: ask.files is rejected before any path handling (N3)", () =>
       const before = upstreamHits;
       const body = await callTool(keys["ask"]!, "ask", { model: "mellum", prompt: "s", files });
       expect(body.result.isError).toBe(true);
-      expect(body.result.content[0].text).toBe("File attachments ('files') are not available to an ask-scope key.");
+      expect(body.result.content[0].text).toBe("File attachments ('files') are not available to this ask-scope key (no file-root grant).");
       expect(spy).not.toHaveBeenCalled();
       expect(upstreamHits).toBe(before);
     }

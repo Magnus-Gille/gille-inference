@@ -445,6 +445,16 @@ describe("m5 doctor model-discovery diagnostics", () => {
       });
     });
 
+    it("accepts ask_batch (INFER-525) for an ask key without flagging it", async () => {
+      const result = await diagnose({
+        identityScope: "ask",
+        publicTools: [...ASK_TOOLS, "ask_batch"],
+        inferenceProbe: { route: "public", model: "safe-model" },
+        askSuccess: true,
+      });
+      expect(result).toMatchObject({ status: "mcp_reachable", inference_probe: { status: "succeeded" } });
+    });
+
     it("rejects an ask key without ask on the explicit probe path", async () => {
       const result = await diagnose({
         identityScope: "ask",

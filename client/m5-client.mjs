@@ -55,10 +55,16 @@ export const REQUIRED_AGENT_TOOLS = Object.freeze([
 /** Tools the gateway advertises to an owner `ask` key (src/homeserver/mcp.ts base catalogue). */
 export const REQUIRED_ASK_TOOLS = Object.freeze(["list_models", "ask", "model_status", "tokenize"]);
 
+/**
+ * Tools an ask key may additionally see without widening its authority: `ask_batch` dispatches
+ * every task through `ask` itself (INFER-525). Older gateways do not advertise it.
+ */
+export const OPTIONAL_ASK_TOOLS = Object.freeze(["ask_batch"]);
+
 /** Tools outside the closed ask-scope set; an ask key must never see more than that. */
 function unexpectedAskTools(identity, tools) {
   if (identity.scope !== "ask") return [];
-  return tools.filter((tool) => !REQUIRED_ASK_TOOLS.includes(tool));
+  return tools.filter((tool) => !REQUIRED_ASK_TOOLS.includes(tool) && !OPTIONAL_ASK_TOOLS.includes(tool));
 }
 
 /** Required tool set for an owner identity, or null when the tier/scope is not acceptable. */

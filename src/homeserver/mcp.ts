@@ -41,6 +41,7 @@ import type { ModelFailureBackoff } from "./model-failure-backoff.js";
 import { classifyUpstreamError, makeError } from "./errors.js";
 import {
   describeBlindContextAvailability,
+  describeKeyScopedBlindContextAvailability,
   expandBlindContext,
   MAX_BLIND_CONTEXT_ROOTS,
   type BlindContextConfig,
@@ -56,7 +57,9 @@ import {
   type AdoptionEvidenceRetention,
 } from "./adoption-evidence.js";
 import type { HuginRequestStamp, LearningTaskCapabilityEpoch } from "./learning-task-contract.js";
-import type { KeyScope } from "./keystore.js";
+import { getKeyFileRootsByHash, isKeyHashActive, type KeyScope } from "./keystore.js";
+import { isOAuthGrantActive } from "./oauth.js";
+import type { KeyFileRoot } from "./blind-context.js";
 // #33: reuse PR #32's exact derivation VERBATIM (never fork it) — see orchestrator.ts's
 // deriveEvidenceIdentity doc comment for why this is lane-agnostic and safe to share.
 import { deriveEvidenceIdentity } from "./orchestrator.js";
@@ -99,6 +102,8 @@ export interface McpPrincipal {
   maxParallel: number;
   keyHash: string | null;
   creditLimit: number;
+  /** Set when the credential is an OAuth access token (INFER-518); re-checked between batch items. */
+  oauthGrantId?: string;
 }
 
 interface McpTraceOverride {
@@ -153,8 +158,21 @@ const ASK_DESCRIPTION =
   "OWNER-TIER KEYS ONLY: an optional `files` array of absolute paths on the box is expanded " +
   "SERVER-SIDE into the prompt as local context, so this tool can orchestrate over local data it " +
   "never ingests — only the box reads the file and the local model sees its content. Requires " +
-  "HOMESERVER_BLIND_CONTEXT_ROOTS to be configured (disabled by default); a guest key supplying " +
-  "`files` is always rejected, never silently ignored.";
+  "HOMESERVER_BLIND_CONTEXT_ROOTS to be configured (disabled by default); an ask-scope key also " +
+  "needs an explicit per-key file-root grant, and secret, credential, VCS-internal and database " +
+  "files are always refused. A guest key supplying `files` is always rejected, never silently ignored.";
+
+/** INFER-525: one MCP call carrying several independent `ask` tasks. */
+export const ASK_BATCH_MAX_TASKS = 16;
+export const ASK_BATCH_MAX_CONCURRENCY = 4;
+const ASK_BATCH_DESCRIPTION =
+  `Run 1–${ASK_BATCH_MAX_TASKS} independent ask tasks in ONE call (for example ten small classifications or ` +
+  "summaries). Each item in `tasks` takes exactly the ask tool's arguments and goes through the same " +
+  "authorization, model allow-list, credits, quotas and admission as a single ask; nothing is shared " +
+  "between tasks. Tasks run with at most min(key max_parallel, " + `${ASK_BATCH_MAX_CONCURRENCY}` + ") at a time. " +
+  "One task failing never aborts the others. structuredContent.results[] keeps input order: each entry has " +
+  "index and ok, plus model/text/finish_reason/truncated/usage when the model answered, and " +
+  "error {message, m5_code, retryable, retry_after_seconds} when it did not. isError is true only when every task failed.";
 
 const ASK_FILES_REASON_VALUES = ["enabled", "owner_tier_required", "unconfigured", "no_resolved_roots"] as const;
 const COMPLETE_WITHIN_BUDGET_PROFILE = "complete-within-budget" as const;
@@ -307,6 +325,46 @@ const ASK_OWNER_OUTPUT_SCHEMA = {
   },
 } as const;
 
+const ASK_BATCH_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    results: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          index: { type: "integer", minimum: 0 },
+          ok: { type: "boolean" },
+          model: { type: ["string", "null"] },
+          text: { type: ["string", "null"] },
+          finish_reason: { type: ["string", "null"] },
+          truncated: { type: ["boolean", "null"] },
+          usage: { oneOf: [ASK_USAGE_OUTPUT_SCHEMA, { type: "null" }] },
+          error: {
+            oneOf: [
+              { type: "null" },
+              {
+                type: "object",
+                properties: {
+                  message: { type: "string" },
+                  m5_code: { type: ["string", "null"] },
+                  retryable: { type: "boolean" },
+                  retry_after_seconds: { type: ["number", "null"] },
+                },
+                required: ["message", "m5_code", "retryable", "retry_after_seconds"],
+              },
+            ],
+          },
+        },
+        required: ["index", "ok", "model", "text", "finish_reason", "truncated", "usage", "error"],
+      },
+    },
+    succeeded: { type: "integer", minimum: 0 },
+    failed: { type: "integer", minimum: 0 },
+  },
+  required: ["results", "succeeded", "failed"],
+} as const;
+
 const CODE_LOOP_OWNER_INSTRUCTIONS =
   "code_loop is OWNER-AGENT ONLY, async, and OS-caged. Delegate only self-contained seed-file work; never credentials, network, live checkouts, or side effects. Caller reviews/applies the diff.";
 
@@ -333,23 +391,36 @@ function isAdoptionReporter(principal: McpPrincipal): boolean {
 }
 
 /**
- * Blind-context `files` expansion is read by the gateway's own service account, so it is never
- * available to the `ask` scope: an on-box agent account must not be able to use the gateway as a
- * confused deputy for files it cannot read itself (INFER-450).
+ * Blind-context `files` expansion is read by the gateway's own service account, so the `ask` scope
+ * does not get it by default: an on-box agent account must not be able to use the gateway as a
+ * confused deputy for files it cannot read itself (INFER-450). INFER-524 adds an explicit,
+ * per-credential operator grant (`keys files`) that lets ONE ask-scope key read files under its
+ * granted roots, which only ever NARROW HOMESERVER_BLIND_CONTEXT_ROOTS.
+ *
+ * Returns the access mode: "global" (agent/admin/inference owner keys: the server's roots),
+ * "key" (ask scope with a grant: the key's roots narrowed by the server's roots), or null.
  */
-function isAskFilesOwner(principal: McpPrincipal): boolean {
-  return principal.tier === "owner" && principal.scope !== "ask";
+function askFilesAccess(principal: McpPrincipal): { mode: "global" } | { mode: "key"; roots: KeyFileRoot[] } | null {
+  if (principal.tier !== "owner") return null;
+  if (principal.scope !== "ask") return { mode: "global" };
+  const roots = getKeyFileRootsByHash(principal.keyHash);
+  return roots.length === 0 ? null : { mode: "key", roots };
 }
 
 function askFilesCapability(principal: McpPrincipal, cfg: HomeserverConfig): AskFilesCapability {
-  if (!isAskFilesOwner(principal)) {
+  const access = askFilesAccess(principal);
+  if (access === null) {
+    // Kept as the stable wire value for an ungranted ask-scope key too, so deployed clients that
+    // validate the closed reason set keep parsing (INFER-524).
     return {
       files_enabled: false,
       files_reason: "owner_tier_required",
       resolved_root_count: null,
     };
   }
-  const availability = describeBlindContextAvailability(cfg.blindContextRoots);
+  const availability = access.mode === "global"
+    ? describeBlindContextAvailability(cfg.blindContextRoots)
+    : describeKeyScopedBlindContextAvailability(cfg.blindContextRoots, access.roots);
   return {
     files_enabled: availability.enabled,
     files_reason: availability.reason,
@@ -581,8 +652,8 @@ function toolDefs(principal: McpPrincipal, cfg: HomeserverConfig): McpToolDef[] 
             include_reasoning: { type: "boolean", default: false,
               description: "OWNER-ONLY opt-in: return native reasoning_content separately (up to 16384 UTF-8 bytes). Does not request a generated explanation or change reasoning effort; absent backend data stays null." },
           } : {}),
-          // The ask-only scope never reads server-side files, so the input is not advertised.
-          ...(principal.scope === "ask" ? {} : {
+          // An ask-scope key reads server-side files only with an explicit grant (INFER-524).
+          ...(principal.tier === "owner" && principal.scope === "ask" && !filesCapability.files_enabled ? {} : {
             files: {
               type: "array",
               items: { type: "string" },
@@ -598,6 +669,34 @@ function toolDefs(principal: McpPrincipal, cfg: HomeserverConfig): McpToolDef[] 
       outputSchema: principal.tier === "owner" ? ASK_OWNER_OUTPUT_SCHEMA : ASK_OUTPUT_SCHEMA,
     },
   ];
+  const askDef = base.find((tool) => tool.name === "ask")!;
+  base.push({
+    name: "ask_batch",
+    description: ASK_BATCH_DESCRIPTION,
+    _meta: { [ASK_FILES_META_KEY]: filesCapability },
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        tasks: {
+          type: "array",
+          minItems: 1,
+          maxItems: ASK_BATCH_MAX_TASKS,
+          description: `1–${ASK_BATCH_MAX_TASKS} independent ask calls; each item takes exactly the ask tool's arguments`,
+          items: askDef.inputSchema,
+        },
+        ...(isKeyedExposureFingerprintAvailable() ? {
+          content_capture: {
+            type: "string",
+            enum: [CONTENT_CAPTURE_NONE],
+            description: "optional opt-out applied to every task (same contract as ask.content_capture)",
+          },
+        } : {}),
+      },
+      required: ["tasks"],
+    },
+    outputSchema: ASK_BATCH_OUTPUT_SCHEMA,
+  });
   if (isAdoptionReporter(principal)) {
     base.push({
       name: "record_adoption_evidence",
@@ -1452,6 +1551,8 @@ interface ToolCallContext {
   inflight: { inc: (alias: string) => void; dec: (alias: string) => void; current: (alias: string) => number };
   /** #487: transport-level `X-Content-Capture: none` on this /mcp POST (validated by the gateway). */
   contentCapture?: ContentCapture;
+  /** Aborted when the client connection closes before the response is written (ask_batch stops starting tasks). */
+  signal?: AbortSignal;
 }
 
 /** A tools/call result: a text content block + isError flag. Never throws for a tool error. */
@@ -1461,6 +1562,7 @@ async function callTool(
   ctx: ToolCallContext
 ): Promise<{ text: string; isError: boolean; structuredContent?: unknown; meta?: Record<string, unknown>; trace?: McpTraceOverride }> {
   if (name === "tokenize") return runTokenize(args, ctx);
+  if (name === "ask_batch") return runAskBatch(args, ctx);
   if (name === "list_models") {
     const models = await visibleModels(ctx.principal, ctx.cfg);
     const structuredContent = buildListModelsStructuredContent(
@@ -1602,10 +1704,11 @@ async function callTool(
     // never inspects per-tool params). A guest key carrying `files` is NEVER silently ignored: it
     // is rejected before any credit reservation / quota / admission work runs, using the same
     // OpenAI-shaped error vocabulary (errors.ts) as the rest of the gateway.
-    if (files !== undefined && files.length > 0 && !isAskFilesOwner(ctx.principal)) {
+    const filesAccess = askFilesAccess(ctx.principal);
+    if (files !== undefined && files.length > 0 && filesAccess === null) {
       const env = makeError("route_not_allowed", {
         message: ctx.principal.scope === "ask"
-          ? "File attachments ('files') are not available to an ask-scope key."
+          ? "File attachments ('files') are not available to this ask-scope key (no file-root grant)."
           : "File attachments ('files') require an owner-tier API key. This key is 'guest'.",
       });
       return {
@@ -1625,6 +1728,7 @@ async function callTool(
         roots: ctx.cfg.blindContextRoots,
         maxFileBytes: ctx.cfg.blindContextMaxFileBytes,
         maxTotalBytes: ctx.cfg.blindContextMaxTotalBytes,
+        ...(filesAccess?.mode === "key" ? { keyRoots: filesAccess.roots } : {}),
       };
       const expansion = expandBlindContext(files, blindCfg);
       if (!expansion.ok) {
@@ -1709,6 +1813,164 @@ async function callTool(
   return { text: `Unknown tool '${name}'.`, isError: true, trace: badRequestTrace() };
 }
 
+type ToolCallOutcome = Awaited<ReturnType<typeof callTool>>;
+
+interface AskBatchEntry {
+  reasoning_content?: string | null;
+  reasoning_truncated?: boolean | null;
+  index: number;
+  ok: boolean;
+  model: string | null;
+  text: string | null;
+  finish_reason: string | null;
+  truncated: boolean | null;
+  usage: unknown;
+  error: { message: string; m5_code: string | null; retryable: boolean; retry_after_seconds: number | null } | null;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function askBatchEntry(index: number, out: ToolCallOutcome): AskBatchEntry {
+  const structured = isPlainObject(out.structuredContent) ? out.structuredContent : null;
+  const meta = out.meta ?? {};
+  const retryAfter = meta["retry_after_seconds"];
+  return {
+    index,
+    ok: !out.isError,
+    model: typeof structured?.["model"] === "string" ? structured["model"] : null,
+    text: structured !== null && typeof structured["text"] === "string" ? structured["text"] : (out.isError ? null : out.text),
+    finish_reason: typeof structured?.["finish_reason"] === "string" ? structured["finish_reason"] : null,
+    truncated: typeof structured?.["truncated"] === "boolean" ? structured["truncated"] : null,
+    usage: structured?.["usage"] ?? null,
+    ...(structured !== null && "reasoning_content" in structured ? {
+      reasoning_content: (structured["reasoning_content"] as string | null | undefined) ?? null,
+      reasoning_truncated: (structured["reasoning_truncated"] as boolean | null | undefined) ?? null,
+    } : {}),
+    error: out.isError
+      ? {
+          message: out.text,
+          m5_code: typeof meta["m5_code"] === "string" ? meta["m5_code"] : (structured?.["finish_reason"] === "length" ? "token_limit" : null),
+          retryable: meta["retryable"] === true,
+          retry_after_seconds: typeof retryAfter === "number" ? retryAfter : null,
+        }
+      : null,
+  };
+}
+
+function renderAskBatchText(results: readonly AskBatchEntry[]): string {
+  return results.map((entry) => {
+    const head = entry.ok
+      ? `===== TASK ${entry.index} (${entry.model ?? "unknown"}) ok =====`
+      : `===== TASK ${entry.index} failed${entry.error?.m5_code ? ` (${entry.error.m5_code})` : ""} =====`;
+    const body = entry.ok ? entry.text ?? "" : [entry.error?.message ?? "", entry.text ?? ""].filter((part) => part !== "").join("\n");
+    return `${head}\n${body}`;
+  }).join("\n\n");
+}
+
+/** Type checks the shared ask normalizer is lenient about; a bad item fails on its own (review L5). */
+function askBatchItemProblem(task: unknown): string | null {
+  if (!isPlainObject(task)) return "Each ask_batch task must be an object of ask arguments.";
+  if (task["system"] !== undefined && typeof task["system"] !== "string") return "'system' must be a string.";
+  const maxTokens = task["max_tokens"];
+  if (maxTokens !== undefined && (typeof maxTokens !== "number" || !Number.isFinite(maxTokens) || maxTokens < 1)) {
+    return "'max_tokens' must be a positive number.";
+  }
+  if (task["files"] !== undefined && (!Array.isArray(task["files"]) || task["files"].some((f) => typeof f !== "string"))) {
+    return "'files' must be an array of strings.";
+  }
+  return null;
+}
+
+/**
+ * Re-check, before each item, that the credential that authenticated the batch is still active
+ * (review M4): a key revoked or rotated mid-batch must not keep spending or reading files.
+ */
+function askBatchCredentialStillValid(principal: McpPrincipal): boolean {
+  if (principal.oauthGrantId !== undefined && !isOAuthGrantActive(principal.oauthGrantId)) return false;
+  if (principal.keyHash !== null && !isKeyHashActive(principal.keyHash)) return false;
+  return true;
+}
+
+/**
+ * INFER-525: run several independent `ask` tasks in one tool call. Every task is dispatched through
+ * callTool("ask") itself, so authorization, model allow-lists, files grants, credits, quotas,
+ * admission, logging and metering are exactly those of a single ask — the batch adds no authority.
+ * Concurrency is bounded by the key's own max_parallel (and ASK_BATCH_MAX_CONCURRENCY) so a batch
+ * cannot exceed the key's parallel limit by itself.
+ */
+async function runAskBatch(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolCallOutcome> {
+  const unknownKeys = Object.keys(args).filter((key) => key !== "tasks" && key !== "content_capture");
+  if (unknownKeys.length > 0) {
+    return { text: `ask_batch: unknown argument '${unknownKeys[0]}'.`, isError: true, trace: badRequestTrace() };
+  }
+  const tasks = args["tasks"];
+  if (!Array.isArray(tasks) || tasks.length === 0 || tasks.length > ASK_BATCH_MAX_TASKS) {
+    return { text: `ask_batch requires 'tasks': an array of 1–${ASK_BATCH_MAX_TASKS} ask argument objects.`, isError: true, trace: badRequestTrace() };
+  }
+  const batchCapture = args["content_capture"];
+  if (batchCapture !== undefined && batchCapture !== CONTENT_CAPTURE_NONE) {
+    return { text: `ask_batch: 'content_capture' must be '${CONTENT_CAPTURE_NONE}' when given.`, isError: true, trace: badRequestTrace() };
+  }
+  if (batchCapture === CONTENT_CAPTURE_NONE && !isKeyedExposureFingerprintAvailable()) {
+    return {
+      text: "content_capture 'none' is not available on this gateway (exposure fingerprint key not provisioned); nothing was run.",
+      isError: true,
+      meta: { m5_code: "content_capture_unavailable", retryable: false },
+      trace: badRequestTrace(),
+    };
+  }
+
+  const results: AskBatchEntry[] = new Array(tasks.length);
+  const traces: Array<McpTraceOverride | undefined> = new Array(tasks.length);
+  const concurrency = Math.max(1, Math.min(ctx.principal.maxParallel > 0 ? ctx.principal.maxParallel : 1, ASK_BATCH_MAX_CONCURRENCY, tasks.length));
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < tasks.length) {
+      const index = next++;
+      const task = tasks[index];
+      let out: ToolCallOutcome;
+      const invalid = askBatchItemProblem(task);
+      if (ctx.signal?.aborted === true) {
+        // The client is gone: never START another billable task for a response nobody reads.
+        out = { text: "Not started: the client disconnected before this task began.", isError: true,
+          meta: { m5_code: "client_closed", retryable: true }, trace: { traceOutcome: "client_closed" } };
+      } else if (!askBatchCredentialStillValid(ctx.principal)) {
+        out = { text: "Not started: this key or its grant was revoked or expired during the batch.", isError: true,
+          meta: { m5_code: "invalid_api_key", retryable: false },
+          trace: { traceOutcome: "auth_failed", traceErrorClass: "invalid_api_key" } };
+      } else if (invalid !== null) {
+        out = { text: invalid, isError: true, trace: badRequestTrace() };
+      } else {
+        const item = task as Record<string, unknown>;
+        // A task's own content_capture is validated by ask itself; the batch value fills the gap.
+        const taskArgs = batchCapture === undefined || "content_capture" in item ? item : { ...item, content_capture: batchCapture };
+        try {
+          out = await callTool("ask", taskArgs, ctx);
+        } catch {
+          out = { text: "This task failed inside the gateway; other tasks were not affected.", isError: true,
+            meta: { m5_code: "upstream_error", retryable: false }, trace: genericToolErrorTrace() };
+        }
+      }
+      results[index] = askBatchEntry(index, out);
+      traces[index] = out.trace ?? (out.isError ? genericToolErrorTrace() : undefined);
+    }
+  };
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
+  const succeeded = results.filter((entry) => entry.ok).length;
+  const failed = results.length - succeeded;
+  const structuredContent = { results, succeeded, failed };
+  return {
+    text: renderAskBatchText(results),
+    isError: succeeded === 0,
+    structuredContent,
+    ...(batchCapture === CONTENT_CAPTURE_NONE ? { meta: { content_capture: CONTENT_CAPTURE_SUPPRESSED } } : {}),
+    ...(succeeded === 0 ? { trace: traces.find((trace) => trace !== undefined) ?? genericToolErrorTrace() } : {}),
+  };
+}
+
 // ─── HTTP dispatch (one JSON-RPC message per POST body) ────────────────────────────────
 
 /**
@@ -1782,7 +2044,17 @@ export async function handleMcpPost(rawBody: string, res: ServerResponse, ctx: T
     const params = (msg.params ?? {}) as { name?: unknown; arguments?: unknown };
     const name = typeof params.name === "string" ? params.name : "";
     const toolArgs = (typeof params.arguments === "object" && params.arguments !== null ? params.arguments : {}) as Record<string, unknown>;
-    const out = await callTool(name, toolArgs, ctx);
+    const abort = new AbortController();
+    const onClose = (): void => { if (!res.writableEnded) abort.abort(); };
+    // Minimal response doubles in tests may not be event emitters; then no abort is wired.
+    const canWatch = typeof res.once === "function" && typeof res.off === "function";
+    if (canWatch) res.once("close", onClose);
+    let out: Awaited<ReturnType<typeof callTool>>;
+    try {
+      out = await callTool(name, toolArgs, name === "ask_batch" ? { ...ctx, signal: ctx.signal ?? abort.signal } : ctx);
+    } finally {
+      if (canWatch) res.off("close", onClose);
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(rpcResult(id, { content: [{ type: "text", text: out.text }], isError: out.isError, ...(out.structuredContent === undefined ? {} : { structuredContent: out.structuredContent }), ...(out.meta === undefined ? {} : { _meta: out.meta }) }));
     const trace = out.trace ?? (out.isError ? genericToolErrorTrace() : undefined);

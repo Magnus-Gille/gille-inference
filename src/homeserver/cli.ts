@@ -24,6 +24,8 @@ import {
   credentialInventoryReadOnly,
   buildCredentialPlan,
   restrictKey,
+  setKeyFileRoots,
+  getKeyFileRootsByAlias,
   listKeys,
   revokeKey,
   revokeKeysByScope,
@@ -51,6 +53,7 @@ import {
   revokeClient,
   revokeGrant,
   revokeGrantsForKey,
+  countActiveGrantsForKey,
 } from "./oauth.js";
 import { runCli as runDeepResearch } from "./deep-research-cli.js";
 import { acquireGpuLease, gpuLeaseStatus, type HolderSelection } from "./gpu-lease.js";
@@ -569,6 +572,40 @@ export function cmdKeys(args: ParsedArgs): void {
     return;
   }
 
+  if (sub === "files") {
+    // INFER-524: grant/clear the blind-context roots ONE owner key may read via MCP ask `files`.
+    const allowed = new Set(["alias", "roots", "clear"]);
+    for (const name of Object.keys(args.flags)) {
+      if (!allowed.has(name)) throw new Error(`keys files: unknown flag --${name}`);
+    }
+    const alias = typeof args.flags["alias"] === "string" ? args.flags["alias"] : undefined;
+    const rootsFlag = args.flags["roots"];
+    const clear = args.flags["clear"] === true;
+    const usage =
+      "usage: keys files --alias A [--roots /abs/a:/abs/b | --clear]\n" +
+      "  Grants an owner key read access to files under these roots for MCP ask `files`. Roots only\n" +
+      "  narrow HOMESERVER_BLIND_CONTEXT_ROOTS; rotation drops the grant. No --roots/--clear shows it.";
+    if (!alias || (clear && rootsFlag !== undefined) || (rootsFlag !== undefined && typeof rootsFlag !== "string")) {
+      throw new Error(usage);
+    }
+    const oauthClients = countActiveGrantsForKey(alias);
+    const sharedNote = oauthClients > 0
+      ? `\n  note: ${oauthClients} active OAuth grant(s) are backed by '${alias}' and share this file grant.`
+      : "";
+    if (!clear && rootsFlag === undefined) {
+      const roots = getKeyFileRootsByAlias(alias).map((root) => root.path);
+      console.log((roots.length === 0 ? `'${alias}' has no file-root grant` : `'${alias}' file roots:\n  ${roots.join("\n  ")}`) + sharedNote);
+      return;
+    }
+    const roots = clear ? [] : (rootsFlag as string).split(":").filter((root) => root.length > 0);
+    if (!clear && roots.length === 0) throw new Error(usage);
+    const applied = setKeyFileRoots(alias, roots).map((root) => root.path);
+    console.log((applied.length === 0
+      ? `✓ cleared the file-root grant for '${alias}'`
+      : `✓ '${alias}' may now attach files under:\n  ${applied.join("\n  ")}`) + sharedNote);
+    return;
+  }
+
   if (sub === "restrict") {
     const allowed = new Set(["alias", "scope", "expires-in", "dry-run"]);
     for (const name of Object.keys(args.flags)) {
@@ -874,7 +911,7 @@ export function cmdKeys(args: ParsedArgs): void {
     return;
   }
 
-  console.log("usage: keys <mint|rotate|list|revoke|invite|invites> ...");
+  console.log("usage: keys <mint|rotate|list|revoke|invite|invites|restrict|files> ...");
 }
 
 function strFlag(flags: Record<string, string | boolean>, name: string): string | undefined {
@@ -1269,6 +1306,7 @@ async function main(): Promise<void> {
           "  tsx src/homeserver/cli.ts keys mint --alias claude --tier owner --scope agent\n" +
           "  tsx src/homeserver/cli.ts keys mint --alias box-agent --tier owner --scope ask --models mellum --credits 200000   # MCP ask only (INFER-450)\n" +
           "  tsx src/homeserver/cli.ts keys rotate --alias harness   # revoke old + mint fresh (#99)\n" +
+          "  tsx src/homeserver/cli.ts keys files --alias claude-connector --roots /home/magnus/blind-context/gille-inference   # ask files grant (INFER-524)\n" +
           "  tsx src/homeserver/cli.ts keys inventory --stale-days 30 [--scope ask | --plan | --static] [--json]   # --static is counts only and takes no --scope\n" +
           "  tsx src/homeserver/cli.ts keys restrict --alias harness --scope agent --expires-in 2592000 [--dry-run]\n" +
           "  tsx src/homeserver/cli.ts keys revoke --scope ask [--confirm]   # ask ONLY; dry-run unless --confirm; REQUIRED before rolling the gateway back below the ask-scope version\n" +
