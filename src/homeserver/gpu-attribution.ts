@@ -5,11 +5,19 @@
  * desktop/driver baseline, and any out-of-band GPU tenant (the 2026-10-01 OOM had one). This
  * module subtracts what the gateway can attribute to resident models and reports the rest.
  *
- * Attribution uses the operator-declared RECLAIM estimate (INFER-352), which is a conservative
- * LOWER bound on what a resident model holds. Subtracting a lower bound makes
- * `unattributedGpuBytes` an UPPER bound on memory held outside the model service: it can raise a
- * false alarm, never hide a tenant behind an over-generous estimate. A resident model with no
- * declared reclaim estimate makes attribution `unknown` rather than guessed.
+ * Attribution brackets what resident models hold with the two operator-declared figures from
+ * INFER-352 (`HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB`, `modelId=peakGiB[:reclaimGiB]`):
+ * - the RECLAIM estimate is a conservative LOWER bound on a resident model's footprint, so GTT
+ *   used minus reclaim is an UPPER bound on memory held outside the model service
+ *   (`unattributedGpuBytes`); a model with no reclaim entry contributes 0, which keeps it an
+ *   upper bound;
+ * - the PEAK start budget is an UPPER bound on a resident model's footprint, so GTT used minus
+ *   peak is a LOWER bound (`unattributedGpuBytesMin`).
+ * `exceedsBaseline` fires only when even the lower bound is above the allowance (memory is
+ * certainly held outside the model service); `mayExceedBaseline` fires on the upper bound. The
+ * admission margins between peak and reclaim are deliberately wide, so with large models
+ * resident only the upper bound may trip, and it must not be read as an incident on its own.
+ * A resident model without a declared peak makes attribution `unknown` rather than guessed.
  *
  * Content-blind: numbers, a fixed status/reason vocabulary and booleans only. No process names,
  * command lines, PIDs or paths, so an out-of-band tenant is visible without exposing what it is.
@@ -33,23 +41,29 @@ export interface GpuAttribution {
   reason: GpuAttributionReason | null;
   /** Upper bound on GTT bytes not attributable to resident models; null when unknown. */
   unattributedGpuBytes: number | null;
+  /** Lower bound on the same quantity (GTT used minus declared peaks); null when unknown. */
+  unattributedGpuBytesMin: number | null;
   /** Sum of declared reclaim lower bounds for resident models; null when unknown. */
   residentEstimateBytes: number | null;
-  /** Resident models with no declared reclaim estimate (count only, never names). */
+  /** Sum of declared peak budgets for resident models; null when unknown. */
+  residentPeakBytes: number | null;
+  /** Resident models with no declared peak budget (count only, never names). */
   residentWithoutEstimate: number | null;
   baselineBytes: number;
   /** GTT above the baseline while llama-swap reports no resident model. */
   inUseWhileNothingResident: boolean | null;
-  /** Unattributed bytes above the baseline: an out-of-band tenant is likely. */
+  /** Even the lower bound is above the baseline: memory is certainly held outside the model service. */
   exceedsBaseline: boolean | null;
-  estimateBasis: "declared_reclaim_lower_bound";
-  bound: "upper";
+  /** The upper bound is above the baseline: an out-of-band tenant is possible, not proven. */
+  mayExceedBaseline: boolean | null;
+  estimateBasis: "declared_peak_and_reclaim";
 }
 
 export interface GpuAttributionInput {
   gttUsedBytes: number | null;
   /** Resident model ids, or null when the residency snapshot is unavailable. */
   residentModels: readonly string[] | null;
+  peakBytesByModel: ReadonlyMap<string, number>;
   reclaimBytesByModel: ReadonlyMap<string, number>;
   baselineBytes?: number;
 }
@@ -59,14 +73,20 @@ function unknown(reason: GpuAttributionReason, baselineBytes: number, residentWi
     status: "unknown",
     reason,
     unattributedGpuBytes: null,
+    unattributedGpuBytesMin: null,
     residentEstimateBytes: null,
+    residentPeakBytes: null,
     residentWithoutEstimate,
     baselineBytes,
     inUseWhileNothingResident: null,
     exceedsBaseline: null,
-    estimateBasis: "declared_reclaim_lower_bound",
-    bound: "upper",
+    mayExceedBaseline: null,
+    estimateBasis: "declared_peak_and_reclaim",
   };
+}
+
+function positiveBytes(value: number | undefined): number | null {
+  return value !== undefined && Number.isSafeInteger(value) && value > 0 ? value : null;
 }
 
 export function attributeGpuMemory(input: GpuAttributionInput): GpuAttribution {
@@ -83,35 +103,46 @@ export function attributeGpuMemory(input: GpuAttributionInput): GpuAttribution {
       status: "nothing_resident",
       reason: null,
       unattributedGpuBytes: used,
+      unattributedGpuBytesMin: used,
       residentEstimateBytes: 0,
+      residentPeakBytes: 0,
       residentWithoutEstimate: 0,
       baselineBytes,
       inUseWhileNothingResident: used > baselineBytes,
       exceedsBaseline: used > baselineBytes,
-      estimateBasis: "declared_reclaim_lower_bound",
-      bound: "upper",
+      mayExceedBaseline: used > baselineBytes,
+      estimateBasis: "declared_peak_and_reclaim",
     };
   }
-  let estimate = 0;
+  let reclaimSum = 0;
+  let peakSum = 0;
   let missing = 0;
   for (const model of resident) {
-    const bytes = input.reclaimBytesByModel.get(model);
-    if (bytes === undefined || !Number.isSafeInteger(bytes) || bytes <= 0) missing += 1;
-    else estimate += bytes;
+    const peak = positiveBytes(input.peakBytesByModel.get(model));
+    if (peak === null) {
+      missing += 1;
+      continue;
+    }
+    peakSum += peak;
+    // A reclaim estimate above the peak is not a lower bound; cap it rather than trust it.
+    reclaimSum += Math.min(peak, positiveBytes(input.reclaimBytesByModel.get(model)) ?? 0);
   }
   if (missing > 0) return unknown("estimate_missing", baselineBytes, missing);
-  const unattributed = Math.max(0, used - estimate);
+  const upper = Math.max(0, used - reclaimSum);
+  const lower = Math.max(0, used - peakSum);
   return {
     status: "attributed",
     reason: null,
-    unattributedGpuBytes: unattributed,
-    residentEstimateBytes: estimate,
+    unattributedGpuBytes: upper,
+    unattributedGpuBytesMin: lower,
+    residentEstimateBytes: reclaimSum,
+    residentPeakBytes: peakSum,
     residentWithoutEstimate: 0,
     baselineBytes,
     inUseWhileNothingResident: false,
-    exceedsBaseline: unattributed > baselineBytes,
-    estimateBasis: "declared_reclaim_lower_bound",
-    bound: "upper",
+    exceedsBaseline: lower > baselineBytes,
+    mayExceedBaseline: upper > baselineBytes,
+    estimateBasis: "declared_peak_and_reclaim",
   };
 }
 

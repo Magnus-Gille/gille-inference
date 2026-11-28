@@ -262,25 +262,36 @@ background, so it never blocks the request hot path.
 ## GPU memory held outside the model service (INFER-355)
 
 `GET /models/residency` returns a content-blind `gpuAttribution` object next to `hostMemory`.
-It subtracts the operator-declared reclaim estimates (`HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB`,
-the `:reclaimGiB` part) of the resident models from the device-wide GTT counter and reports the
-rest as `unattributedGpuBytes`:
+It brackets what the resident models hold with the two operator-declared figures in
+`HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB` (`modelId=peakGiB[:reclaimGiB]`, INFER-352) and reports
+the rest of the device-wide GTT counter:
 
-- `status:"nothing_resident"` — llama-swap reports no resident model, so all GTT in use is
-  unattributed; `inUseWhileNothingResident` is true above the baseline allowance.
-- `status:"attributed"` — every resident model has a declared reclaim estimate.
+- `unattributedGpuBytes` = GTT used − Σ declared reclaim. Reclaim is a conservative *lower* bound
+  on a resident model's footprint (a missing reclaim entry counts as 0), so this is an *upper*
+  bound on memory held outside the model service.
+- `unattributedGpuBytesMin` = GTT used − Σ declared peak. The peak start budget is an *upper*
+  bound on a resident footprint, so this is a *lower* bound.
+- `exceedsBaseline` is true only when the lower bound is above the allowance: memory is certainly
+  held outside the model service. `mayExceedBaseline` uses the upper bound: possible, not proven.
+  The admission margins between peak and reclaim are deliberately wide (for a large model they can
+  be ~30 GiB), so with large models resident `mayExceedBaseline` alone is not an incident.
+- `status:"nothing_resident"` — llama-swap reports no resident model, so both bounds equal GTT
+  used; `inUseWhileNothingResident` is true above the allowance. This is the sharpest signal and
+  matches the 2026-10-01 incident shape.
 - `status:"unknown"` with `reason` `gtt_unavailable`, `residency_unknown`, or `estimate_missing`
-  (`residentWithoutEstimate` counts the models, never names them). Until the INFER-352 budgets are
-  declared, any resident model makes attribution unknown; it is never guessed.
+  (a resident model has no declared peak; `residentWithoutEstimate` counts them, never names them).
+  Until the INFER-352 budgets are declared, any resident model makes attribution unknown.
 
-The reclaim estimate is a conservative *lower* bound on what a resident model holds, so
-`unattributedGpuBytes` is an *upper* bound (`bound:"upper"`): it can raise a false alarm but
-cannot hide a tenant behind an over-generous estimate. `exceedsBaseline` compares it with
-`HOMESERVER_GPU_UNATTRIBUTED_BASELINE_GIB` (default 4 GiB: the measured idle driver/desktop baseline
-is about 1.5 GiB; the smallest roster model needs about 5.3 GiB; the out-of-band tenant removed on
-2026-10-02 held 17.7 GiB). The object never contains process names, command lines, PIDs, or paths.
-Feeding the unattributed amount into the admission decision is deferred until the INFER-352
-budgets are calibrated.
+The allowance is `HOMESERVER_GPU_UNATTRIBUTED_BASELINE_GIB` (default 4 GiB: the measured idle
+driver/desktop baseline is about 1.5 GiB; the smallest roster model needs about 5.3 GiB; the
+out-of-band tenant removed on 2026-10-02 held 17.7 GiB). The object never contains process names,
+command lines, PIDs, or paths. Feeding the unattributed amount into the admission decision is
+deferred until the INFER-352 budgets are calibrated.
+
+**Why bracket instead of one estimate:** the declared figures are admission margins, not
+measurements of steady residency. Subtracting only the reclaim bound would flag every large
+resident model permanently; subtracting only the peak would hide a tenant next to a large model.
+Reporting both keeps the certain and the possible cases apart without a third per-model setting.
 
 ### Policy for out-of-band GPU tenants (proposed; owner approval pending, gate E)
 

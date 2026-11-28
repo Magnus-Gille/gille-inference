@@ -167,13 +167,15 @@ const UNKNOWN_ESTIMATE_ATTRIBUTION = {
   status: "unknown",
   reason: "estimate_missing",
   unattributedGpuBytes: null,
+  unattributedGpuBytesMin: null,
   residentEstimateBytes: null,
+  residentPeakBytes: null,
   residentWithoutEstimate: 1,
   baselineBytes: 4 * 1024 ** 3,
   inUseWhileNothingResident: null,
   exceedsBaseline: null,
-  estimateBasis: "declared_reclaim_lower_bound",
-  bound: "upper",
+  mayExceedBaseline: null,
+  estimateBasis: "declared_peak_and_reclaim",
 };
 
 describe("GET /models/residency", () => {
@@ -186,13 +188,15 @@ describe("GET /models/residency", () => {
       status: "nothing_resident",
       reason: null,
       unattributedGpuBytes: 18 * 1024 ** 3,
+      unattributedGpuBytesMin: 18 * 1024 ** 3,
       residentEstimateBytes: 0,
+      residentPeakBytes: 0,
       residentWithoutEstimate: 0,
       baselineBytes: 4 * 1024 ** 3,
       inUseWhileNothingResident: true,
       exceedsBaseline: true,
-      estimateBasis: "declared_reclaim_lower_bound",
-      bound: "upper",
+      mayExceedBaseline: true,
+      estimateBasis: "declared_peak_and_reclaim",
     });
   });
 

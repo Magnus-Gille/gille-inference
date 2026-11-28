@@ -232,9 +232,10 @@ Admin output may also contain `lastUse.alias`; monitor output deliberately omits
 bytes. GTT counters are device-wide and always marked `unattributed` when present; they cannot say
 which model or process owns the allocation, even with resident models. Missing DRM counters are
 explicit `null` values and `gttAccounting:"unknown"`. A separate `gpuAttribution` object (INFER-355)
-subtracts the declared reclaim estimates of resident models and reports `unattributedGpuBytes` as an
-upper bound, with `inUseWhileNothingResident` and `exceedsBaseline` flags, or `status:"unknown"` with a
-fixed reason when GTT, residency, or an estimate is missing; see `docs/observability.md`. If the memory snapshot itself cannot be read,
+brackets GTT memory not attributable to resident models between declared peak budgets
+(`unattributedGpuBytesMin`) and reclaim bounds (`unattributedGpuBytes`), with `inUseWhileNothingResident`,
+`exceedsBaseline` (certain) and `mayExceedBaseline` (possible) flags, or `status:"unknown"` with a fixed
+reason when GTT, residency, or a peak budget is missing; see `docs/observability.md`. If the memory snapshot itself cannot be read,
 the object reports `status:"unknown"` and null values. If the model snapshot is unavailable, the
 safe response remains `503 {status:"unavailable",resourceEvidence:{...}}` with no `models` array. This endpoint is
 read-only and content-blind: it does not expose prompts, responses, token counts, keys, key hashes,

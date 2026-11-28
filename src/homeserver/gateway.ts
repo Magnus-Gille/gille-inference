@@ -757,7 +757,7 @@ async function readModelResidency(
   admissionMode: HostMemoryAdmissionMode,
   readOom: () => Promise<number | null>,
   readAdmission: () => AdmissionState,
-  attribution: { reclaimBytesByModel: ReadonlyMap<string, number>; baselineBytes?: number },
+  attribution: { peakBytesByModel: ReadonlyMap<string, number>; reclaimBytesByModel: ReadonlyMap<string, number>; baselineBytes?: number },
 ): Promise<ModelResidencyResponse> {
   const resourceEvidence = await readResourceEvidence(admissionMode, readOom);
   let running: Awaited<ReturnType<typeof getRunningSnapshot>>;
@@ -807,6 +807,7 @@ async function readModelResidency(
   const gpuAttribution = attributeGpuMemory({
     gttUsedBytes: hostMemory.gttUsedBytes,
     residentModels: models,
+    peakBytesByModel: attribution.peakBytesByModel,
     reclaimBytesByModel: attribution.reclaimBytesByModel,
     ...(attribution.baselineBytes === undefined ? {} : { baselineBytes: attribution.baselineBytes }),
   });
@@ -5971,6 +5972,7 @@ export async function handleRequest(
         hostMemoryDeps.readOomKillCount ?? readOomKillCount,
         () => controller.snapshot(),
         {
+          peakBytesByModel: cfg.hostMemoryAdmission.modelBudgetBytes,
           reclaimBytesByModel: cfg.hostMemoryAdmission.modelReclaimBytes,
           baselineBytes: cfg.hostMemoryAdmission.gpuUnattributedBaselineBytes,
         },

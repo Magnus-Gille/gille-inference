@@ -486,7 +486,7 @@ raw backend commands, backend addresses/IPs, or other content-bearing or credent
 
 **Response 200:** `{ "models": ResidencyModel[], "hostMemory": HostMemory, "gpuAttribution": GpuAttribution, "resourceEvidence": ResourceEvidence, "activityEvidence": ActivityEvidence }` when the model
 snapshot is available. `gpuAttribution` (INFER-355) reports GTT memory not attributable to resident
-models, as an upper bound computed from declared reclaim estimates; see `docs/observability.md`. `state: "ready"` means resident and able to accept work, **not** actively
+models, bracketed by declared peak and reclaim estimates; see `docs/observability.md`. `state: "ready"` means resident and able to accept work, **not** actively
 generating. Activity is reported separately per model and is never inferred: `idle` requires a fresh
 zero from a sample that covers all backend traffic, and anything weaker is `unknown` with a reason.
 No backend activity probe is wired yet, so rows currently report `unknown`/`not_probed`. Gateway
@@ -510,14 +510,16 @@ array as evidence that no models are resident.
 interface GpuAttribution {
   status: "nothing_resident" | "attributed" | "unknown";
   reason: "gtt_unavailable" | "residency_unknown" | "estimate_missing" | null;
-  unattributedGpuBytes: number | null;   // upper bound; null when unknown
-  residentEstimateBytes: number | null;  // sum of declared reclaim lower bounds
-  residentWithoutEstimate: number | null; // count only, never model names
-  baselineBytes: number;                 // HOMESERVER_GPU_UNATTRIBUTED_BASELINE_GIB
+  unattributedGpuBytes: number | null;    // upper bound (GTT used − declared reclaim)
+  unattributedGpuBytesMin: number | null; // lower bound (GTT used − declared peak)
+  residentEstimateBytes: number | null;   // sum of declared reclaim lower bounds
+  residentPeakBytes: number | null;       // sum of declared peak budgets
+  residentWithoutEstimate: number | null; // resident models without a peak; count only
+  baselineBytes: number;                  // HOMESERVER_GPU_UNATTRIBUTED_BASELINE_GIB
   inUseWhileNothingResident: boolean | null;
-  exceedsBaseline: boolean | null;
-  estimateBasis: "declared_reclaim_lower_bound";
-  bound: "upper";
+  exceedsBaseline: boolean | null;        // lower bound above baseline: certain
+  mayExceedBaseline: boolean | null;      // upper bound above baseline: possible
+  estimateBasis: "declared_peak_and_reclaim";
 }
 
 interface ResidencyModel {
