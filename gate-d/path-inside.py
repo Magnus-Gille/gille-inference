@@ -45,6 +45,10 @@ while True:
         # parent instead of its destination, so refuse it.
         if os.path.lexists(path):
             fail(f"{path} is a dangling symlink")
+        # A ".." in the missing suffix is never looked up, so it could hide a lookup error in an
+        # earlier component ("missing/../file/../work"); refuse it.
+        if os.path.basename(path) == "..":
+            fail(f"{sys.argv[1]} has '..' after a missing component")
         parent = os.path.dirname(path)
         if parent == path:
             fail(f"no existing ancestor of {sys.argv[1]}")

@@ -610,12 +610,14 @@ describe("gate-d/run.sh pi prompt variants (INFER-519)", { timeout: 120_000 }, (
     const outside = tmp("gd-spelled-");
     writeFileSync(join(outside, "plain-file"), "x\n");
     const { bin, log } = fakeBin();
-    const { res, out } = runGateD(repo, bin, { GATE_D_WORKROOT: `${outside}/plain-file/../work` }, ["pi", TASK]);
-    expect(res.status).toBe(3);
-    expect(res.stderr).toContain("could not be checked");
-    expect(existsSync(join(outside, "work"))).toBe(false);
+    for (const spelled of [`${outside}/plain-file/../work`, `${outside}/missing/../plain-file/../work`]) {
+      const { res, out } = runGateD(repo, bin, { GATE_D_WORKROOT: spelled }, ["pi", TASK]);
+      expect(res.status, spelled).toBe(3);
+      expect(res.stderr).toContain("could not be checked");
+      expect(existsSync(join(outside, "work"))).toBe(false);
+      expect(rows(out)).toEqual([]);
+    }
     expect(calls(log)).toEqual([]);
-    expect(rows(out)).toEqual([]);
   });
 
   it("aborts when the .git entry points at a bare repository, so rev-parse prints false (INFER-520)", () => {
@@ -641,13 +643,16 @@ describe("gate-d/run.sh pi prompt variants (INFER-519)", { timeout: 120_000 }, (
     writeFileSync(
       join(bin, "git"),
       `#!/usr/bin/env bash
-for a in "$@"; do
-  case "$a" in
-    --is-inside-work-tree) echo PROBE >> "$GD_GIT_LOG"; echo false; exit 0 ;;
-    status) echo STATUS >> "$GD_GIT_LOG" ;;
-  esac
+# Skip the -c/-C option pairs gd_git passes, so only the subcommand itself is matched.
+orig=("$@")
+set -- "$@" --gd-end
+sub=""
+while [ "$1" != --gd-end ]; do
+  case "$1" in -c|-C) shift 2 ;; -*) shift ;; *) sub="$1"; break ;; esac
 done
-exec "$GD_REAL_GIT" "$@"
+if [ "$sub" = rev-parse ] && [ "$2" = --is-inside-work-tree ]; then echo PROBE >> "$GD_GIT_LOG"; echo false; exit 0; fi
+[ "$sub" = status ] && echo STATUS >> "$GD_GIT_LOG"
+exec "$GD_REAL_GIT" "\${orig[@]}"
 `,
     );
     chmodSync(join(bin, "git"), 0o755);
