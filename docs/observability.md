@@ -261,37 +261,40 @@ background, so it never blocks the request hot path.
 
 ## GPU memory held outside the model service (INFER-355)
 
-`GET /models/residency` returns a content-blind `gpuAttribution` object next to `hostMemory`.
-It brackets what the resident models hold with the two operator-declared figures in
-`HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB` (`modelId=peakGiB[:reclaimGiB]`, INFER-352) and reports
-the rest of the device-wide GTT counter:
+`GET /models/residency` returns a content-blind `gpuAttribution` object next to `hostMemory`. It
+brackets the device-wide GTT counter against what the resident models can hold:
 
-- `unattributedGpuBytes` = GTT used − Σ declared reclaim. Reclaim is a conservative *lower* bound
-  on a resident model's footprint (a missing reclaim entry counts as 0), so this is an *upper*
-  bound on memory held outside the model service.
-- `unattributedGpuBytesMin` = GTT used − Σ declared peak. The peak start budget is an *upper*
-  bound on a resident footprint, so this is a *lower* bound.
+- `unattributedGpuBytesMin` = GTT used − Σ declared peak start budget
+  (`HOMESERVER_HOST_MEMORY_MODEL_BUDGETS_GIB`, INFER-352). A peak is a whole-host upper bound on a
+  model's footprint and therefore also on its GTT share, so this is a *lower* bound on memory held
+  outside the model service.
+- `unattributedGpuBytes` = GTT used − Σ declared GTT lower bound
+  (`HOMESERVER_GPU_MODEL_GTT_MIN_GIB`, `modelId=gttMinGiB`). A model without one contributes 0, so
+  this stays a valid *upper* bound. The admission reclaim estimate is deliberately not used: it
+  bounds whole-host memory released on eviction, not GTT held, and subtracting it could hide a
+  tenant.
 - `exceedsBaseline` is true only when the lower bound is above the allowance: memory is certainly
   held outside the model service. `mayExceedBaseline` uses the upper bound: possible, not proven.
-  The admission margins between peak and reclaim are deliberately wide (for a large model they can
-  be ~30 GiB), so with large models resident `mayExceedBaseline` alone is not an incident.
+  With large models resident and no GTT lower bounds declared, `mayExceedBaseline` alone is not an
+  incident.
 - `status:"nothing_resident"` — llama-swap reports no resident model, so both bounds equal GTT
-  used; `inUseWhileNothingResident` is true above the allowance. This is the sharpest signal and
-  matches the 2026-10-01 incident shape.
-- `status:"unknown"` with `reason` `gtt_unavailable`, `residency_unknown`, or `estimate_missing`
-  (a resident model has no declared peak; `residentWithoutEstimate` counts them, never names them).
-  Until the INFER-352 budgets are declared, any resident model makes attribution unknown.
+  used and `inUseWhileNothingResident` is true above the allowance. This is the sharpest signal.
+- `status:"unknown"` with a fixed `reason`: `gtt_unavailable`, `residency_unknown`,
+  `residency_transition` (a model is starting or stopping, or residency changed between the
+  snapshots taken before and after the counter read), or `estimate_missing` (a resident model has
+  no declared peak; `residentWithoutEstimate` counts them, never names them). Until the INFER-352
+  budgets are declared, any resident model makes attribution unknown.
 
-The allowance is `HOMESERVER_GPU_UNATTRIBUTED_BASELINE_GIB` (default 4 GiB: the measured idle
-driver/desktop baseline is about 1.5 GiB; the smallest roster model needs about 5.3 GiB; the
-out-of-band tenant removed on 2026-10-02 held 17.7 GiB). The object never contains process names,
-command lines, PIDs, or paths. Feeding the unattributed amount into the admission decision is
-deferred until the INFER-352 budgets are calibrated.
+The allowance is `HOMESERVER_GPU_UNATTRIBUTED_BASELINE_GIB` (default 4 GiB: above the idle
+driver/desktop GTT baseline seen in calibration and below the smallest roster model's footprint).
+The object never contains model names, process names, command lines, PIDs, or paths. Feeding the
+unattributed amount into the admission decision is deferred until the INFER-352 budgets are
+calibrated.
 
-**Why bracket instead of one estimate:** the declared figures are admission margins, not
-measurements of steady residency. Subtracting only the reclaim bound would flag every large
-resident model permanently; subtracting only the peak would hide a tenant next to a large model.
-Reporting both keeps the certain and the possible cases apart without a third per-model setting.
+**Why bracket instead of one estimate:** declared peaks are admission margins, not measurements of
+steady residency, and reclaim figures are whole-host. A single subtraction would either flag every
+large resident model permanently or hide a tenant next to one. Two bounds keep the certain and the
+possible cases apart.
 
 ### Policy for out-of-band GPU tenants (proposed; owner approval pending, gate E)
 
@@ -311,16 +314,15 @@ host budget, or does not run**:
    operator identifies the tenant on the host, stops it or brings it under rule 1, and records the
    resolution in the private operations tracker, not in this repository.
 
-**Why:** the 2026-10-01 host OOM (INFER-350) had two out-of-band tenants — a forgotten model server
-and an application's always-loaded model copy — that no admission decision could see. Memory that
-admission cannot count makes every budget wrong in the unsafe direction.
+**Why:** GPU memory that admission cannot see makes every budget wrong in the unsafe direction;
+an earlier host OOM (INFER-350) had exactly this as a contributing cause.
 
-**Why not:** (a) *subtract the unattributed amount from admission now* — with no calibrated
-budgets the figure is an unbounded upper bound and would refuse fitting starts; it is deferred to
-INFER-352. (b) *expose the tenant's process name or command line* — that leaks host-private detail
-through a monitor-readable surface; the operator already has shell access to identify it. (c)
-*allow long-lived tenants with a static declared budget* — a declaration cannot be verified and
-drifts silently; the roster path gives the same capability with measured evidence.
+**Why not:** (a) *subtract the unattributed amount from admission now* — without calibrated
+budgets the figure is too wide and would refuse fitting starts; deferred to INFER-352. (b) *expose
+the tenant's process name or command line* — that leaks host-private detail through a
+monitor-readable surface; the operator already has shell access to identify it. (c) *allow
+long-lived tenants with a static declared budget* — a declaration cannot be verified and drifts
+silently; the roster path gives the same capability with measured evidence.
 
 ## Retention & rotation
 

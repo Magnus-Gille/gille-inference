@@ -37,6 +37,8 @@ export interface HostMemoryAdmissionConfig {
   retryAfterSeconds: number;
   /** GTT allowance not attributed to resident models before an out-of-band tenant is flagged (INFER-355). */
   gpuUnattributedBaselineBytes?: number;
+  /** Declared GTT lower bound per settled resident model, diagnostics only (INFER-355). */
+  gpuModelGttMinBytes?: ReadonlyMap<string, number>;
 }
 
 export type HostMemoryOutcome = "not_needed" | "allow" | "refuse";

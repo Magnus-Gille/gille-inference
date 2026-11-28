@@ -1102,8 +1102,8 @@ describe("mixed-health connector regression (#242)", () => {
       failure_layer: "connector_transport",
       retryable: true,
     });
-    // The first failure never reached the gateway, so no gateway correlation id exists to
-    // repeat; a client-fabricated id would claim a server-side record that does not exist.
+    // No response arrived, so delivery is unknown and the client has no gateway id to report;
+    // the retry's id below belongs to the retry alone (ADR-007).
     expect(first.error.data).not.toHaveProperty("request_id");
     expect(first.error.message).toContain("failure_layer=connector_transport");
 

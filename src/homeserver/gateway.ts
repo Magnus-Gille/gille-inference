@@ -757,7 +757,7 @@ async function readModelResidency(
   admissionMode: HostMemoryAdmissionMode,
   readOom: () => Promise<number | null>,
   readAdmission: () => AdmissionState,
-  attribution: { peakBytesByModel: ReadonlyMap<string, number>; reclaimBytesByModel: ReadonlyMap<string, number>; baselineBytes?: number },
+  attribution: { peakBytesByModel: ReadonlyMap<string, number>; gttMinBytesByModel: ReadonlyMap<string, number>; baselineBytes?: number },
 ): Promise<ModelResidencyResponse> {
   const resourceEvidence = await readResourceEvidence(admissionMode, readOom);
   let running: Awaited<ReturnType<typeof getRunningSnapshot>>;
@@ -804,11 +804,21 @@ async function readModelResidency(
     };
   });
   const hostMemory = await readHostMemoryForResidency(readMemory);
+  // Re-observe residency after the counter read so a swap during the read is not attributed.
+  let runningAfter: Awaited<ReturnType<typeof getRunningSnapshot>> | null = null;
+  if (hostMemory.gttUsedBytes !== null) {
+    try {
+      runningAfter = await getRunningSnapshot();
+    } catch {
+      runningAfter = null;
+    }
+  }
   const gpuAttribution = attributeGpuMemory({
     gttUsedBytes: hostMemory.gttUsedBytes,
-    residentModels: models,
+    residentBefore: running,
+    residentAfter: runningAfter,
     peakBytesByModel: attribution.peakBytesByModel,
-    reclaimBytesByModel: attribution.reclaimBytesByModel,
+    gttMinBytesByModel: attribution.gttMinBytesByModel,
     ...(attribution.baselineBytes === undefined ? {} : { baselineBytes: attribution.baselineBytes }),
   });
   const admission = readAdmission();
@@ -5973,7 +5983,7 @@ export async function handleRequest(
         () => controller.snapshot(),
         {
           peakBytesByModel: cfg.hostMemoryAdmission.modelBudgetBytes,
-          reclaimBytesByModel: cfg.hostMemoryAdmission.modelReclaimBytes,
+          gttMinBytesByModel: cfg.hostMemoryAdmission.gpuModelGttMinBytes ?? new Map(),
           baselineBytes: cfg.hostMemoryAdmission.gpuUnattributedBaselineBytes,
         },
       );

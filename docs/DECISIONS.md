@@ -88,14 +88,16 @@ criteria: [`hugin-role-validation.md`](./hugin-role-validation.md).
 **Decision:** The standalone `m5 doctor` and `bin/m5-network-doctor.mjs` deliberately do not
 inspect the interactive host connector session (Claude Code / Codex MCP host state); they keep
 reporting `connector.status=unsupported` / `connector_session: not_inspected`. A transport failure
-that never reached the gateway carries no `request_id`; only gateway answers (such as the
-`server_busy` refusal of a retry) carry the gateway's own `request_id`.
+before any response carries no `request_id`; only gateway answers (such as the `server_busy`
+refusal of a retry) carry the gateway's own `request_id`, and that id belongs to the retry alone.
 
 **Why:** The host connector session lives inside the L1 host process, which exposes no stable,
 content-free API to a separate CLI; reading its state would mean scraping host-private files or
 logs, which can contain credentials and prompts. A gateway `request_id` names a server-side
-record; a request that timed out before any HTTP response has no such record, so repeating an id
-across "timeout" and "busy" would point the operator at a log line that does not exist.
+record. A timeout before any HTTP response does not prove the gateway never received the request
+(it may have assigned an id and logged it while the response was lost), so delivery is *unknown*;
+but the client has no id to report, and copying the retry's id onto the first failure would point
+the operator at the wrong record.
 
 **Why not:** (a) *Install the authenticated `list_models` route monitor in production* — useful,
 but it observes the gateway route, not the host connector, and installing it is an
