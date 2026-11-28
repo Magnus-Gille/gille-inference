@@ -73,6 +73,7 @@ function git(cwd: string, ...args: string[]): string {
 function fixtureRepo(): string {
   const repo = tmp("gd-ext-fixture-");
   cpSync(join(REAL_ROOT, "gate-d"), join(repo, "gate-d"), { recursive: true });
+  cpSync(join(REAL_ROOT, "vendor"), join(repo, "vendor"), { recursive: true });
   mkdirSync(join(repo, "scripts"));
   for (const f of ["pi-benchmark-telemetry.ts", "pi-verification-telemetry.ts"]) {
     cpSync(join(REAL_ROOT, "scripts", f), join(repo, "scripts", f));
@@ -468,7 +469,7 @@ fs.writeFileSync(manifestPath, JSON.stringify(m, null, 2) + "\\n");`);
 
   it("records an io gate that cannot run as a runner failure, not a model failure", () => {
     const repo = fixtureRepo();
-    writeFileSync(join(repo, "gate-d", "io-gate.mjs"), "throw new Error('broken gate');\n");
+    writeFileSync(join(repo, "vendor", "code-battle-gate-d-r3", "io-gate.mjs"), "throw new Error('broken gate');\n");
     const root = corpus();
     const { bin } = fakeBin(root);
     const { res, out } = runGateD(repo, bin, { GATE_D_TASKS_ROOT: root }, ["pi", TASK_A]);
@@ -631,7 +632,7 @@ describe("vendored io-gate.mjs provenance (INFER-521)", () => {
     const doc = readFileSync(join(REAL_ROOT, "gate-d", "CORPUS.md"), "utf8");
     const recorded = /`gate-d-r3\/io-gate\.mjs`, sha256 `([0-9a-f]{64})`/.exec(doc)?.[1];
     expect(recorded).toBeDefined();
-    const actual = createHash("sha256").update(readFileSync(join(REAL_ROOT, "gate-d", "io-gate.mjs"))).digest("hex");
+    const actual = createHash("sha256").update(readFileSync(join(REAL_ROOT, "vendor", "code-battle-gate-d-r3", "io-gate.mjs"))).digest("hex");
     expect(actual).toBe(recorded);
   });
 });

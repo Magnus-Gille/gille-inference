@@ -184,7 +184,7 @@ def sh(argv, cwd=None):
     return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=300, env=CHILD_ENV)
 
 AT_STOP = os.path.join(REPO, "gate-d", "at-stop.sh")
-IO_GATE = os.path.join(REPO, "gate-d", "io-gate.mjs")
+IO_GATE = os.path.join(REPO, "vendor", "code-battle-gate-d-r3", "io-gate.mjs")
 # check.sh for external corpora, as gate-d/run.sh runs it (INFER-521): no code generation from
 # strings and no tsx cache in any node process it starts.
 HARDENED_ENV = dict(CHILD_ENV, TSX_DISABLE_CACHE="1", NODE_OPTIONS=" ".join(

@@ -125,9 +125,16 @@ not scripts. Re-copy them when CBATTLE-14 changes the originals; tests check eac
 
 | Copy | Original | Local changes |
 | --- | --- | --- |
-| `gate-d/io-gate.mjs` | `gate-d-r3/io-gate.mjs`, sha256 `b9525b680f1c7a1c3082a7c6fa4ff437e68552d9b43e18e7b67c0f494f279437` | none (byte-identical) |
+| `vendor/code-battle-gate-d-r3/io-gate.mjs` | `gate-d-r3/io-gate.mjs`, sha256 `b9525b680f1c7a1c3082a7c6fa4ff437e68552d9b43e18e7b67c0f494f279437` | none (byte-identical) |
 | `gate-d/at-stop.sh` | `gate-d-r3/at-stop.sh` (sha256 in its header) | lines marked `# INFER-521-local`: a check that hits the cap is unmeasured, not red |
 | `scripts/pi-verification-telemetry.ts` | `gate-d-r3/telemetry/verification-telemetry.ts` | checks match the invoked program only (`command -v tsc` is not a check run); no CLI block |
+
+`io-gate.mjs` lives under `vendor/` rather than `gate-d/` because it is third-party code kept
+byte-identical: it loads `typescript` from the toolchain through `createRequire`, which the
+code-health module-graph audit (`research/code-health-402`, which scans `gate-d/`) counts as an
+unresolvable candidate-module load. Why not edit the copy to avoid `node:module`: then it would no
+longer be the code the corpus's own verifier runs. Why not exempt it inside the audit: that would
+weaken a repository-wide gate for one vendored file.
 
 The telemetry port takes upstream's check-versus-edit semantics as they are (a command's mutation
 is ordered by its position relative to the checks in the same command). Why not keep this repo's
